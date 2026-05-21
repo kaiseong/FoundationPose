@@ -1135,7 +1135,11 @@ class NerfRunner:
     tex_image = torch.zeros((tex_res,tex_res,3)).cuda().float()
     weight_tex_image = torch.zeros(tex_image.shape[:-1]).cuda().float()
     mesh.merge_vertices()
-    mesh.remove_duplicate_faces()
+    if hasattr(mesh, "remove_duplicate_faces"):
+      mesh.remove_duplicate_faces()
+    else:
+      mesh.update_faces(mesh.unique_faces())
+      mesh.remove_unreferenced_vertices()
     mesh = mesh.unwrap()
     H,W = tex_image.shape[:2]
     uvs_tex = (mesh.visual.uv*np.array([W-1,H-1]).reshape(1,2))    #(n_V,2)

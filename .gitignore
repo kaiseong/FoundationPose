@@ -154,5 +154,6 @@ dmypy.json
 # Datasets
 data/
 logs/
+visual_servoing/visual_servoing_data/
 !BundleTrack/XMem/inference/data
 run_used.yml
