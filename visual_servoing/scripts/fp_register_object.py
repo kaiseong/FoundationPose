@@ -29,8 +29,8 @@ def main() -> int:
     parser.add_argument("--frame-interval-s", type=float, default=0.0)
     parser.add_argument("--camera", choices=SUPPORTED_LIVE_CAMERA_MODELS, default="d405")
     parser.add_argument("--serial", default=None, help="Optional camera serial number for live capture.")
-    parser.add_argument("--width", type=int, default=640)
-    parser.add_argument("--height", type=int, default=480)
+    parser.add_argument("--width", type=int, default=None)
+    parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--fps", type=int, default=15)
     args = parser.parse_args()
 

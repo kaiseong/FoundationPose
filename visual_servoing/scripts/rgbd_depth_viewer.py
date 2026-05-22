@@ -18,8 +18,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--camera", choices=SUPPORTED_LIVE_CAMERA_MODELS, default="d435")
     parser.add_argument("--serial")
-    parser.add_argument("--width", type=int, default=640)
-    parser.add_argument("--height", type=int, default=480)
+    parser.add_argument("--width", type=int, default=None)
+    parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--max-frames", type=int, default=0)
@@ -29,7 +29,8 @@ def main() -> int:
 
     cv2 = require_cv2()
     snapshot_dir = resolve_snapshot_dir(args.snapshot_dir, args.data_root)
-    window_title = f"RGB-D Viewer | {args.camera} {args.width}x{args.height}"
+    resolution_label = "native" if args.width is None or args.height is None else f"{args.width}x{args.height}"
+    window_title = f"RGB-D Viewer | {args.camera} {resolution_label}"
 
     frame_count = 0
     last_time = time.perf_counter()

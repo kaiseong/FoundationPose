@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 
+from visual_servoing.point_pose.live_camera_config import resolve_live_camera_config
 from visual_servoing.point_pose.realsense_d405 import LiveRgbdCamera, RealSenseCamera, RgbdFrame
 from visual_servoing.point_pose.rgbd_geometry import CameraIntrinsics
 
@@ -26,8 +27,8 @@ SESSION_JSON = "session.json"
 class ReferenceRecordingConfig:
     camera_model: str = "d405"
     serial: str | None = None
-    width: int = 640
-    height: int = 480
+    width: int | None = None
+    height: int | None = None
     fps: int = 15
     frame_timeout_ms: int = 5000
     board_spec: CharucoBoardSpec = field(default_factory=CharucoBoardSpec)
@@ -37,13 +38,22 @@ class ReferenceRecordingConfig:
     sam_confidence_threshold: float = 0.3
 
     def to_metadata(self) -> dict[str, Any]:
+        camera = resolve_live_camera_config(
+            model=self.camera_model,
+            serial=self.serial,
+            width=self.width,
+            height=self.height,
+            fps=self.fps,
+        )
         return {
             "camera": {
-                "model": self.camera_model,
-                "serial": self.serial,
-                "width": int(self.width),
-                "height": int(self.height),
-                "fps": int(self.fps),
+                "model": camera.model,
+                "serial": camera.serial,
+                "width": camera.width,
+                "height": camera.height,
+                "fps": int(camera.fps),
+                "sdk_resolution": camera.sdk_resolution,
+                "native_resolution": bool(camera.native_resolution),
             },
             "frame_timeout_ms": int(self.frame_timeout_ms),
             "board_spec": self.board_spec.to_dict(),

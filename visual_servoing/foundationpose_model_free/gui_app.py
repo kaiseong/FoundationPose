@@ -15,6 +15,11 @@ from tkinter import messagebox, ttk
 from typing import Callable
 
 from visual_servoing.common.paths import data_root
+from visual_servoing.point_pose.live_camera_config import (
+    SUPPORTED_LIVE_CAMERA_MODELS,
+    default_camera_resolution,
+    is_default_camera_resolution,
+)
 
 from .charuco_reference import BoardObjectTransform, CharucoBoardSpec
 from .reference_dataset import count_reference_frames
@@ -48,6 +53,7 @@ class RecordingEvent:
 DEFAULT_CAMERA_RESOLUTIONS = {
     "d405": (640, 480),
     "d435": (640, 480),
+    "zed": (672, 376),
 }
 RECORDING_PREVIEW_WINDOW = "Reference Recording Preview"
 
@@ -60,11 +66,13 @@ class GuiCommandBuilder:
     def module(self, module: str, *args: str) -> list[str]:
         return [self.config.python_executable, "-m", module, *args]
 
-    def setup_check(self, *, foundationpose_root: str) -> list[str]:
+    def setup_check(self, *, foundationpose_root: str, camera_model: str = "all") -> list[str]:
         command = self.module(
             "visual_servoing.scripts.fp_setup_check",
             "--foundationpose-path",
             foundationpose_root,
+            "--camera",
+            camera_model,
             "--strict",
         )
         return command
@@ -81,17 +89,16 @@ class GuiCommandBuilder:
     ) -> list[str]:
         command = self.module(
             "visual_servoing.scripts.point_pose_live",
-            _live_camera_flag(camera_model),
+            "--live",
+            "--camera",
+            camera_model,
             "--prompt",
             prompt,
-            "--width",
-            str(width),
-            "--height",
-            str(height),
             "--fps",
             str(fps),
             "--print-timing",
         )
+        self._append_live_dimensions(command, camera_model=camera_model, width=width, height=height)
         self._append_serial(command, serial)
         return command
 
@@ -209,10 +216,6 @@ class GuiCommandBuilder:
             prompt,
             "--camera",
             camera_model,
-            "--width",
-            str(width),
-            "--height",
-            str(height),
             "--fps",
             str(fps),
             "--frames",
@@ -243,6 +246,7 @@ class GuiCommandBuilder:
             str(max_keyframes),
             "--json",
         )
+        self._append_live_dimensions(command, camera_model=camera_model, width=width, height=height)
         if capture_once:
             command.append("--capture-once")
         if preview_output:
@@ -278,10 +282,6 @@ class GuiCommandBuilder:
             foundationpose_root,
             "--camera",
             camera_model,
-            "--width",
-            str(width),
-            "--height",
-            str(height),
             "--fps",
             str(fps),
             "--print-timing",
@@ -292,6 +292,7 @@ class GuiCommandBuilder:
             "--track-iterations",
             str(track_iterations),
         )
+        self._append_live_dimensions(command, camera_model=camera_model, width=width, height=height)
         if auto_reinit:
             command.append("--auto-reinit")
         self._append_serial(command, serial)
@@ -307,6 +308,12 @@ class GuiCommandBuilder:
     def _append_serial(command: list[str], serial: str | None) -> None:
         if serial and serial.strip():
             command.extend(["--serial", serial.strip()])
+
+    @staticmethod
+    def _append_live_dimensions(command: list[str], *, camera_model: str, width: int, height: int) -> None:
+        if camera_model.lower() == "zed" and is_default_camera_resolution(camera_model, width, height):
+            return
+        command.extend(["--width", str(width), "--height", str(height)])
 
 
 class BackgroundCommandRunner:
@@ -462,7 +469,7 @@ class FoundationPoseWorkflowGui:
         camera_combo = ttk.Combobox(
             setup,
             textvariable=self.camera_model,
-            values=("d405", "d435"),
+            values=SUPPORTED_LIVE_CAMERA_MODELS,
             width=8,
             state="readonly",
         )
@@ -606,7 +613,12 @@ class FoundationPoseWorkflowGui:
         self._update_capture_status()
 
     def run_setup_check(self) -> None:
-        self._start_command(self.command_builder.setup_check(foundationpose_root=self.foundationpose_root.get()))
+        self._start_command(
+            self.command_builder.setup_check(
+                foundationpose_root=self.foundationpose_root.get(),
+                camera_model=self.camera_model.get(),
+            )
+        )
 
     def run_segmentation_check(self) -> None:
         self._start_command(
@@ -1072,15 +1084,11 @@ def _looks_like_foundationpose_root(path: Path) -> bool:
     )
 
 
-def _live_camera_flag(camera_model: str) -> str:
-    model = camera_model.lower()
-    if model == "d435":
-        return "--live-d435"
-    return "--live-d405"
-
-
 def _default_camera_resolution(camera_model: str) -> tuple[int, int]:
-    return DEFAULT_CAMERA_RESOLUTIONS.get(camera_model.lower(), DEFAULT_CAMERA_RESOLUTIONS["d405"])
+    try:
+        return default_camera_resolution(camera_model)
+    except ValueError:
+        return DEFAULT_CAMERA_RESOLUTIONS["d405"]
 
 
 def _draw_recording_preview_status(image_bgr, *, session_id: str, frame_count: int) -> None:

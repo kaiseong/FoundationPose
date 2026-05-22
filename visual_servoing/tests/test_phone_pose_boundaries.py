@@ -59,6 +59,19 @@ def test_live_camera_model_selection_prefers_explicit_camera_flag():
     assert selected_camera_model(Args()) == "d435"
 
 
+def test_live_camera_model_selection_supports_zed_legacy_alias():
+    class Args:
+        camera = None
+        live_zed = True
+        live_d435 = False
+
+    assert selected_camera_model(Args()) == "zed"
+
+
+def test_supported_live_camera_models_include_zed():
+    assert "zed" in SUPPORTED_LIVE_CAMERA_MODELS
+
+
 def test_no_forbidden_dependency_strings_in_implementation():
     root = Path(__file__).resolve().parents[1]
     files = list((root / "phone_pose").glob("*.py")) + [root / "run_d405_phone_pose.py"]

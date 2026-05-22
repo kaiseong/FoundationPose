@@ -6,6 +6,11 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .live_camera_config import (
+    SUPPORTED_LIVE_CAMERA_MODELS,
+    SUPPORTED_REALSENSE_MODELS,
+    resolve_live_camera_config,
+)
 from .rgbd_geometry import CameraIntrinsics
 
 
@@ -20,10 +25,6 @@ class RealSenseUnavailableError(RuntimeError):
     pass
 
 
-SUPPORTED_REALSENSE_MODELS = ("d405", "d435")
-SUPPORTED_LIVE_CAMERA_MODELS = SUPPORTED_REALSENSE_MODELS
-
-
 class LiveRgbdCamera:
     """Factory wrapper for supported live RGB-D camera backends."""
 
@@ -32,14 +33,32 @@ class LiveRgbdCamera:
         *,
         model: str = "d405",
         serial: str | None = None,
-        width: int = 640,
-        height: int = 480,
+        width: int | None = None,
+        height: int | None = None,
         fps: int = 15,
     ):
-        model = model.lower()
-        if model in SUPPORTED_REALSENSE_MODELS:
-            return RealSenseCamera(model=model, serial=serial, width=width, height=height, fps=fps)
-        raise ValueError(f"unsupported RGB-D camera model: {model}")
+        config = resolve_live_camera_config(model=model, serial=serial, width=width, height=height, fps=fps)
+        if config.model in SUPPORTED_REALSENSE_MODELS:
+            assert config.width is not None
+            assert config.height is not None
+            return RealSenseCamera(
+                model=config.model,
+                serial=config.serial,
+                width=config.width,
+                height=config.height,
+                fps=config.fps,
+            )
+        if config.model == "zed":
+            from .zed_camera import ZedCamera
+
+            return ZedCamera(
+                model=config.model,
+                serial=config.serial,
+                width=config.width,
+                height=config.height,
+                fps=config.fps,
+            )
+        raise ValueError(f"unsupported RGB-D camera model: {config.model}")
 
 
 class RealSenseCamera:

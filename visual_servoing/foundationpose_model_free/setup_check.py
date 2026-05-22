@@ -12,6 +12,8 @@ from pathlib import Path
 import sys
 from typing import Iterable
 
+from visual_servoing.point_pose.live_camera_config import SUPPORTED_LIVE_CAMERA_MODELS, SUPPORTED_REALSENSE_MODELS
+
 
 @dataclass(frozen=True)
 class CheckResult:
@@ -29,19 +31,27 @@ class CheckResult:
         }
 
 
-def run_checks(*, foundationpose_path: str | Path | None = None) -> list[CheckResult]:
+def run_checks(*, foundationpose_path: str | Path | None = None, camera: str = "all") -> list[CheckResult]:
+    camera = camera.lower()
+    if camera != "all" and camera not in SUPPORTED_LIVE_CAMERA_MODELS:
+        raise ValueError(f"unsupported camera: {camera}")
+    check_realsense = camera == "all" or camera in SUPPORTED_REALSENSE_MODELS
+    check_zed = camera == "all" or camera == "zed"
     results = [
         _python_check(),
         _conda_env_check(),
         _module_check("numpy", required=True),
         _module_check("torch", required=True),
         _module_check("cv2", required=True, package_hint="opencv-python"),
-        _module_check("pyrealsense2", required=True),
         _module_check("sam3", required=False),
         _import_check("nvdiffrast.torch", required=True, package_hint="nvdiffrast"),
         _import_check("pytorch3d", required=True),
         _module_check("kaolin", required=False),
     ]
+    if check_realsense:
+        results.append(_module_check("pyrealsense2", required=True))
+    if check_zed:
+        results.append(_zed_sdk_check(required=camera == "zed"))
     results.extend(_foundationpose_checks(foundationpose_path))
     return results
 
@@ -91,6 +101,15 @@ def _import_check(name: str, *, required: bool, package_hint: str | None = None)
         return CheckResult(name, False, f"missing or failed import; install {hint}: {exc}", required=required)
     origin = getattr(module, "__file__", None) or "namespace/package"
     return CheckResult(name, True, str(origin), required=required)
+
+
+def _zed_sdk_check(*, required: bool) -> CheckResult:
+    try:
+        from visual_servoing.point_pose.zed_camera import check_zed_backend
+    except Exception as exc:
+        return CheckResult("zed_sdk", False, f"diagnostic unavailable: {exc}", required=required)
+    diagnostic = check_zed_backend()
+    return CheckResult("zed_sdk", diagnostic.ok, diagnostic.detail, required=required)
 
 
 def _foundationpose_checks(path: str | Path | None) -> list[CheckResult]:
@@ -157,11 +176,12 @@ def _weights_check(root: Path) -> tuple[bool, str]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--foundationpose-path")
+    parser.add_argument("--camera", choices=(*SUPPORTED_LIVE_CAMERA_MODELS, "all"), default="all")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--strict", action="store_true")
     args = parser.parse_args(argv)
 
-    summary = summarize(run_checks(foundationpose_path=args.foundationpose_path))
+    summary = summarize(run_checks(foundationpose_path=args.foundationpose_path, camera=args.camera))
     if args.json:
         print(json.dumps(summary, indent=2, sort_keys=True))
     else:

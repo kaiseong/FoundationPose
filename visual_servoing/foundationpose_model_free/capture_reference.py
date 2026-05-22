@@ -20,8 +20,8 @@ class ReferenceCaptureConfig:
     frame_timeout_ms: int = 5000
     camera_model: str = "d405"
     serial: str | None = None
-    width: int = 640
-    height: int = 480
+    width: int | None = None
+    height: int | None = None
     fps: int = 15
 
 
@@ -31,8 +31,8 @@ class ManualReferenceCaptureConfig:
     frame_timeout_ms: int = 5000
     camera_model: str = "d405"
     serial: str | None = None
-    width: int = 640
-    height: int = 480
+    width: int | None = None
+    height: int | None = None
     fps: int = 15
 
 

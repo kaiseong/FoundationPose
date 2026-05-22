@@ -34,8 +34,10 @@ if _ADDED_PACKAGE_PARENT is not None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--live", action="store_true", help="Read live RGB-D frames from --camera.")
     mode.add_argument("--live-d405", action="store_true", help="Read live RGB-D frames from a D405.")
     mode.add_argument("--live-d435", action="store_true", help="Read live RGB-D frames from a D435.")
+    mode.add_argument("--live-zed", action="store_true", help="Read live RGB-D frames from a ZED camera.")
     mode.add_argument("--rgb", help="Offline RGB image path.")
     parser.add_argument("--depth", help="Offline depth path (.npy meters, or image scaled by --depth-scale).")
     parser.add_argument("--mask", help="Offline binary phone mask path. Skips SAM3.")
@@ -50,8 +52,8 @@ def parse_args() -> argparse.Namespace:
         help="Live RGB-D camera model. Defaults to the selected --live-* flag.",
     )
     parser.add_argument("--serial", default=None, help="Optional camera serial number.")
-    parser.add_argument("--width", type=int, default=640)
-    parser.add_argument("--height", type=int, default=480)
+    parser.add_argument("--width", type=int, default=None)
+    parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--frame-timeout-ms", type=int, default=5000)
     parser.add_argument("--min-depth-m", type=float, default=0.05)
@@ -68,7 +70,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if args.live_d405 or args.live_d435:
+    if args.live or args.live_d405 or args.live_d435 or args.live_zed:
         return run_live(args)
     return run_offline(args)
 
@@ -220,6 +222,8 @@ def run_live(args: argparse.Namespace) -> int:
 def selected_camera_model(args: argparse.Namespace) -> str:
     if args.camera:
         return args.camera
+    if getattr(args, "live_zed", False):
+        return "zed"
     if getattr(args, "live_d435", False):
         return "d435"
     return "d405"

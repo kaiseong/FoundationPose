@@ -49,8 +49,10 @@ def test_gui_command_builder_constructs_subprocess_commands(tmp_path):
 
     assert setup[:3] == ["python", "-m", "visual_servoing.scripts.fp_setup_check"]
     assert segmentation[:3] == ["python", "-m", "visual_servoing.scripts.point_pose_live"]
-    assert "--live-d405" in segmentation
-    assert "--live-d435" in segmentation_d435
+    assert "--live" in segmentation
+    assert segmentation[segmentation.index("--camera") + 1] == "d405"
+    assert "--live" in segmentation_d435
+    assert segmentation_d435[segmentation_d435.index("--camera") + 1] == "d435"
     assert segmentation_d435[segmentation_d435.index("--serial") + 1] == "12345"
     assert "--turntable" in turntable
     assert "--data-root" in turntable
@@ -223,7 +225,36 @@ def test_gui_uses_camera_specific_default_resolution():
 
     assert _default_camera_resolution("d405") == (640, 480)
     assert _default_camera_resolution("d435") == (640, 480)
+    assert _default_camera_resolution("zed") == (672, 376)
     assert _default_camera_resolution("unknown") == (640, 480)
+
+
+def test_gui_command_builder_uses_zed_live_path_without_forced_default_dimensions(tmp_path):
+    builder = GuiCommandBuilder(config=GuiConfig(data_root=str(tmp_path), python_executable="python"))
+
+    segmentation = builder.segmentation_sanity(prompt="mouse", camera_model="zed", width=672, height=376)
+    explicit = builder.segmentation_sanity(prompt="mouse", camera_model="zed", width=1280, height=720)
+    track = builder.track_live(
+        object_name="mouse",
+        prompt="wireless mouse",
+        foundationpose_root="/home/kgs/FoundationPose",
+        auto_reinit=False,
+        auto_reinit_after_lost_frames=5,
+        camera_model="zed",
+        width=672,
+        height=376,
+    )
+
+    assert "--live-d405" not in segmentation
+    assert "--live-d435" not in segmentation
+    assert segmentation[segmentation.index("--camera") + 1] == "zed"
+    assert "--width" not in segmentation
+    assert "--height" not in segmentation
+    assert explicit[explicit.index("--width") + 1] == "1280"
+    assert explicit[explicit.index("--height") + 1] == "720"
+    assert track[track.index("--camera") + 1] == "zed"
+    assert "--width" not in track
+    assert "--height" not in track
 
 
 def test_gui_resolves_and_passes_default_data_root(tmp_path, monkeypatch):
