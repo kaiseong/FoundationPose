@@ -380,26 +380,46 @@ def select_view_diverse_candidates(
     accepted = [item for item in evaluated if item.accepted]
     if not accepted:
         return []
-    accepted.sort(key=lambda item: (-item.score, item.candidate.session_id, item.candidate.frame_index))
+    max_keyframes = max(int(config.max_keyframes), 0)
+    if max_keyframes <= 0:
+        return []
     selected: list[EvaluatedCandidate] = []
     used_ids: set[str] = set()
     bins: dict[int, list[EvaluatedCandidate]] = {}
     for item in accepted:
-        bins.setdefault(int(item.view_bin or 0), []).append(item)
-    for bin_id in sorted(bins):
-        if len(selected) >= config.max_keyframes:
-            break
-        item = bins[bin_id][0]
-        selected.append(item)
-        used_ids.add(item.candidate.candidate_id)
-    if len(selected) < min(config.required_keyframes, config.max_keyframes):
-        for item in accepted:
-            if len(selected) >= config.max_keyframes:
+        bin_id = int(item.view_bin) if item.view_bin is not None else 0
+        bins.setdefault(bin_id, []).append(item)
+    for items in bins.values():
+        items.sort(key=lambda item: (-item.score, item.candidate.session_id, item.candidate.frame_index))
+
+    bin_ids = sorted(bins)
+    per_bin_cap = int(np.ceil(max_keyframes / max(len(bin_ids), 1)))
+    per_bin_counts = {bin_id: 0 for bin_id in bin_ids}
+    per_bin_offsets = {bin_id: 0 for bin_id in bin_ids}
+
+    # Max is an upper bound, not a target. Keep selected references balanced across
+    # observed view bins instead of padding oversampled angles with many near-duplicates.
+    while len(selected) < max_keyframes:
+        progressed = False
+        for bin_id in bin_ids:
+            if len(selected) >= max_keyframes:
                 break
+            if per_bin_counts[bin_id] >= per_bin_cap:
+                continue
+            items = bins[bin_id]
+            offset = per_bin_offsets[bin_id]
+            if offset >= len(items):
+                continue
+            item = items[offset]
+            per_bin_offsets[bin_id] = offset + 1
             if item.candidate.candidate_id in used_ids:
                 continue
             selected.append(item)
             used_ids.add(item.candidate.candidate_id)
+            per_bin_counts[bin_id] += 1
+            progressed = True
+        if not progressed:
+            break
     return sorted(selected, key=lambda item: (item.candidate.session_id, item.candidate.frame_index))
 
 

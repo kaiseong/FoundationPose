@@ -472,8 +472,8 @@ class FoundationPoseWorkflowGui:
         ttk.Label(capture, textvariable=self.recording_status).grid(row=0, column=0, columnspan=2, sticky="w")
         ttk.Label(capture, text="Required").grid(row=0, column=2, sticky="e")
         ttk.Spinbox(capture, from_=1, to=80, textvariable=self.reference_target, width=5).grid(row=0, column=3)
-        ttk.Label(capture, text="Max").grid(row=0, column=4, sticky="e")
-        ttk.Spinbox(capture, from_=1, to=160, textvariable=self.max_keyframes, width=5).grid(row=0, column=5)
+        ttk.Label(capture, text="Max Selected").grid(row=0, column=4, sticky="e")
+        ttk.Spinbox(capture, from_=1, to=1500, textvariable=self.max_keyframes, width=5).grid(row=0, column=5)
         ttk.Button(capture, text="Start Recording", command=self.start_recording).grid(row=0, column=6)
         ttk.Button(capture, text="Stop Recording", command=self.stop_recording).grid(row=0, column=7)
         ttk.Button(capture, text="Processing", command=self.run_recording_processing).grid(row=0, column=8)
@@ -1025,9 +1025,29 @@ def resolve_gui_config(config: GuiConfig | None = None) -> GuiConfig:
     input_config = config or GuiConfig()
     return GuiConfig(
         data_root=str(data_root(input_config.data_root)),
-        foundationpose_root=input_config.foundationpose_root,
+        foundationpose_root=_resolve_foundationpose_root(input_config.foundationpose_root),
         python_executable=input_config.python_executable,
         title=input_config.title,
+    )
+
+
+def _resolve_foundationpose_root(value: str | None = None) -> str:
+    raw_candidates = [candidate for candidate in (value, os.environ.get("FOUNDATIONPOSE_ROOT"), "/home/kgs/FoundationPose") if candidate]
+    for raw_candidate in raw_candidates:
+        candidate = Path(raw_candidate).expanduser()
+        for root_candidate in (candidate, candidate / "FoundationPose"):
+            if _looks_like_foundationpose_root(root_candidate):
+                return str(root_candidate.resolve())
+    if value:
+        return str(Path(value).expanduser())
+    return "/home/kgs/FoundationPose"
+
+
+def _looks_like_foundationpose_root(path: Path) -> bool:
+    return (
+        (path / "bundlesdf" / "run_nerf.py").exists()
+        and (path / "estimater.py").exists()
+        and (path / "learning").is_dir()
     )
 
 

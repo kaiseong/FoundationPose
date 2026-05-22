@@ -6,7 +6,12 @@ ENV_NAME="${ENV_NAME:-visual}"
 DATA_ROOT="${DATA_ROOT:-/home/kgs/Hierarchical_lerobot/visual_servoing_data}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-FOUNDATIONPOSE_ROOT="${FOUNDATIONPOSE_ROOT:-${PROJECT_ROOT}}"
+DEFAULT_FOUNDATIONPOSE_ROOT="/home/kgs/FoundationPose"
+if [[ -d "${DEFAULT_FOUNDATIONPOSE_ROOT}" ]]; then
+  FOUNDATIONPOSE_ROOT="${FOUNDATIONPOSE_ROOT:-${DEFAULT_FOUNDATIONPOSE_ROOT}}"
+else
+  FOUNDATIONPOSE_ROOT="${FOUNDATIONPOSE_ROOT:-${PROJECT_ROOT}}"
+fi
 
 source "${CONDA_BASE}/etc/profile.d/conda.sh"
 conda activate "${ENV_NAME}"

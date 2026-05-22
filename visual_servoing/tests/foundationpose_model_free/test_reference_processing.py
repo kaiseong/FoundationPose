@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections import Counter
+from pathlib import Path
+
 import numpy as np
 
 from visual_servoing.foundationpose_model_free.charuco_reference import (
@@ -15,11 +18,14 @@ from visual_servoing.foundationpose_model_free.reference_processing import (
     READINESS_NEED_MORE_RECORDING,
     READINESS_NO_RECORDINGS,
     READINESS_READY,
+    EvaluatedCandidate,
     ReferenceProcessingConfig,
+    RecordedCandidate,
     compute_mask_depth_stats,
     evaluate_recorded_references,
     latest_processing_report,
     process_recorded_references,
+    select_view_diverse_candidates,
 )
 from visual_servoing.foundationpose_model_free.reference_recording import ReferenceRecordingSession
 from visual_servoing.foundationpose_model_free.registry import ObjectProfileRegistry
@@ -236,6 +242,22 @@ def test_processing_rejects_pose_detector_exception_per_frame(tmp_path):
     assert "charuco rejected: camera_T_board must contain only finite values" in reason_text
 
 
+def test_view_diverse_selection_balances_oversampled_angle_bins():
+    candidates = [
+        *_evaluated_candidates_for_bin(0, count=20, start_index=0, score_start=100.0),
+        *_evaluated_candidates_for_bin(1, count=3, start_index=100, score_start=70.0),
+        *_evaluated_candidates_for_bin(2, count=3, start_index=200, score_start=60.0),
+    ]
+
+    selected = select_view_diverse_candidates(
+        candidates,
+        config=ReferenceProcessingConfig(required_keyframes=3, max_keyframes=9),
+    )
+
+    assert len(selected) == 9
+    assert Counter(item.view_bin for item in selected) == {0: 3, 1: 3, 2: 3}
+
+
 def test_mask_depth_stats_handles_empty_mask():
     stats = compute_mask_depth_stats(
         np.ones((3, 4), dtype=np.float32),
@@ -246,6 +268,34 @@ def test_mask_depth_stats_handles_empty_mask():
 
     assert stats["mask_pixels"] == 0
     assert stats["valid_depth_ratio"] == 0.0
+
+
+def _evaluated_candidates_for_bin(
+    bin_id: int,
+    *,
+    count: int,
+    start_index: int,
+    score_start: float,
+) -> list[EvaluatedCandidate]:
+    return [
+        EvaluatedCandidate(
+            candidate=RecordedCandidate(
+                session_id="session",
+                frame_index=start_index + index,
+                session_dir=Path("."),
+                frame_record=None,  # type: ignore[arg-type]
+                rgb=np.zeros((2, 2, 3), dtype=np.uint8),
+                depth_m=np.ones((2, 2), dtype=np.float32),
+                intrinsics=CameraIntrinsics(fx=1.0, fy=1.0, cx=1.0, cy=1.0, width=2, height=2),
+            ),
+            accepted=True,
+            reasons=[],
+            score=score_start - index,
+            view_yaw_deg=float(bin_id),
+            view_bin=bin_id,
+        )
+        for index in range(count)
+    ]
 
 
 def _record_frames(profile, *, count: int, zero_depth_after: int | None = None) -> None:

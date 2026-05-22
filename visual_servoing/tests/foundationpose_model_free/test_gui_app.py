@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import inspect
 
-from visual_servoing.foundationpose_model_free.gui_app import FoundationPoseWorkflowGui, GuiCommandBuilder, GuiConfig
+from visual_servoing.foundationpose_model_free.gui_app import (
+    FoundationPoseWorkflowGui,
+    GuiCommandBuilder,
+    GuiConfig,
+    resolve_gui_config,
+)
 
 
 def test_gui_command_builder_constructs_subprocess_commands(tmp_path):
@@ -56,6 +61,19 @@ def test_gui_command_builder_constructs_subprocess_commands(tmp_path):
     assert track[track.index("--width") + 1] == "1280"
     assert track[track.index("--refine-iterations") + 1] == "1"
     assert track[track.index("--track-iterations") + 1] == "1"
+
+
+def test_resolve_gui_config_repairs_workspace_parent_foundationpose_root(tmp_path, monkeypatch):
+    foundationpose = tmp_path / "FoundationPose"
+    (foundationpose / "bundlesdf").mkdir(parents=True)
+    (foundationpose / "bundlesdf" / "run_nerf.py").write_text("", encoding="utf-8")
+    (foundationpose / "estimater.py").write_text("", encoding="utf-8")
+    (foundationpose / "learning").mkdir()
+    monkeypatch.delenv("FOUNDATIONPOSE_ROOT", raising=False)
+
+    config = resolve_gui_config(GuiConfig(data_root=str(tmp_path / "data"), foundationpose_root=str(tmp_path)))
+
+    assert config.foundationpose_root == str(foundationpose.resolve())
 
 
 def test_gui_command_builder_supports_pose_dir_import(tmp_path):
