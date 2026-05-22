@@ -25,6 +25,7 @@ from visual_servoing.foundationpose_model_free.reference_processing import (
     evaluate_recorded_references,
     latest_processing_report,
     process_recorded_references,
+    reselect_recorded_references,
     select_view_diverse_candidates,
 )
 from visual_servoing.foundationpose_model_free.reference_recording import ReferenceRecordingSession
@@ -107,6 +108,62 @@ def test_processing_publishes_references_and_is_idempotent(tmp_path):
     assert len(list(profile.rgb_dir.glob("*.png"))) == 16
     assert latest_processing_report(profile)["readiness"] == READINESS_READY
     assert (profile.cam_in_ob_dir / "000000.txt").exists()
+
+
+def test_reselect_recorded_references_reuses_processing_cache_without_sam(tmp_path):
+    profile = ObjectProfileRegistry(tmp_path).create("mouse", prompt="wireless mouse")
+    _record_frames(profile, count=8)
+    board_spec = CharucoBoardSpec()
+    quality_config = CharucoQualityConfig()
+    board_object = BoardObjectTransform.identity()
+
+    processed = process_recorded_references(
+        profile,
+        mask_provider=FakeMaskProvider(),
+        board_spec=board_spec,
+        quality_config=quality_config,
+        board_object=board_object,
+        config=ReferenceProcessingConfig(required_keyframes=4, max_keyframes=4),
+        pose_detector=_fake_pose_detector,
+    )
+    reselected = reselect_recorded_references(
+        profile,
+        board_spec=board_spec,
+        quality_config=quality_config,
+        board_object=board_object,
+        config=ReferenceProcessingConfig(required_keyframes=2, max_keyframes=2),
+    )
+
+    assert processed.processing_cache_path
+    assert reselected.readiness == READINESS_READY
+    assert reselected.accepted == 2
+    assert count_reference_frames(profile) == 2
+    metadata = (profile.refs_dir / "000000.json").read_text(encoding="utf-8")
+    assert "recording_processing_cache_reselect" in metadata
+
+
+def test_reselect_recorded_references_rejects_changed_object_transform(tmp_path):
+    profile = ObjectProfileRegistry(tmp_path).create("mouse", prompt="wireless mouse")
+    _record_frames(profile, count=4)
+
+    process_recorded_references(
+        profile,
+        mask_provider=FakeMaskProvider(),
+        board_spec=CharucoBoardSpec(),
+        quality_config=CharucoQualityConfig(),
+        board_object=BoardObjectTransform.identity(),
+        config=ReferenceProcessingConfig(required_keyframes=4, max_keyframes=4),
+        pose_detector=_fake_pose_detector,
+    )
+
+    with np.testing.assert_raises_regex(ValueError, "different Obj XYZ/RPY"):
+        reselect_recorded_references(
+            profile,
+            board_spec=CharucoBoardSpec(),
+            quality_config=CharucoQualityConfig(),
+            board_object=BoardObjectTransform.from_xyz_rpy_deg((0.1, 0.0, 0.0)),
+            config=ReferenceProcessingConfig(required_keyframes=2, max_keyframes=2),
+        )
 
 
 def test_processing_need_more_recording_uses_appended_sessions(tmp_path):

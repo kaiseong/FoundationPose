@@ -134,6 +134,7 @@ class Sam3MaskProvider:
         device: str = "cuda",
         confidence_threshold: float = 0.3,
         resolution: int = 1008,
+        autocast_dtype: str | None = "float32",
         fallback_to_cpu_on_cuda_oom: bool = True,
         quality_config: MaskQualityConfig | None = None,
     ) -> None:
@@ -141,6 +142,7 @@ class Sam3MaskProvider:
         self.device = _resolve_sam3_device(device)
         self.confidence_threshold = confidence_threshold
         self.resolution = int(resolution)
+        self.autocast_dtype = autocast_dtype
         self.fallback_to_cpu_on_cuda_oom = fallback_to_cpu_on_cuda_oom
         self.quality_config = quality_config or MaskQualityConfig(min_confidence=confidence_threshold)
         self._segmenter = None
@@ -161,7 +163,39 @@ class Sam3MaskProvider:
             detail = str(exc)
             if not detail and exc.__cause__ is not None:
                 detail = str(exc.__cause__)
-            if self._can_retry_on_cpu(detail):
+            if self._can_retry_without_autocast(detail):
+                fallback_metadata = {
+                    "fallback_from_device": self.device,
+                    "fallback_reason": detail,
+                    "fallback_action": "disabled_cuda_autocast",
+                }
+                self.release()
+                self.autocast_dtype = "float32"
+                try:
+                    selection = self._segment_once(prompt, image_rgb)
+                except Exception as retry_exc:
+                    retry_detail = str(retry_exc)
+                    if not retry_detail and retry_exc.__cause__ is not None:
+                        retry_detail = str(retry_exc.__cause__)
+                    if not self._can_retry_on_cpu(retry_detail):
+                        message = "SAM3 failed to produce an initialization mask after disabling CUDA autocast."
+                        if retry_detail:
+                            message = f"{message} Root cause: {retry_detail}"
+                        raise MaskProviderError(message) from retry_exc
+                    fallback_metadata["fallback_reason_after_autocast_retry"] = retry_detail
+                    self.release()
+                    self.device = "cpu"
+                    try:
+                        selection = self._segment_once(prompt, image_rgb)
+                    except Exception as cpu_exc:
+                        cpu_detail = str(cpu_exc)
+                        if not cpu_detail and cpu_exc.__cause__ is not None:
+                            cpu_detail = str(cpu_exc.__cause__)
+                        message = "SAM3 failed to produce an initialization mask after CPU fallback."
+                        if cpu_detail:
+                            message = f"{message} Root cause: {cpu_detail}"
+                        raise MaskProviderError(message) from cpu_exc
+            elif self._can_retry_on_cpu(detail):
                 fallback_metadata = {
                     "fallback_from_device": self.device,
                     "fallback_reason": detail,
@@ -203,6 +237,7 @@ class Sam3MaskProvider:
                 "index": selection.index,
                 "device": self.device,
                 "resolution": self.resolution,
+                "autocast_dtype": self.autocast_dtype,
                 **fallback_metadata,
                 "mask_quality": quality.__dict__,
             },
@@ -219,6 +254,13 @@ class Sam3MaskProvider:
             and _looks_like_cuda_recoverable_failure(detail)
         )
 
+    def _can_retry_without_autocast(self, detail: str) -> bool:
+        return (
+            self.device.split(":", 1)[0] == "cuda"
+            and str(self.autocast_dtype or "").lower() in {"bfloat16", "bf16", "float16", "fp16", "half"}
+            and _looks_like_autocast_dtype_mismatch(detail)
+        )
+
     def _get_segmenter(self, prompt: str):
         if self._segmenter is not None and self._segmenter.prompt == prompt:
             return self._segmenter
@@ -231,6 +273,7 @@ class Sam3MaskProvider:
             device=self.device,
             confidence_threshold=self.confidence_threshold,
             resolution=self.resolution,
+            autocast_dtype=self.autocast_dtype,
         )
         return self._segmenter
 
@@ -291,6 +334,15 @@ def _looks_like_cuda_recoverable_failure(detail: str) -> bool:
             "device-side assert",
             "no kernel image",
         )
+    )
+
+
+def _looks_like_autocast_dtype_mismatch(detail: str) -> bool:
+    text = str(detail).lower()
+    return (
+        "must have the same dtype" in text
+        and ("bfloat16" in text or "float16" in text or "half" in text)
+        and "float" in text
     )
 
 

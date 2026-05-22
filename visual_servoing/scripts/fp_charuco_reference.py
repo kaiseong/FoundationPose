@@ -27,6 +27,7 @@ from visual_servoing.foundationpose_model_free.reference_processing import (
     ReferenceProcessingConfig,
     evaluate_recorded_references,
     process_recorded_references,
+    reselect_recorded_references,
 )
 from visual_servoing.foundationpose_model_free.reference_recording import (
     ReferenceRecordingConfig,
@@ -49,6 +50,11 @@ def main() -> int:
         "--process-recordings",
         action="store_true",
         help="Process raw recording sessions into accepted FoundationPose references.",
+    )
+    mode.add_argument(
+        "--reselect-recordings",
+        action="store_true",
+        help="Republish references from the latest processing cache without rerunning SAM.",
     )
     parser.add_argument("--object", help="Object profile name.")
     parser.add_argument("--data-root")
@@ -120,8 +126,10 @@ def main() -> int:
             payload = _live_capture(args, board_spec, quality_config, board_object)
         elif args.record:
             payload = _record_raw(args, board_spec, board_object)
-        else:
+        elif args.process_recordings:
             payload = _process_recordings(args, board_spec, quality_config, board_object)
+        else:
+            payload = _reselect_recordings(args, board_spec, quality_config, board_object)
     except Exception as exc:
         payload = {"ok": False, "returncode": 2, "error": str(exc)}
         if args.json:
@@ -461,6 +469,36 @@ def _process_recordings(
     payload["ok"] = report.ok
     payload["returncode"] = 0 if report.accepted > 0 else 1
     payload["mode"] = "process_recordings"
+    return payload
+
+
+def _reselect_recordings(
+    args: argparse.Namespace,
+    board_spec: CharucoBoardSpec,
+    quality_config: CharucoQualityConfig,
+    board_object: BoardObjectTransform,
+) -> dict[str, Any]:
+    if not args.object:
+        raise ValueError("--object is required with --reselect-recordings")
+    profile = ObjectProfileRegistry(args.data_root).get(args.object)
+    config = ReferenceProcessingConfig(
+        required_keyframes=args.required_keyframes,
+        max_keyframes=args.max_keyframes,
+        min_mask_area_fraction=args.min_mask_area_fraction,
+        min_valid_depth_ratio=args.min_valid_depth_ratio,
+        publish=not args.evaluate_only,
+    )
+    report = reselect_recorded_references(
+        profile,
+        board_spec=board_spec,
+        quality_config=quality_config,
+        board_object=board_object,
+        config=config,
+    )
+    payload = report.to_dict()
+    payload["ok"] = report.ok
+    payload["returncode"] = 0 if report.accepted > 0 else 1
+    payload["mode"] = "reselect_recordings"
     return payload
 
 

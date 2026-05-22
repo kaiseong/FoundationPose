@@ -98,11 +98,13 @@ class Sam3PhoneSegmenter:
         device: str = "cuda",
         confidence_threshold: float = 0.3,
         resolution: int = 1008,
+        autocast_dtype: str | None = "float32",
     ) -> None:
         self.prompt = prompt
         self.device = device
         self.confidence_threshold = confidence_threshold
         self.resolution = resolution
+        self.autocast_dtype = autocast_dtype
         self._processor = None
         self._last_model_load_ms: float | None = None
 
@@ -112,7 +114,7 @@ class Sam3PhoneSegmenter:
         torch = _require_torch()
         height, width = image_rgb.shape[:2]
         pil_image = _to_pil_image(image_rgb)
-        with torch.inference_mode(), _autocast_context(torch, self.device):
+        with torch.inference_mode(), _autocast_context(torch, self.device, self.autocast_dtype):
             state = processor.set_image(pil_image)
             output = processor.set_text_prompt(state=state, prompt=self.prompt)
         masks = normalize_masks(output.get("masks"), height, width)
@@ -130,6 +132,7 @@ class Sam3PhoneSegmenter:
             raise RuntimeError(
                 "SAM3 is required for live segmentation. Use --mask for offline mode."
             ) from exc
+        _patch_sam3_float32_fused_mlp()
         model = build_sam3_image_model(device=self.device)
         kwargs = {
             "resolution": self.resolution,
@@ -171,6 +174,41 @@ def _prefer_local_sam3_package() -> None:
             sys.modules.pop(name, None)
 
 
+def _patch_sam3_float32_fused_mlp() -> None:
+    """Keep SAM3's ViT MLP in float32 on GPUs where its BF16 fused op mismatches weights."""
+
+    try:
+        import torch
+        import sam3.model.vitdet as vitdet
+        import sam3.perflib.fused as fused
+    except Exception:
+        return
+
+    if getattr(fused.addmm_act, "_visual_servoing_float32_safe", False):
+        return
+
+    def addmm_act_float32_safe(activation, linear, mat1):
+        if torch.is_grad_enabled():
+            raise ValueError("Expected grad to be disabled.")
+        input_dtype = mat1.dtype
+        weight_dtype = linear.weight.dtype
+        x = mat1.to(weight_dtype) if mat1.dtype != weight_dtype else mat1
+        y = linear(x)
+        if activation in [torch.nn.functional.relu, torch.nn.ReLU]:
+            y = torch.nn.functional.relu(y)
+        elif activation in [torch.nn.functional.gelu, torch.nn.GELU]:
+            y = torch.nn.functional.gelu(y)
+        else:
+            raise ValueError(f"Unexpected activation {activation}")
+        if input_dtype.is_floating_point and input_dtype != torch.bfloat16 and y.dtype != input_dtype:
+            y = y.to(input_dtype)
+        return y
+
+    addmm_act_float32_safe._visual_servoing_float32_safe = True
+    fused.addmm_act = addmm_act_float32_safe
+    vitdet.addmm_act = addmm_act_float32_safe
+
+
 def _require_torch():
     try:
         import torch
@@ -179,10 +217,15 @@ def _require_torch():
     return torch
 
 
-def _autocast_context(torch, device: str):
+def _autocast_context(torch, device: str, autocast_dtype: str | None = "float32"):
     device_type = str(device).split(":", 1)[0]
-    if device_type == "cuda" and torch.cuda.is_available():
+    dtype_name = str(autocast_dtype or "float32").lower()
+    if dtype_name in {"none", "off", "false", "0", "float", "float32", "fp32"}:
+        return nullcontext()
+    if device_type == "cuda" and torch.cuda.is_available() and dtype_name in {"bfloat16", "bf16"}:
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    if device_type == "cuda" and torch.cuda.is_available() and dtype_name in {"float16", "fp16", "half"}:
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
     return nullcontext()
 
 

@@ -78,6 +78,19 @@ def test_sam3_mask_provider_falls_back_to_cpu_on_sam_initialize_failed():
     assert result.metadata["fallback_from_device"] == "cuda"
 
 
+def test_sam3_mask_provider_retries_dtype_mismatch_without_autocast():
+    image = np.zeros((20, 20, 3), dtype=np.uint8)
+    provider = DtypeFallbackProvider(prompt="wireless mouse", device="cuda", autocast_dtype="bfloat16")
+
+    result = provider.get_mask(image, object_name="wireless mouse")
+
+    assert result.source == "sam3"
+    assert result.metadata["device"] == "cuda"
+    assert result.metadata["autocast_dtype"] == "float32"
+    assert result.metadata["fallback_action"] == "disabled_cuda_autocast"
+    assert provider.autocast_history == ["bfloat16", "float32"]
+
+
 def test_mask_quality_rejects_tiny_mask_by_default():
     image_shape = (100, 100)
     mask = np.zeros(image_shape, dtype=bool)
@@ -178,3 +191,26 @@ class CpuFallbackProvider(Sam3MaskProvider):
     def _get_segmenter(self, prompt: str):
         self.devices.append(self.device)
         return OomSegmenter(prompt=prompt, device=self.device, cuda_error=self.cuda_error)
+
+
+class DtypeMismatchSegmenter:
+    def __init__(self, *, prompt: str, autocast_dtype: str | None) -> None:
+        self.prompt = prompt
+        self.autocast_dtype = autocast_dtype
+
+    def segment(self, image_rgb):
+        if str(self.autocast_dtype).lower() in {"bfloat16", "bf16"}:
+            raise RuntimeError("mat1 and mat2 must have the same dtype, but got BFloat16 and Float")
+        mask = np.zeros(np.asarray(image_rgb).shape[:2], dtype=bool)
+        mask[5:15, 5:15] = True
+        return FakeSelection(mask=mask)
+
+
+class DtypeFallbackProvider(Sam3MaskProvider):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.autocast_history = []
+
+    def _get_segmenter(self, prompt: str):
+        self.autocast_history.append(self.autocast_dtype)
+        return DtypeMismatchSegmenter(prompt=prompt, autocast_dtype=self.autocast_dtype)

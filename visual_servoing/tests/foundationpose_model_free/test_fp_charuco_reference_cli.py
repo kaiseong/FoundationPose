@@ -25,6 +25,7 @@ def test_fp_charuco_reference_help_exits_successfully():
     assert "--live-capture" in completed.stdout
     assert "--record" in completed.stdout
     assert "--process-recordings" in completed.stdout
+    assert "--reselect-recordings" in completed.stdout
     assert "--required-keyframes" in completed.stdout
     assert "--max-keyframes" in completed.stdout
 

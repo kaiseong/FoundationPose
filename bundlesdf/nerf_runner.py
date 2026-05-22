@@ -1160,9 +1160,16 @@ class NerfRunner:
       mask = self.masks[i].reshape(self.H,self.W).astype(bool)
       valid = (render_depth.reshape(self.H,self.W)>=0.1*self.cfg['sc_factor']) & (mask)
       pts = xyz_map[valid].reshape(-1,3)
+      if len(pts)==0:
+        logging.warning(f"Texture: skip frame {i} while choosing views; no valid projected mask pixels")
+        continue
       pts = transform_pts(pts, cvcam_in_ob)
       ray_colors = rgbs_raw[i][valid].reshape(-1,3)
-      locations, distance, index_tri = trimesh.proximity.closest_point(mesh, pts)
+      try:
+        locations, distance, index_tri = trimesh.proximity.closest_point(mesh, pts)
+      except ValueError as exc:
+        logging.warning(f"Texture: skip frame {i} while choosing views; closest_point failed: {exc}")
+        continue
       normals = mesh.face_normals[index_tri]
       for ind_tri, each_tri in enumerate(index_tri):
           rays_o = np.zeros(3)
@@ -1195,9 +1202,16 @@ class NerfRunner:
       mask = self.masks[i].reshape(self.H,self.W).astype(bool)
       valid = (render_depth.reshape(self.H,self.W)>=0.1*self.cfg['sc_factor']) & (mask)
       pts = xyz_map[valid].reshape(-1,3)
+      if len(pts)==0:
+        logging.warning(f"Texture: skip frame {i} while projecting colors; no valid projected mask pixels")
+        continue
       pts = transform_pts(pts, cvcam_in_ob)
       ray_colors = rgbs_raw[i][valid].reshape(-1,3)
-      locations, distance, index_tri = trimesh.proximity.closest_point(mesh, pts)
+      try:
+        locations, distance, index_tri = trimesh.proximity.closest_point(mesh, pts)
+      except ValueError as exc:
+        logging.warning(f"Texture: skip frame {i} while projecting colors; closest_point failed: {exc}")
+        continue
       normals = mesh.face_normals[index_tri]
       rays_o = np.zeros((len(normals),3))
       rays_o = transform_pts(rays_o,cvcam_in_ob)
@@ -1208,7 +1222,7 @@ class NerfRunner:
       bool_weights=torch.zeros(len(locations), dtype=torch.bool, device='cuda')
       count = 0
       for jj, trtind__ in enumerate(index_tri):
-        if(i in all_triangles_dict[trtind__] ):
+        if(i in all_triangles_dict.get(trtind__, set()) ):
             bool_weights[jj]=1
             all_tri_visited[trtind__]=1
             count +=1
@@ -1226,7 +1240,10 @@ class NerfRunner:
       tex_image[uvs_unique[:,1],uvs_unique[:,0]] += torch.from_numpy(ray_colors).cuda().float()[unique_ids]*cur_weights.reshape(-1,1)
       weight_tex_image[uvs_unique[:,1], uvs_unique[:,0]] += cur_weights
 
-    tex_image = tex_image/weight_tex_image[...,None]
+    if not torch.any(weight_tex_image>0):
+      logging.warning("Texture: no texture pixels were assigned; returning untextured mesh")
+      return mesh
+    tex_image = tex_image/torch.clamp(weight_tex_image[...,None], min=1.0)
     tex_image = tex_image.data.cpu().numpy()
     tex_image = np.clip(tex_image,0,255).astype(np.uint8)
     tex_image = tex_image[::-1].copy()

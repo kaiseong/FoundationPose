@@ -188,8 +188,18 @@ class GuiCommandBuilder:
         max_keyframes: str = "32",
         data_root: str | None = None,
     ) -> list[str]:
-        if mode not in {"offline-generate", "detect-only", "live-capture", "record", "process-recordings"}:
-            raise ValueError("mode must be offline-generate, detect-only, live-capture, record, or process-recordings")
+        if mode not in {
+            "offline-generate",
+            "detect-only",
+            "live-capture",
+            "record",
+            "process-recordings",
+            "reselect-recordings",
+        }:
+            raise ValueError(
+                "mode must be offline-generate, detect-only, live-capture, record, process-recordings, "
+                "or reselect-recordings"
+            )
         command = self.module(
             "visual_servoing.scripts.fp_charuco_reference",
             f"--{mode}",
@@ -477,12 +487,13 @@ class FoundationPoseWorkflowGui:
         ttk.Button(capture, text="Start Recording", command=self.start_recording).grid(row=0, column=6)
         ttk.Button(capture, text="Stop Recording", command=self.stop_recording).grid(row=0, column=7)
         ttk.Button(capture, text="Processing", command=self.run_recording_processing).grid(row=0, column=8)
+        ttk.Button(capture, text="Reselect", command=self.run_recording_reselect).grid(row=0, column=9)
         ttk.Label(capture, textvariable=self.processing_status).grid(row=1, column=0, columnspan=6, sticky="w")
         ttk.Button(capture, text="Build Dry Run", command=lambda: self.run_build_assets(False)).grid(row=1, column=6)
         ttk.Button(capture, text="Build Assets", command=lambda: self.run_build_assets(True)).grid(row=1, column=7)
         ttk.Button(capture, text="Force Build", command=self.run_force_build_assets).grid(row=1, column=8)
         preview = ttk.Frame(capture)
-        preview.grid(row=2, column=0, columnspan=9, sticky="ew", pady=(8, 0))
+        preview.grid(row=2, column=0, columnspan=10, sticky="ew", pady=(8, 0))
         preview.columnconfigure(0, weight=1)
         preview.columnconfigure(1, weight=1)
         ttk.Label(preview, text="RGB").grid(row=0, column=0, sticky="w")
@@ -657,6 +668,16 @@ class FoundationPoseWorkflowGui:
         if not self._release_live_sessions_for_gpu():
             return
         self._start_command(self._charuco_command(profile, mode="process-recordings"))
+
+    def run_recording_reselect(self) -> None:
+        if self.recording_session is not None:
+            self.stop_recording()
+            self.status.set("Stopping recording first; press Reselect again after it stops")
+            return
+        profile = self._current_profile()
+        if not self._release_live_sessions_for_gpu():
+            return
+        self._start_command(self._charuco_command(profile, mode="reselect-recordings"))
 
     def run_charuco_detect_preview(self) -> None:
         profile = self._current_profile()
