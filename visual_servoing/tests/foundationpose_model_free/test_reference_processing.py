@@ -62,8 +62,10 @@ class FakeMaskProvider:
     def __init__(self, *, fail_on_value: int | None = None) -> None:
         self.fail_on_value = fail_on_value
         self.released = False
+        self.calls = 0
 
     def get_mask(self, image_rgb, *, depth_m=None, object_name=None) -> MaskResult:
+        self.calls += 1
         if self.fail_on_value is not None and int(image_rgb[0, 0, 0]) == self.fail_on_value:
             raise RuntimeError("planned mask failure")
         mask = np.zeros(image_rgb.shape[:2], dtype=bool)
@@ -140,6 +142,45 @@ def test_reselect_recorded_references_reuses_processing_cache_without_sam(tmp_pa
     assert count_reference_frames(profile) == 2
     metadata = (profile.refs_dir / "000000.json").read_text(encoding="utf-8")
     assert "recording_processing_cache_reselect" in metadata
+
+
+def test_processing_reuses_existing_cache_for_appended_recordings(tmp_path):
+    profile = ObjectProfileRegistry(tmp_path).create("mouse", prompt="wireless mouse")
+    board_spec = CharucoBoardSpec()
+    quality_config = CharucoQualityConfig()
+    board_object = BoardObjectTransform.identity()
+    _record_frames(profile, count=4)
+    first_provider = FakeMaskProvider()
+
+    first = process_recorded_references(
+        profile,
+        mask_provider=first_provider,
+        board_spec=board_spec,
+        quality_config=quality_config,
+        board_object=board_object,
+        config=ReferenceProcessingConfig(required_keyframes=4, max_keyframes=8),
+        pose_detector=_fake_pose_detector,
+    )
+    _record_frames(profile, count=3)
+    second_provider = FakeMaskProvider()
+    second = process_recorded_references(
+        profile,
+        mask_provider=second_provider,
+        board_spec=board_spec,
+        quality_config=quality_config,
+        board_object=board_object,
+        config=ReferenceProcessingConfig(required_keyframes=4, max_keyframes=8),
+        pose_detector=_fake_pose_detector,
+    )
+
+    assert first_provider.calls == 4
+    assert first.accepted == 4
+    assert second_provider.calls == 3
+    assert second.accepted == 7
+    assert second.processing_summary["cache_mode"] == "incremental"
+    assert second.processing_summary["reused_cached_records"] == 4
+    assert second.processing_summary["newly_processed_candidates"] == 3
+    assert count_reference_frames(profile) == 7
 
 
 def test_reselect_recorded_references_rejects_changed_object_transform(tmp_path):

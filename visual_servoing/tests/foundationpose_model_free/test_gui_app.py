@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 
 from visual_servoing.foundationpose_model_free.gui_app import (
     FoundationPoseWorkflowGui,
@@ -226,9 +227,11 @@ def test_gui_uses_camera_specific_default_resolution():
 
 
 def test_gui_resolves_and_passes_default_data_root(tmp_path, monkeypatch):
+    from visual_servoing.common import paths
     from visual_servoing.foundationpose_model_free.gui_app import resolve_gui_config
 
     monkeypatch.chdir(tmp_path)
+    expected_root = Path(paths.__file__).resolve().parents[1] / "visual_servoing_data"
     config = resolve_gui_config(GuiConfig(python_executable="python"))
     builder = GuiCommandBuilder(config=config)
     command = builder.set_reference_poses_turntable(
@@ -240,5 +243,5 @@ def test_gui_resolves_and_passes_default_data_root(tmp_path, monkeypatch):
         data_root=config.data_root,
     )
 
-    assert config.data_root == str(tmp_path / "visual_servoing_data")
-    assert command[-2:] == ["--data-root", str(tmp_path / "visual_servoing_data")]
+    assert config.data_root == str(expected_root)
+    assert command[-2:] == ["--data-root", str(expected_root)]

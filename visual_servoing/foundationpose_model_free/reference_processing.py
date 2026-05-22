@@ -125,6 +125,7 @@ class ReferenceProcessingReport:
     output_reference_count: int
     report_path: str | None = None
     processing_cache_path: str | None = None
+    processing_summary: dict[str, Any] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -147,6 +148,7 @@ class ReferenceProcessingReport:
             "output_reference_count": int(self.output_reference_count),
             "report_path": self.report_path,
             "processing_cache_path": self.processing_cache_path,
+            "processing_summary": dict(self.processing_summary),
         }
 
 
@@ -166,8 +168,28 @@ def process_recorded_references(
     config = config or ReferenceProcessingConfig()
     run_id = _new_processing_run_id()
     try:
-        candidates = load_recorded_candidates(profile)
         sessions = [session for session in list_recording_sessions(profile)]
+        recorded_frame_index = index_recorded_frame_records(profile)
+        source_cache = _load_reusable_processing_cache(
+            profile,
+            board_spec=board_spec,
+            quality_config=quality_config,
+            board_object=board_object,
+            config=config,
+            mask_provider=mask_provider,
+        )
+        source_cache_path, source_payload = source_cache if source_cache is not None else (None, None)
+        reusable_records = _reusable_cached_records_for_frames(
+            source_payload,
+            source_cache_dir=source_cache_path,
+            recorded_frame_ids=set(recorded_frame_index),
+        )
+        reusable_ids = {str(record.get("candidate_id")) for record in reusable_records}
+        candidates = [
+            load_recorded_candidate(session_dir, frame_record)
+            for candidate_id, (session_dir, frame_record) in sorted(recorded_frame_index.items())
+            if candidate_id not in reusable_ids
+        ]
         evaluated = [
             evaluate_candidate(
                 candidate,
@@ -189,32 +211,56 @@ def process_recorded_references(
             config=config,
             run_id=run_id,
             mask_provider=mask_provider,
+            reusable_records=reusable_records,
+            source_cache_dir=source_cache_path,
+            cache_metadata={
+                "cache_mode": "incremental" if reusable_records else "full",
+                "source_run_id": source_payload.get("run_id") if isinstance(source_payload, dict) else None,
+                "reused_cached_records": len(reusable_records),
+                "newly_processed_candidates": len(evaluated),
+                "total_recorded_frames": len(recorded_frame_index),
+            },
         )
-        selected = select_view_diverse_candidates(evaluated, config=config)
-        for index, item in enumerate(selected):
-            item.selected_index = index
-        readiness = _readiness_for_selection(selected, candidates, config)
-        force_build_allowed = readiness == READINESS_NEED_MORE_RECORDING and bool(selected)
+        _, cache_payload = load_processing_cache(profile, cache_dir=cache_path)
+        cached_records = list(cache_payload.get("records", []))
+        selected_records = select_view_diverse_records(cached_records, config=config)
+        for index, record in enumerate(selected_records):
+            record["selected_index"] = index
+        readiness = _readiness_for_cached_selection(selected_records, cached_records, config)
+        force_build_allowed = readiness == READINESS_NEED_MORE_RECORDING and bool(selected_records)
         published = False
-        if config.publish and selected:
-            publish_selected_references(
+        if config.publish and selected_records:
+            publish_selected_cached_references(
                 profile,
-                selected,
+                selected_records,
+                cache_dir=cache_path,
                 board_object=board_object,
                 run_id=run_id,
+                source_run_id=str(cache_payload.get("run_id") or ""),
+                capture_mode="recording_processing_incremental",
             )
             published = True
-        report = _build_report(
+        report = _build_report_from_cached_records(
             profile,
             run_id=run_id,
             readiness=readiness,
-            selected=selected,
-            evaluated=evaluated,
+            selected_records=selected_records,
+            cached_records=cached_records,
             sessions=sessions,
             config=config,
             force_build_allowed=force_build_allowed,
             published=published,
             processing_cache_path=str(cache_path),
+            processing_summary={
+                "cache_mode": "incremental" if reusable_records else "full",
+                "source_processing_cache_path": str(source_cache_path) if source_cache_path is not None else None,
+                "source_processing_run_id": (
+                    str(source_payload.get("run_id")) if isinstance(source_payload, dict) and source_payload.get("run_id") else None
+                ),
+                "reused_cached_records": len(reusable_records),
+                "newly_processed_candidates": len(evaluated),
+                "total_recorded_frames": len(recorded_frame_index),
+            },
         )
         return write_processing_report(profile, report)
     finally:
@@ -318,6 +364,9 @@ def write_processing_cache(
     config: ReferenceProcessingConfig,
     run_id: str,
     mask_provider: MaskProvider | None = None,
+    reusable_records: list[dict[str, Any]] | None = None,
+    source_cache_dir: Path | None = None,
+    cache_metadata: dict[str, Any] | None = None,
 ) -> Path:
     cache_root = profile.root / PROCESSING_CACHE_DIRNAME
     run_dir = cache_root / run_id
@@ -326,6 +375,21 @@ def write_processing_cache(
     (run_dir / "masks").mkdir(parents=True, exist_ok=True)
     records = []
     cv2 = _require_cv2()
+    for source_record in reusable_records or []:
+        record = dict(source_record)
+        mask_rel = record.get("cached_mask_path")
+        if mask_rel and source_cache_dir is not None:
+            source_mask = source_cache_dir / str(mask_rel)
+            target_mask = run_dir / str(mask_rel)
+            if source_mask.exists():
+                target_mask.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_mask, target_mask)
+            else:
+                record.pop("cached_mask_path", None)
+                record["accepted"] = False
+                record["reasons"] = [f"cached mask image missing during incremental processing: {mask_rel}"]
+        record["selected_index"] = None
+        records.append(record)
     for item in evaluated:
         record = item.to_record()
         if item.mask is not None:
@@ -344,7 +408,9 @@ def write_processing_cache(
         "quality_config": quality_config.to_dict(),
         "board_object": board_object.to_dict(),
         "thresholds": config.to_dict(),
+        "frame_evaluation_config": _frame_evaluation_config(config),
         "mask_provider": _mask_provider_metadata(mask_provider),
+        "processing_summary": dict(cache_metadata or {}),
         "records": records,
     }
     (run_dir / PROCESSING_CACHE_RECORDS).write_text(
@@ -381,6 +447,65 @@ def load_processing_cache(
     if int(payload.get("version", 0)) != PROCESSING_CACHE_VERSION:
         raise ValueError(f"unsupported processing cache version: {payload.get('version')}")
     return cache_path, payload
+
+
+def _load_reusable_processing_cache(
+    profile: ObjectProfile,
+    *,
+    board_spec: CharucoBoardSpec,
+    quality_config: CharucoQualityConfig,
+    board_object: BoardObjectTransform,
+    config: ReferenceProcessingConfig,
+    mask_provider: MaskProvider | None,
+) -> tuple[Path, dict[str, Any]] | None:
+    try:
+        cache_path, payload = load_processing_cache(profile)
+    except (FileNotFoundError, ValueError, json.JSONDecodeError):
+        return None
+    try:
+        _validate_processing_cache(
+            payload,
+            board_spec=board_spec,
+            quality_config=quality_config,
+            board_object=board_object,
+        )
+    except ValueError:
+        return None
+    if _cache_frame_evaluation_config(payload) != _frame_evaluation_config(config):
+        return None
+    if not _mask_provider_metadata_compatible(payload.get("mask_provider"), _mask_provider_metadata(mask_provider)):
+        return None
+    return cache_path, payload
+
+
+def _reusable_cached_records_for_frames(
+    payload: dict[str, Any] | None,
+    *,
+    source_cache_dir: Path | None,
+    recorded_frame_ids: set[str],
+) -> list[dict[str, Any]]:
+    if payload is None or source_cache_dir is None:
+        return []
+    reusable: list[dict[str, Any]] = []
+    for source in payload.get("records", []):
+        if not isinstance(source, dict):
+            continue
+        candidate_id = str(source.get("candidate_id") or "")
+        if candidate_id not in recorded_frame_ids:
+            continue
+        record = dict(source)
+        record["selected_index"] = None
+        mask_rel = record.get("cached_mask_path")
+        if record.get("accepted"):
+            if not mask_rel:
+                continue
+            if not (source_cache_dir / str(mask_rel)).exists():
+                continue
+        reusable.append(record)
+    return sorted(
+        reusable,
+        key=lambda record: (str(record.get("session_id", "")), int(record.get("frame_index", 0))),
+    )
 
 
 def load_recorded_candidates(profile: ObjectProfile) -> list[RecordedCandidate]:
@@ -722,6 +847,7 @@ def publish_selected_cached_references(
     board_object: BoardObjectTransform,
     run_id: str,
     source_run_id: str,
+    capture_mode: str = "recording_processing_cache_reselect",
 ) -> None:
     if not selected_records:
         return
@@ -767,7 +893,7 @@ def publish_selected_cached_references(
             intrinsics=candidate.intrinsics,
             cam_in_ob=cam_in_ob,
             metadata={
-                "capture_mode": "recording_processing_cache_reselect",
+                "capture_mode": capture_mode,
                 "processing_run_id": run_id,
                 "source_processing_run_id": source_run_id,
                 "raw_candidate_id": candidate.candidate_id,
@@ -800,7 +926,7 @@ def publish_selected_cached_references(
             shutil.rmtree(staging_root, ignore_errors=True)
     profile.reference_count = count_reference_frames(profile)
     profile.status = ProfileStatus.CAPTURED
-    profile.metadata["reference_workflow"] = "recording_processing_cache_reselect"
+    profile.metadata["reference_workflow"] = capture_mode
     profile.metadata["last_processing_run_id"] = run_id
     profile.metadata["source_processing_run_id"] = source_run_id
     profile.touch()
@@ -811,7 +937,7 @@ def publish_selected_cached_references(
         board_object=board_object,
         indices=list(range(len(selected_records))),
     )
-    mark_assets_stale(profile, "recording processing cache reselected references")
+    mark_assets_stale(profile, f"{capture_mode} published references")
 
 
 def write_processing_report(profile: ObjectProfile, report: ReferenceProcessingReport) -> ReferenceProcessingReport:
@@ -839,6 +965,7 @@ def write_processing_report(profile: ObjectProfile, report: ReferenceProcessingR
         output_reference_count=report.output_reference_count,
         report_path=str(path),
         processing_cache_path=report.processing_cache_path,
+        processing_summary=dict(report.processing_summary),
     )
 
 
@@ -862,6 +989,7 @@ def _build_report(
     force_build_allowed: bool,
     published: bool,
     processing_cache_path: str | None = None,
+    processing_summary: dict[str, Any] | None = None,
 ) -> ReferenceProcessingReport:
     selected_ids = {item.candidate.candidate_id for item in selected}
     records = []
@@ -894,6 +1022,7 @@ def _build_report(
         records=records,
         output_reference_count=count_reference_frames(profile),
         processing_cache_path=processing_cache_path,
+        processing_summary=dict(processing_summary or {}),
     )
 
 
@@ -909,6 +1038,7 @@ def _build_report_from_cached_records(
     force_build_allowed: bool,
     published: bool,
     processing_cache_path: str | None,
+    processing_summary: dict[str, Any] | None = None,
 ) -> ReferenceProcessingReport:
     selected_ids = {str(record.get("candidate_id")) for record in selected_records}
     report_records = []
@@ -954,6 +1084,7 @@ def _build_report_from_cached_records(
         records=report_records,
         output_reference_count=count_reference_frames(profile),
         processing_cache_path=processing_cache_path,
+        processing_summary=dict(processing_summary or {}),
     )
 
 
@@ -1119,6 +1250,58 @@ def _validate_processing_cache(
         atol=1e-9,
     ):
         raise ValueError("cached processing used different Obj XYZ/RPY; run Processing again")
+
+
+def _frame_evaluation_config(config: ReferenceProcessingConfig) -> dict[str, Any]:
+    return {
+        "min_mask_area_fraction": float(config.min_mask_area_fraction),
+        "min_valid_depth_ratio": float(config.min_valid_depth_ratio),
+        "min_depth_m": float(config.min_depth_m),
+        "max_depth_m": float(config.max_depth_m),
+    }
+
+
+def _cache_frame_evaluation_config(payload: dict[str, Any]) -> dict[str, Any]:
+    config = payload.get("frame_evaluation_config")
+    if isinstance(config, dict):
+        return {
+            "min_mask_area_fraction": float(config.get("min_mask_area_fraction", 0.0)),
+            "min_valid_depth_ratio": float(config.get("min_valid_depth_ratio", 0.0)),
+            "min_depth_m": float(config.get("min_depth_m", 0.0)),
+            "max_depth_m": float(config.get("max_depth_m", 0.0)),
+        }
+    thresholds = payload.get("thresholds") if isinstance(payload.get("thresholds"), dict) else {}
+    return {
+        "min_mask_area_fraction": float(thresholds.get("min_mask_area_fraction", 0.0)),
+        "min_valid_depth_ratio": float(thresholds.get("min_valid_depth_ratio", 0.0)),
+        "min_depth_m": float(thresholds.get("min_depth_m", 0.0)),
+        "max_depth_m": float(thresholds.get("max_depth_m", 0.0)),
+    }
+
+
+def _mask_provider_metadata_compatible(cached: Any, current: dict[str, Any]) -> bool:
+    cached_data = cached if isinstance(cached, dict) else {}
+    for key in ("class", "prompt", "resolution", "confidence_threshold", "autocast_dtype"):
+        cached_value = cached_data.get(key)
+        current_value = current.get(key)
+        if cached_value is None and current_value is None:
+            continue
+        if key in {"resolution"}:
+            try:
+                if int(cached_value) == int(current_value):
+                    continue
+            except (TypeError, ValueError):
+                pass
+        elif key in {"confidence_threshold"}:
+            try:
+                if abs(float(cached_value) - float(current_value)) <= 1e-9:
+                    continue
+            except (TypeError, ValueError):
+                pass
+        elif str(cached_value) == str(current_value):
+            continue
+        return False
+    return True
 
 
 def _mask_provider_metadata(mask_provider: MaskProvider | None) -> dict[str, Any]:

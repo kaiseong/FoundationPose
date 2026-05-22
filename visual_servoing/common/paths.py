@@ -18,7 +18,7 @@ def data_root(root: str | Path | None = None) -> Path:
     configured = os.environ.get(ENV_DATA_DIR)
     if configured:
         return Path(configured).expanduser().resolve()
-    return (Path.cwd() / DEFAULT_DATA_DIR_NAME).resolve()
+    return (Path(__file__).resolve().parents[1] / DEFAULT_DATA_DIR_NAME).resolve()
 
 
 def object_profiles_root(root: str | Path | None = None) -> Path:
