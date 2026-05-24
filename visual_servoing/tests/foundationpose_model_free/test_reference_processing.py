@@ -8,6 +8,9 @@ import numpy as np
 from visual_servoing.foundationpose_model_free.charuco_reference import (
     BoardObjectTransform,
     CharucoBoardSpec,
+    CharucoDetectorConfig,
+    CHARUCO_DETECTOR_PRESET_CONSERVATIVE,
+    CHARUCO_DETECTOR_PRESET_OPENCV_DEFAULT,
     CharucoPoseResult,
     CharucoQualityConfig,
     DictionaryCandidateResult,
@@ -181,6 +184,55 @@ def test_processing_reuses_existing_cache_for_appended_recordings(tmp_path):
     assert second.processing_summary["reused_cached_records"] == 4
     assert second.processing_summary["newly_processed_candidates"] == 3
     assert count_reference_frames(profile) == 7
+
+
+def test_processing_cache_is_partitioned_by_charuco_detector_preset(tmp_path):
+    profile = ObjectProfileRegistry(tmp_path).create("mouse", prompt="wireless mouse")
+    board_spec = CharucoBoardSpec()
+    quality_config = CharucoQualityConfig()
+    board_object = BoardObjectTransform.identity()
+    _record_frames(profile, count=4)
+
+    default_provider = FakeMaskProvider()
+    process_recorded_references(
+        profile,
+        mask_provider=default_provider,
+        board_spec=board_spec,
+        quality_config=quality_config,
+        board_object=board_object,
+        config=ReferenceProcessingConfig(required_keyframes=4, max_keyframes=4),
+        detector_config=CharucoDetectorConfig(CHARUCO_DETECTOR_PRESET_OPENCV_DEFAULT),
+        pose_detector=_fake_pose_detector,
+    )
+    tuned_provider = FakeMaskProvider()
+    tuned = process_recorded_references(
+        profile,
+        mask_provider=tuned_provider,
+        board_spec=board_spec,
+        quality_config=quality_config,
+        board_object=board_object,
+        config=ReferenceProcessingConfig(required_keyframes=4, max_keyframes=4),
+        detector_config=CharucoDetectorConfig(CHARUCO_DETECTOR_PRESET_CONSERVATIVE),
+        pose_detector=_fake_pose_detector,
+    )
+    reused_provider = FakeMaskProvider()
+    reused = process_recorded_references(
+        profile,
+        mask_provider=reused_provider,
+        board_spec=board_spec,
+        quality_config=quality_config,
+        board_object=board_object,
+        config=ReferenceProcessingConfig(required_keyframes=4, max_keyframes=4),
+        detector_config=CharucoDetectorConfig(CHARUCO_DETECTOR_PRESET_CONSERVATIVE),
+        pose_detector=_fake_pose_detector,
+    )
+
+    assert default_provider.calls == 4
+    assert tuned_provider.calls == 4
+    assert tuned.processing_summary["reused_cached_records"] == 0
+    assert tuned.processing_summary["detector_preset"] == CHARUCO_DETECTOR_PRESET_CONSERVATIVE
+    assert reused_provider.calls == 0
+    assert reused.processing_summary["reused_cached_records"] == 4
 
 
 def test_reselect_recorded_references_rejects_changed_object_transform(tmp_path):
@@ -402,7 +454,8 @@ def _record_frames(profile, *, count: int, zero_depth_after: int | None = None) 
             session.record_next_frame()
 
 
-def _fake_pose_detector(image_rgb, intrinsics, *, board_spec, quality_config, board_object):
+def _fake_pose_detector(image_rgb, intrinsics, *, board_spec, quality_config, board_object, detector_config=None):
+    detector_config = detector_config or CharucoDetectorConfig()
     value = int(image_rgb[0, 0, 0])
     yaw_rad = np.deg2rad((value * 22.5) % 360.0)
     cam_in_ob = np.eye(4, dtype=np.float64)
@@ -422,6 +475,8 @@ def _fake_pose_detector(image_rgb, intrinsics, *, board_spec, quality_config, bo
         camera_T_object=camera_t_object,
         cam_in_ob=cam_in_ob,
         distortion_policy="zero_unavailable",
+        detector_preset=detector_config.preset,
+        detector_parameters=detector_config.parameter_summary(),
     )
     return CharucoPoseResult(
         ok=True,
@@ -435,11 +490,22 @@ def _fake_pose_detector(image_rgb, intrinsics, *, board_spec, quality_config, bo
         camera_T_board=camera_t_board,
         camera_T_object=camera_t_object,
         cam_in_ob=cam_in_ob,
+        detector_preset=detector_config.preset,
+        detector_parameters=detector_config.parameter_summary(),
     )
 
 
-def _fake_pose_detector_reject_value_2(image_rgb, intrinsics, *, board_spec, quality_config, board_object):
+def _fake_pose_detector_reject_value_2(
+    image_rgb,
+    intrinsics,
+    *,
+    board_spec,
+    quality_config,
+    board_object,
+    detector_config=None,
+):
     if int(image_rgb[0, 0, 0]) == 2:
+        detector_config = detector_config or CharucoDetectorConfig()
         return CharucoPoseResult(
             ok=False,
             selected_dictionary=None,
@@ -453,6 +519,8 @@ def _fake_pose_detector_reject_value_2(image_rgb, intrinsics, *, board_spec, qua
             camera_T_object=None,
             cam_in_ob=None,
             reject_reasons=["planned charuco failure"],
+            detector_preset=detector_config.preset,
+            detector_parameters=detector_config.parameter_summary(),
         )
     return _fake_pose_detector(
         image_rgb,
@@ -460,10 +528,19 @@ def _fake_pose_detector_reject_value_2(image_rgb, intrinsics, *, board_spec, qua
         board_spec=board_spec,
         quality_config=quality_config,
         board_object=board_object,
+        detector_config=detector_config,
     )
 
 
-def _fake_pose_detector_raise_value_2(image_rgb, intrinsics, *, board_spec, quality_config, board_object):
+def _fake_pose_detector_raise_value_2(
+    image_rgb,
+    intrinsics,
+    *,
+    board_spec,
+    quality_config,
+    board_object,
+    detector_config=None,
+):
     if int(image_rgb[0, 0, 0]) == 2:
         raise ValueError("camera_T_board must contain only finite values")
     return _fake_pose_detector(
@@ -472,4 +549,5 @@ def _fake_pose_detector_raise_value_2(image_rgb, intrinsics, *, board_spec, qual
         board_spec=board_spec,
         quality_config=quality_config,
         board_object=board_object,
+        detector_config=detector_config,
     )

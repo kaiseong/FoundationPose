@@ -21,7 +21,11 @@ from visual_servoing.point_pose.live_camera_config import (
     is_default_camera_resolution,
 )
 
-from .charuco_reference import BoardObjectTransform, CharucoBoardSpec
+from .charuco_reference import (
+    CHARUCO_DETECTOR_PRESET_CONSERVATIVE,
+    BoardObjectTransform,
+    CharucoBoardSpec,
+)
 from .reference_dataset import count_reference_frames
 from .reference_processing import latest_processing_report
 from .reference_recording import ReferenceRecordingConfig, ReferenceRecordingSession, list_recording_sessions
@@ -193,6 +197,7 @@ class GuiCommandBuilder:
         sam_resolution: str = "1008",
         required_keyframes: str = "16",
         max_keyframes: str = "32",
+        charuco_detector_preset: str = CHARUCO_DETECTOR_PRESET_CONSERVATIVE,
         data_root: str | None = None,
     ) -> list[str]:
         if mode not in {
@@ -230,6 +235,8 @@ class GuiCommandBuilder:
             str(marker_length_m),
             "--dictionary",
             dictionary,
+            "--charuco-detector-preset",
+            charuco_detector_preset,
             "--object-xyz-m",
             *[str(value) for value in object_xyz_m],
             "--object-rpy-deg",

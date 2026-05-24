@@ -14,6 +14,10 @@ import numpy as np
 from visual_servoing.foundationpose_model_free.charuco_reference import (
     BoardObjectTransform,
     CharucoBoardSpec,
+    CharucoDetectorConfig,
+    CHARUCO_DETECTOR_PRESET_CONSERVATIVE,
+    CHARUCO_DETECTOR_PRESET_OPENCV_DEFAULT,
+    CHARUCO_DETECTOR_PRESETS,
     CharucoQualityConfig,
     detect_charuco_pose,
     draw_charuco_detection_debug_bgr,
@@ -78,6 +82,12 @@ def main() -> int:
     parser.add_argument("--marker-length-m", type=float, default=0.022)
     parser.add_argument("--dictionary", default="auto")
     parser.add_argument("--legacy-pattern", action="store_true")
+    parser.add_argument(
+        "--charuco-detector-preset",
+        choices=CHARUCO_DETECTOR_PRESETS,
+        default="opencv-default",
+        help="ChArUco detector parameter preset. Default preserves the existing OpenCV behavior.",
+    )
     parser.add_argument("--board-t-object", help="Path to 4x4 txt or JSON board_T_object.")
     parser.add_argument("--object-xyz-m", nargs=3, type=float, metavar=("X", "Y", "Z"))
     parser.add_argument("--object-rpy-deg", nargs=3, type=float, default=(0.0, 0.0, 0.0), metavar=("R", "P", "Y"))
@@ -99,6 +109,11 @@ def main() -> int:
     parser.add_argument("--min-mask-area-fraction", type=float, default=0.0005)
     parser.add_argument("--min-valid-depth-ratio", type=float, default=0.05)
     parser.add_argument("--evaluate-only", action="store_true")
+    parser.add_argument(
+        "--compare-charuco-detector-presets",
+        action="store_true",
+        help="With --process-recordings, run deterministic evaluate-only A/B for opencv-default vs conservative-charuco.",
+    )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
@@ -117,19 +132,20 @@ def main() -> int:
             max_reprojection_error_px=args.max_reprojection_error_px,
             min_image_coverage_fraction=args.min_image_coverage_fraction,
         )
+        detector_config = CharucoDetectorConfig(args.charuco_detector_preset)
         board_object = _board_object_from_args(args, required=not args.detect_only)
         if args.offline_generate:
-            payload = _offline_generate(args, board_spec, quality_config, board_object)
+            payload = _offline_generate(args, board_spec, quality_config, board_object, detector_config)
         elif args.detect_only:
-            payload = _detect_only(args, board_spec, quality_config, board_object)
+            payload = _detect_only(args, board_spec, quality_config, board_object, detector_config)
         elif args.live_capture:
-            payload = _live_capture(args, board_spec, quality_config, board_object)
+            payload = _live_capture(args, board_spec, quality_config, board_object, detector_config)
         elif args.record:
             payload = _record_raw(args, board_spec, board_object)
         elif args.process_recordings:
-            payload = _process_recordings(args, board_spec, quality_config, board_object)
+            payload = _process_recordings(args, board_spec, quality_config, board_object, detector_config)
         else:
-            payload = _reselect_recordings(args, board_spec, quality_config, board_object)
+            payload = _reselect_recordings(args, board_spec, quality_config, board_object, detector_config)
     except Exception as exc:
         payload = {"ok": False, "returncode": 2, "error": str(exc)}
         if args.json:
@@ -150,6 +166,7 @@ def _offline_generate(
     board_spec: CharucoBoardSpec,
     quality_config: CharucoQualityConfig,
     board_object: BoardObjectTransform,
+    detector_config: CharucoDetectorConfig,
 ) -> dict[str, Any]:
     if not args.object:
         raise ValueError("--object is required with --offline-generate")
@@ -159,6 +176,7 @@ def _offline_generate(
         board_spec=board_spec,
         quality_config=quality_config,
         board_object=board_object,
+        detector_config=detector_config,
     )
     write_charuco_reference_poses(profile, results, board_object=board_object)
     return {
@@ -167,6 +185,7 @@ def _offline_generate(
         "mode": "offline_generate",
         "object": profile.name,
         "frame_count": len(results),
+        "detector_preset": detector_config.preset,
         "selected_dictionaries": [result.selected_dictionary for result in results],
         "median_reprojection_error_px": _median_reprojection_error(results),
     }
@@ -177,6 +196,7 @@ def _detect_only(
     board_spec: CharucoBoardSpec,
     quality_config: CharucoQualityConfig,
     board_object: BoardObjectTransform,
+    detector_config: CharucoDetectorConfig,
 ) -> dict[str, Any]:
     if args.rgb:
         image = _load_rgb(args.rgb)
@@ -187,16 +207,18 @@ def _detect_only(
             board_spec=board_spec,
             quality_config=quality_config,
             board_object=board_object,
+            detector_config=detector_config,
         )
         preview_path = _write_axis_preview_if_requested(args, image, intrinsics, result)
         return {
             "ok": result.ok,
             "returncode": 0 if result.ok else 1,
             "mode": "detect_only",
+            "detector_preset": detector_config.preset,
             "preview_path": preview_path,
             "result": result.to_metadata(),
         }
-    return _live_detect_only(args, board_spec, quality_config, board_object)
+    return _live_detect_only(args, board_spec, quality_config, board_object, detector_config)
 
 
 def _live_detect_only(
@@ -204,9 +226,12 @@ def _live_detect_only(
     board_spec: CharucoBoardSpec,
     quality_config: CharucoQualityConfig,
     board_object: BoardObjectTransform,
+    detector_config: CharucoDetectorConfig,
 ) -> dict[str, Any]:
     cv2 = _require_cv2()
     accepted = 0
+    last_status_text: str | None = None
+    last_status_time = 0.0
     with LiveRgbdCamera(
         model=args.camera,
         serial=args.serial,
@@ -222,12 +247,15 @@ def _live_detect_only(
                 board_spec=board_spec,
                 quality_config=quality_config,
                 board_object=board_object,
+                detector_config=detector_config,
             )
             preview_path = _write_axis_preview_if_requested(args, frame.rgb, frame.intrinsics, result)
+            _print_preview_status(result.to_metadata(), force=True)
             return {
                 "ok": result.ok,
                 "returncode": 0 if result.ok else 1,
                 "mode": "detect_only_capture_once",
+                "detector_preset": detector_config.preset,
                 "preview_path": preview_path,
                 "result": result.to_metadata(),
             }
@@ -239,8 +267,15 @@ def _live_detect_only(
                 board_spec=board_spec,
                 quality_config=quality_config,
                 board_object=board_object,
+                detector_config=detector_config,
             )
             accepted += int(result.ok)
+            metadata = result.to_metadata()
+            last_status_text, last_status_time = _print_preview_status(
+                metadata,
+                last_text=last_status_text,
+                last_time=last_status_time,
+            )
             if result.ok:
                 preview = draw_charuco_axes_overlay_bgr(
                     frame.rgb,
@@ -248,15 +283,20 @@ def _live_detect_only(
                     result,
                     axis_length_m=args.axis_length_m,
                 )
-                preview = _draw_status_on_bgr(preview, result.to_metadata())
             else:
-                preview = _draw_live_status(frame.rgb, result.to_metadata())
+                preview = _draw_live_status(frame.rgb, metadata)
             cv2.imshow("ChArUco Detect Preview", preview)
             key = cv2.waitKey(1) & 0xFF
             if key in {ord("q"), 27}:
                 break
     cv2.destroyWindow("ChArUco Detect Preview")
-    return {"ok": True, "returncode": 0, "mode": "detect_only_live", "accepted_preview_frames": accepted}
+    return {
+        "ok": True,
+        "returncode": 0,
+        "mode": "detect_only_live",
+        "detector_preset": detector_config.preset,
+        "accepted_preview_frames": accepted,
+    }
 
 
 def _read_after_warmup(camera, warmup_frames: int):
@@ -273,6 +313,7 @@ def _live_capture(
     board_spec: CharucoBoardSpec,
     quality_config: CharucoQualityConfig,
     board_object: BoardObjectTransform,
+    detector_config: CharucoDetectorConfig,
 ) -> dict[str, Any]:
     if not args.object:
         raise ValueError("--object is required with --live-capture")
@@ -296,6 +337,7 @@ def _live_capture(
         height=args.height,
         fps=args.fps,
     ) as camera:
+        print("ChArUco Reference Capture: press C/Space to capture, Q to quit", flush=True)
         while accepted < args.frames:
             frame = camera.read()
             preview = _draw_live_status(frame.rgb, {"ok": None, "message": "press C/Space to capture, Q to quit"})
@@ -312,6 +354,7 @@ def _live_capture(
                 board_spec=board_spec,
                 quality_config=quality_config,
                 board_object=board_object,
+                detector_config=detector_config,
             )
             timing_ms = {"charuco_pose_ms": (time.perf_counter() - start) * 1000.0}
             if not result.ok or result.cam_in_ob is None:
@@ -369,6 +412,7 @@ def _live_capture(
         "returncode": 0 if accepted > 0 else 1,
         "mode": "live_capture",
         "object": profile.name,
+        "detector_preset": detector_config.preset,
         "accepted": accepted,
         "rejected": rejected,
         "records": records,
@@ -430,22 +474,25 @@ def _process_recordings(
     board_spec: CharucoBoardSpec,
     quality_config: CharucoQualityConfig,
     board_object: BoardObjectTransform,
+    detector_config: CharucoDetectorConfig,
 ) -> dict[str, Any]:
     if not args.object:
         raise ValueError("--object is required with --process-recordings")
     profile = ObjectProfileRegistry(args.data_root).get(args.object)
-    provider = Sam3MaskProvider(
-        prompt=args.prompt or profile.prompt,
-        device=args.device,
-        confidence_threshold=args.threshold,
-        resolution=args.sam_resolution,
-    )
     config = ReferenceProcessingConfig(
         required_keyframes=args.required_keyframes,
         max_keyframes=args.max_keyframes,
         min_mask_area_fraction=args.min_mask_area_fraction,
         min_valid_depth_ratio=args.min_valid_depth_ratio,
         publish=not args.evaluate_only,
+    )
+    if args.compare_charuco_detector_presets:
+        return _compare_charuco_detector_presets(args, profile, board_spec, quality_config, board_object, config)
+    provider = Sam3MaskProvider(
+        prompt=args.prompt or profile.prompt,
+        device=args.device,
+        confidence_threshold=args.threshold,
+        resolution=args.sam_resolution,
     )
     if args.evaluate_only:
         report = evaluate_recorded_references(
@@ -455,6 +502,7 @@ def _process_recordings(
             quality_config=quality_config,
             board_object=board_object,
             config=config,
+            detector_config=detector_config,
         )
     else:
         report = process_recorded_references(
@@ -464,12 +512,126 @@ def _process_recordings(
             quality_config=quality_config,
             board_object=board_object,
             config=config,
+            detector_config=detector_config,
         )
     payload = report.to_dict()
     payload["ok"] = report.ok
     payload["returncode"] = 0 if report.accepted > 0 else 1
     payload["mode"] = "process_recordings"
+    payload["detector_preset"] = detector_config.preset
     return payload
+
+
+def _compare_charuco_detector_presets(
+    args: argparse.Namespace,
+    profile,
+    board_spec: CharucoBoardSpec,
+    quality_config: CharucoQualityConfig,
+    board_object: BoardObjectTransform,
+    config: ReferenceProcessingConfig,
+) -> dict[str, Any]:
+    eval_config = ReferenceProcessingConfig(
+        required_keyframes=config.required_keyframes,
+        max_keyframes=config.max_keyframes,
+        min_mask_area_fraction=config.min_mask_area_fraction,
+        min_valid_depth_ratio=config.min_valid_depth_ratio,
+        min_depth_m=config.min_depth_m,
+        max_depth_m=config.max_depth_m,
+        publish=False,
+    )
+    reports = {}
+    for preset in (CHARUCO_DETECTOR_PRESET_OPENCV_DEFAULT, CHARUCO_DETECTOR_PRESET_CONSERVATIVE):
+        provider = Sam3MaskProvider(
+            prompt=args.prompt or profile.prompt,
+            device=args.device,
+            confidence_threshold=args.threshold,
+            resolution=args.sam_resolution,
+        )
+        reports[preset] = evaluate_recorded_references(
+            profile,
+            mask_provider=provider,
+            board_spec=board_spec,
+            quality_config=quality_config,
+            board_object=board_object,
+            config=eval_config,
+            detector_config=CharucoDetectorConfig(preset),
+        )
+    payload = _charuco_detector_ab_payload(profile.name, reports)
+    profile.logs_dir.mkdir(parents=True, exist_ok=True)
+    report_path = profile.logs_dir / "charuco_detector_ab_latest.json"
+    payload["report_path"] = str(report_path)
+    report_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    payload["ok"] = bool(reports[CHARUCO_DETECTOR_PRESET_CONSERVATIVE].accepted > 0)
+    payload["returncode"] = 0 if payload["ok"] else 1
+    payload["mode"] = "compare_charuco_detector_presets"
+    return payload
+
+
+def _charuco_detector_ab_payload(object_name: str, reports: dict[str, Any]) -> dict[str, Any]:
+    baseline = reports[CHARUCO_DETECTOR_PRESET_OPENCV_DEFAULT]
+    tuned = reports[CHARUCO_DETECTOR_PRESET_CONSERVATIVE]
+    baseline_metrics = _charuco_report_metrics(baseline)
+    tuned_metrics = _charuco_report_metrics(tuned)
+    baseline_median = baseline_metrics["median_reprojection_error_px"]
+    tuned_median = tuned_metrics["median_reprojection_error_px"]
+    median_delta = None
+    if baseline_median is not None and tuned_median is not None:
+        median_delta = float(tuned_median) - float(baseline_median)
+    return {
+        "object": object_name,
+        "baseline_preset": CHARUCO_DETECTOR_PRESET_OPENCV_DEFAULT,
+        "tuned_preset": CHARUCO_DETECTOR_PRESET_CONSERVATIVE,
+        "baseline": baseline.to_dict(),
+        "tuned": tuned.to_dict(),
+        "comparison": {
+            "accepted_delta": int(tuned.accepted) - int(baseline.accepted),
+            "median_reprojection_delta_px": median_delta,
+            "baseline_metrics": baseline_metrics,
+            "tuned_metrics": tuned_metrics,
+        },
+    }
+
+
+def _charuco_report_metrics(report) -> dict[str, Any]:
+    values = []
+    view_bins: dict[str, int] = {}
+    for record in report.records:
+        if not record.get("accepted"):
+            continue
+        if record.get("view_bin") is not None:
+            key = str(record["view_bin"])
+            view_bins[key] = view_bins.get(key, 0) + 1
+        value = _record_reprojection_error(record)
+        if value is not None:
+            values.append(value)
+    return {
+        "accepted": int(report.accepted),
+        "rejected": int(report.rejected),
+        "processed_candidates": int(report.processed_candidates),
+        "median_reprojection_error_px": float(np.median(np.asarray(values, dtype=np.float64))) if values else None,
+        "view_bins": dict(sorted(view_bins.items(), key=lambda item: int(item[0]))),
+    }
+
+
+def _record_reprojection_error(record: dict[str, Any]) -> float | None:
+    pose = record.get("charuco_pose")
+    if not isinstance(pose, dict):
+        return None
+    selected_dictionary = pose.get("selected_dictionary")
+    candidates = pose.get("candidates")
+    if not isinstance(candidates, list):
+        return None
+    values = [
+        candidate.get("reprojection_error_px")
+        for candidate in candidates
+        if isinstance(candidate, dict)
+        and candidate.get("ok")
+        and (selected_dictionary is None or candidate.get("dictionary") == selected_dictionary)
+    ]
+    values = [float(value) for value in values if value is not None]
+    if not values:
+        return None
+    return min(values)
 
 
 def _reselect_recordings(
@@ -477,6 +639,7 @@ def _reselect_recordings(
     board_spec: CharucoBoardSpec,
     quality_config: CharucoQualityConfig,
     board_object: BoardObjectTransform,
+    detector_config: CharucoDetectorConfig,
 ) -> dict[str, Any]:
     if not args.object:
         raise ValueError("--object is required with --reselect-recordings")
@@ -494,11 +657,13 @@ def _reselect_recordings(
         quality_config=quality_config,
         board_object=board_object,
         config=config,
+        detector_config=detector_config,
     )
     payload = report.to_dict()
     payload["ok"] = report.ok
     payload["returncode"] = 0 if report.accepted > 0 else 1
     payload["mode"] = "reselect_recordings"
+    payload["detector_preset"] = detector_config.preset
     return payload
 
 
@@ -581,7 +746,11 @@ def _draw_live_status(image_rgb: np.ndarray, metadata: dict[str, Any]):
 
 
 def _draw_status_on_bgr(image, metadata: dict[str, Any]):
-    cv2 = _require_cv2()
+    _ = metadata
+    return image
+
+
+def _preview_status_text(metadata: dict[str, Any]) -> str:
     ok = metadata.get("ok")
     text = f"ChArUco: {'OK' if ok else 'WAIT' if ok is None else 'REJECT'}"
     if metadata.get("selected_dictionary"):
@@ -590,8 +759,23 @@ def _draw_status_on_bgr(image, metadata: dict[str, Any]):
         text += " | " + "; ".join(str(item) for item in metadata["reject_reasons"][:2])
     if metadata.get("message"):
         text = str(metadata["message"])
-    cv2.putText(image, text, (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
-    return image
+    return text
+
+
+def _print_preview_status(
+    metadata: dict[str, Any],
+    *,
+    last_text: str | None = None,
+    last_time: float = 0.0,
+    force: bool = False,
+    min_interval_s: float = 1.0,
+) -> tuple[str, float]:
+    text = _preview_status_text(metadata)
+    now = time.monotonic()
+    if force or text != last_text or now - last_time >= min_interval_s:
+        print(text, flush=True)
+        return text, now
+    return last_text or text, last_time
 
 
 def _human_summary(payload: dict[str, Any]) -> str:

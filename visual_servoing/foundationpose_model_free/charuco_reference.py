@@ -17,6 +17,26 @@ from .reference_pose import reference_indices, write_reference_poses
 
 DICT_5X5_CANDIDATES = ("DICT_5X5_50", "DICT_5X5_100", "DICT_5X5_250", "DICT_5X5_1000")
 POSE_SOURCE = "charuco_board_jig"
+CHARUCO_DETECTOR_PRESET_OPENCV_DEFAULT = "opencv-default"
+CHARUCO_DETECTOR_PRESET_CONSERVATIVE = "conservative-charuco"
+CHARUCO_DETECTOR_PRESETS = (
+    CHARUCO_DETECTOR_PRESET_OPENCV_DEFAULT,
+    CHARUCO_DETECTOR_PRESET_CONSERVATIVE,
+)
+_CONSERVATIVE_CHARUCO_DETECTOR_PARAMETERS: dict[str, Any] = {
+    "cornerRefinementMethod": "CORNER_REFINE_SUBPIX",
+    "cornerRefinementWinSize": 5,
+    "cornerRefinementMaxIterations": 50,
+    "cornerRefinementMinAccuracy": 0.01,
+    "adaptiveThreshWinSizeMin": 3,
+    "adaptiveThreshWinSizeMax": 23,
+    "adaptiveThreshWinSizeStep": 3,
+    "adaptiveThreshConstant": 7,
+    "polygonalApproxAccuracyRate": 0.01,
+    "minDistanceToBorder": 3,
+    "minMarkerPerimeterRate": 0.01,
+    "perspectiveRemovePixelPerCell": 12,
+}
 
 
 @dataclass(frozen=True)
@@ -68,6 +88,31 @@ class CharucoQualityConfig:
             "min_markers": int(self.min_markers),
             "max_reprojection_error_px": float(self.max_reprojection_error_px),
             "min_image_coverage_fraction": float(self.min_image_coverage_fraction),
+        }
+
+
+@dataclass(frozen=True)
+class CharucoDetectorConfig:
+    preset: str = CHARUCO_DETECTOR_PRESET_OPENCV_DEFAULT
+
+    def __post_init__(self) -> None:
+        preset = str(self.preset).strip().lower()
+        if preset not in CHARUCO_DETECTOR_PRESETS:
+            raise ValueError(
+                "unsupported ChArUco detector preset: "
+                f"{self.preset}; expected one of {', '.join(CHARUCO_DETECTOR_PRESETS)}"
+            )
+        object.__setattr__(self, "preset", preset)
+
+    def parameter_summary(self) -> dict[str, Any]:
+        if self.preset == CHARUCO_DETECTOR_PRESET_CONSERVATIVE:
+            return dict(_CONSERVATIVE_CHARUCO_DETECTOR_PARAMETERS)
+        return {}
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "detector_preset": self.preset,
+            "detector_parameters": self.parameter_summary(),
         }
 
 
@@ -145,6 +190,8 @@ class DictionaryCandidateResult:
     camera_T_object: np.ndarray | None = None
     cam_in_ob: np.ndarray | None = None
     distortion_policy: str = "unknown"
+    detector_preset: str = CHARUCO_DETECTOR_PRESET_OPENCV_DEFAULT
+    detector_parameters: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self, *, include_matrices: bool = False) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -159,6 +206,8 @@ class DictionaryCandidateResult:
             "image_coverage_fraction": float(self.image_coverage_fraction),
             "reject_reasons": list(self.reject_reasons),
             "distortion_policy": self.distortion_policy,
+            "detector_preset": self.detector_preset,
+            "detector_parameters": dict(self.detector_parameters),
         }
         if include_matrices:
             data["camera_T_board"] = _matrix_to_list(self.camera_T_board)
@@ -181,6 +230,8 @@ class CharucoPoseResult:
     camera_T_object: np.ndarray | None = None
     cam_in_ob: np.ndarray | None = None
     reject_reasons: list[str] = field(default_factory=list)
+    detector_preset: str = CHARUCO_DETECTOR_PRESET_OPENCV_DEFAULT
+    detector_parameters: dict[str, Any] = field(default_factory=dict)
 
     @property
     def best_candidate(self) -> DictionaryCandidateResult | None:
@@ -195,6 +246,8 @@ class CharucoPoseResult:
             "opencv_version": self.opencv_version,
             "board_coordinate_convention": self.board_coordinate_convention,
             "legacy_pattern": bool(self.legacy_pattern),
+            "detector_preset": self.detector_preset,
+            "detector_parameters": dict(self.detector_parameters),
             "camera_T_board": _matrix_to_list(self.camera_T_board),
             "camera_T_object": _matrix_to_list(self.camera_T_object),
             "cam_in_ob": _matrix_to_list(self.cam_in_ob),
@@ -237,11 +290,14 @@ def detect_charuco_pose(
     board_spec: CharucoBoardSpec | None = None,
     quality_config: CharucoQualityConfig | None = None,
     board_object: BoardObjectTransform | None = None,
+    detector_config: CharucoDetectorConfig | None = None,
+    detector_preset: str | None = None,
 ) -> CharucoPoseResult:
     cv2 = _require_cv2()
     board_spec = board_spec or CharucoBoardSpec()
     quality_config = quality_config or CharucoQualityConfig()
     board_object = board_object or BoardObjectTransform.identity()
+    detector_config = _resolve_detector_config(detector_config, detector_preset)
     image = np.asarray(image_rgb)
     if image.ndim != 3 or image.shape[2] != 3:
         raise ValueError(f"image_rgb must have shape (H, W, 3), got {image.shape}")
@@ -261,6 +317,7 @@ def detect_charuco_pose(
                         dictionary_name=dictionary_name,
                         legacy_pattern=legacy_pattern,
                         board_T_object=board_object.board_T_object,
+                        detector_config=detector_config,
                     )
                 )
     best = choose_best_dictionary_result(candidates)
@@ -279,6 +336,8 @@ def detect_charuco_pose(
         camera_T_object=best.camera_T_object if best and best.ok else None,
         cam_in_ob=best.cam_in_ob if best and best.ok else None,
         reject_reasons=[] if ok else (best.reject_reasons if best else ["no dictionary candidates"]),
+        detector_preset=detector_config.preset,
+        detector_parameters=detector_config.parameter_summary(),
     )
 
 
@@ -288,6 +347,7 @@ def generate_charuco_reference_poses(
     board_spec: CharucoBoardSpec,
     quality_config: CharucoQualityConfig,
     board_object: BoardObjectTransform,
+    detector_config: CharucoDetectorConfig | None = None,
 ) -> list[CharucoPoseResult]:
     intrinsics = load_reference_intrinsics(profile)
     indices = reference_indices(profile)
@@ -300,6 +360,7 @@ def generate_charuco_reference_poses(
             board_spec=board_spec,
             quality_config=quality_config,
             board_object=board_object,
+            detector_config=detector_config,
         )
         results.append(result)
     failures = [(index, result.reject_reasons) for index, result in zip(indices, results) if not result.ok]
@@ -371,11 +432,14 @@ def build_charuco_pose_provenance(
         "opencv_version": first.opencv_version if first else None,
         "board_coordinate_convention": first.board_coordinate_convention if first else None,
         "legacy_pattern": first.legacy_pattern if first else None,
+        "detector_preset": first.detector_preset if first else None,
+        "detector_parameters": dict(first.detector_parameters) if first else {},
         "distortion_policy": _summarize_distortion_policy(results),
         "frame_quality": [
             {
                 "index": index,
                 "selected_dictionary": result.selected_dictionary,
+                "detector_preset": result.detector_preset,
                 "corner_count": result.best_candidate.corner_count if result.best_candidate else 0,
                 "marker_count": result.best_candidate.marker_count if result.best_candidate else 0,
                 "reprojection_error_px": result.best_candidate.reprojection_error_px if result.best_candidate else None,
@@ -409,6 +473,8 @@ def provenance_summary(profile: ObjectProfile) -> dict[str, Any] | None:
         "opencv_version": provenance.get("opencv_version"),
         "board_coordinate_convention": provenance.get("board_coordinate_convention"),
         "legacy_pattern": provenance.get("legacy_pattern"),
+        "detector_preset": provenance.get("detector_preset"),
+        "detector_parameters": provenance.get("detector_parameters"),
         "distortion_policy": provenance.get("distortion_policy"),
         "frame_quality": provenance.get("frame_quality"),
     }
@@ -454,26 +520,6 @@ def draw_charuco_axes_overlay_bgr(
     _draw_axis_arrow(image_bgr, origin, y_end, (0, 255, 0), "+Y")
     _draw_axis_arrow(image_bgr, origin, z_end, (255, 0, 0), "+Z")
     _draw_origin_marker(image_bgr, origin)
-    cv2.putText(
-        image_bgr,
-        "Board origin: O | red +X, green +Y, blue +Z",
-        (16, 28),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        (0, 0, 0),
-        5,
-        cv2.LINE_AA,
-    )
-    cv2.putText(
-        image_bgr,
-        "Board origin: O | red +X, green +Y, blue +Z",
-        (16, 28),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        (255, 255, 255),
-        2,
-        cv2.LINE_AA,
-    )
     return image_bgr
 
 
@@ -494,25 +540,6 @@ def draw_charuco_detection_debug_bgr(image_rgb: np.ndarray, result: CharucoPoseR
     except Exception:
         pass
 
-    marker_count = candidate.marker_count if candidate is not None else 0
-    corner_count = candidate.corner_count if candidate is not None else 0
-    legacy = candidate.legacy_pattern if candidate is not None else result.legacy_pattern
-    reasons = result.reject_reasons or (candidate.reject_reasons if candidate is not None else [])
-    lines = [
-        f"ChArUco rejected: markers={marker_count} corners={corner_count} legacy={legacy}",
-        "; ".join(str(item) for item in reasons[:2]) if reasons else "no rejection reason reported",
-    ]
-    for row, text in enumerate(lines):
-        cv2.putText(
-            image_bgr,
-            text,
-            (16, 28 + row * 28),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (0, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
     return image_bgr
 
 
@@ -572,32 +599,35 @@ def _detect_candidate(
     dictionary_name: str,
     legacy_pattern: bool,
     board_T_object: np.ndarray,
+    detector_config: CharucoDetectorConfig,
 ) -> DictionaryCandidateResult:
     reject_reasons: list[str] = []
+    detector_parameters = detector_config.parameter_summary()
+
+    def candidate_result(**overrides) -> DictionaryCandidateResult:
+        data: dict[str, Any] = {
+            "dictionary": dictionary_name,
+            "ok": False,
+            "legacy_pattern": legacy_pattern,
+            "squares_x": board_spec.squares_x,
+            "squares_y": board_spec.squares_y,
+            "detector_preset": detector_config.preset,
+            "detector_parameters": detector_parameters,
+        }
+        data.update(overrides)
+        return DictionaryCandidateResult(**data)
+
     try:
         board = _create_board(cv2, board_spec, dictionary_name, legacy_pattern=legacy_pattern)
     except Exception as exc:
-        return DictionaryCandidateResult(
-            dictionary=dictionary_name,
-            ok=False,
-            legacy_pattern=legacy_pattern,
-            squares_x=board_spec.squares_x,
-            squares_y=board_spec.squares_y,
-            reject_reasons=[str(exc)],
-        )
+        return candidate_result(reject_reasons=[str(exc)])
 
     try:
-        detector = cv2.aruco.CharucoDetector(board)
+        detector, detector_metadata = _create_charuco_detector(cv2, board, detector_config)
+        detector_parameters = detector_metadata
         charuco_corners, charuco_ids, marker_corners, marker_ids = detector.detectBoard(gray)
     except Exception as exc:
-        return DictionaryCandidateResult(
-            dictionary=dictionary_name,
-            ok=False,
-            legacy_pattern=legacy_pattern,
-            squares_x=board_spec.squares_x,
-            squares_y=board_spec.squares_y,
-            reject_reasons=[f"ChArUco detection failed: {exc}"],
-        )
+        return candidate_result(reject_reasons=[f"ChArUco detection failed: {exc}"])
 
     corner_count = 0 if charuco_corners is None else int(len(charuco_corners))
     marker_count = 0 if marker_ids is None else int(len(marker_ids))
@@ -606,12 +636,7 @@ def _detect_candidate(
     if marker_count < quality_config.min_markers:
         reject_reasons.append(f"marker count {marker_count} below minimum {quality_config.min_markers}")
     if charuco_corners is None or charuco_ids is None or corner_count == 0:
-        return DictionaryCandidateResult(
-            dictionary=dictionary_name,
-            ok=False,
-            legacy_pattern=legacy_pattern,
-            squares_x=board_spec.squares_x,
-            squares_y=board_spec.squares_y,
+        return candidate_result(
             corner_count=corner_count,
             marker_count=marker_count,
             reject_reasons=reject_reasons or ["no ChArUco corners detected"],
@@ -621,12 +646,7 @@ def _detect_candidate(
         object_points, image_points = board.matchImagePoints(charuco_corners, charuco_ids)
     except Exception as exc:
         reject_reasons.append(f"matchImagePoints failed: {exc}")
-        return DictionaryCandidateResult(
-            dictionary=dictionary_name,
-            ok=False,
-            legacy_pattern=legacy_pattern,
-            squares_x=board_spec.squares_x,
-            squares_y=board_spec.squares_y,
+        return candidate_result(
             corner_count=corner_count,
             marker_count=marker_count,
             reject_reasons=reject_reasons,
@@ -653,12 +673,7 @@ def _detect_candidate(
         )
     except Exception as exc:
         reject_reasons.append(f"solvePnP failed: {exc}")
-        return DictionaryCandidateResult(
-            dictionary=dictionary_name,
-            ok=False,
-            legacy_pattern=legacy_pattern,
-            squares_x=board_spec.squares_x,
-            squares_y=board_spec.squares_y,
+        return candidate_result(
             corner_count=corner_count,
             marker_count=marker_count,
             image_coverage_fraction=coverage,
@@ -667,12 +682,7 @@ def _detect_candidate(
         )
     if not pnp_ok:
         reject_reasons.append("solvePnP returned false")
-        return DictionaryCandidateResult(
-            dictionary=dictionary_name,
-            ok=False,
-            legacy_pattern=legacy_pattern,
-            squares_x=board_spec.squares_x,
-            squares_y=board_spec.squares_y,
+        return candidate_result(
             corner_count=corner_count,
             marker_count=marker_count,
             image_coverage_fraction=coverage,
@@ -683,12 +693,7 @@ def _detect_candidate(
         rotation, _ = cv2.Rodrigues(rvec)
     except Exception as exc:
         reject_reasons.append(f"Rodrigues failed: {exc}")
-        return DictionaryCandidateResult(
-            dictionary=dictionary_name,
-            ok=False,
-            legacy_pattern=legacy_pattern,
-            squares_x=board_spec.squares_x,
-            squares_y=board_spec.squares_y,
+        return candidate_result(
             corner_count=corner_count,
             marker_count=marker_count,
             image_coverage_fraction=coverage,
@@ -700,12 +705,7 @@ def _detect_candidate(
     camera_T_board[:3, 3] = np.asarray(tvec, dtype=np.float64).reshape(3)
     if not np.all(np.isfinite(camera_T_board)):
         reject_reasons.append("camera_T_board contains non-finite values")
-        return DictionaryCandidateResult(
-            dictionary=dictionary_name,
-            ok=False,
-            legacy_pattern=legacy_pattern,
-            squares_x=board_spec.squares_x,
-            squares_y=board_spec.squares_y,
+        return candidate_result(
             corner_count=corner_count,
             marker_count=marker_count,
             image_coverage_fraction=coverage,
@@ -726,12 +726,7 @@ def _detect_candidate(
         )
     except Exception as exc:
         reject_reasons.append(f"projectPoints failed: {exc}")
-        return DictionaryCandidateResult(
-            dictionary=dictionary_name,
-            ok=False,
-            legacy_pattern=legacy_pattern,
-            squares_x=board_spec.squares_x,
-            squares_y=board_spec.squares_y,
+        return candidate_result(
             corner_count=corner_count,
             marker_count=marker_count,
             image_coverage_fraction=coverage,
@@ -742,12 +737,7 @@ def _detect_candidate(
     projected_xy = np.asarray(projected).reshape(-1, 2)
     if not np.all(np.isfinite(projected_xy)):
         reject_reasons.append("projected ChArUco corners contain non-finite values")
-        return DictionaryCandidateResult(
-            dictionary=dictionary_name,
-            ok=False,
-            legacy_pattern=legacy_pattern,
-            squares_x=board_spec.squares_x,
-            squares_y=board_spec.squares_y,
+        return candidate_result(
             corner_count=corner_count,
             marker_count=marker_count,
             image_coverage_fraction=coverage,
@@ -764,12 +754,8 @@ def _detect_candidate(
     camera_T_object = camera_T_object_from_board(camera_T_board, board_T_object)
     cam_in_ob = cam_in_ob_from_camera_T_object(camera_T_object)
     ok = not reject_reasons
-    return DictionaryCandidateResult(
-        dictionary=dictionary_name,
+    return candidate_result(
         ok=ok,
-        legacy_pattern=legacy_pattern,
-        squares_x=board_spec.squares_x,
-        squares_y=board_spec.squares_y,
         corner_count=corner_count,
         marker_count=marker_count,
         reprojection_error_px=float(reprojection_error),
@@ -780,6 +766,65 @@ def _detect_candidate(
         cam_in_ob=cam_in_ob,
         distortion_policy=distortion_policy,
     )
+
+
+def _resolve_detector_config(
+    detector_config: CharucoDetectorConfig | None,
+    detector_preset: str | None,
+) -> CharucoDetectorConfig:
+    if detector_config is not None and detector_preset is not None:
+        requested = CharucoDetectorConfig(detector_preset)
+        if requested.preset != detector_config.preset:
+            raise ValueError(
+                "detector_config and detector_preset disagree: "
+                f"{detector_config.preset} != {requested.preset}"
+            )
+    if detector_config is not None:
+        return detector_config
+    return CharucoDetectorConfig(detector_preset or CHARUCO_DETECTOR_PRESET_OPENCV_DEFAULT)
+
+
+def _create_charuco_detector(cv2, board, detector_config: CharucoDetectorConfig):
+    if detector_config.preset == CHARUCO_DETECTOR_PRESET_OPENCV_DEFAULT:
+        return cv2.aruco.CharucoDetector(board), detector_config.parameter_summary()
+
+    detector_parameters = cv2.aruco.DetectorParameters()
+    applied: dict[str, Any] = {}
+    unsupported: list[str] = []
+    for name, value in detector_config.parameter_summary().items():
+        if not hasattr(detector_parameters, name):
+            unsupported.append(name)
+            continue
+        applied[name] = _set_detector_parameter(cv2, detector_parameters, name, value)
+
+    metadata: dict[str, Any] = dict(applied)
+    if unsupported:
+        metadata["_unsupported_parameters"] = unsupported
+
+    charuco_parameters = cv2.aruco.CharucoParameters() if hasattr(cv2.aruco, "CharucoParameters") else None
+    refine_parameters = cv2.aruco.RefineParameters() if hasattr(cv2.aruco, "RefineParameters") else None
+    try:
+        if charuco_parameters is not None and refine_parameters is not None:
+            detector = cv2.aruco.CharucoDetector(board, charuco_parameters, detector_parameters, refine_parameters)
+        elif charuco_parameters is not None:
+            detector = cv2.aruco.CharucoDetector(board, charuco_parameters, detector_parameters)
+        else:
+            detector = cv2.aruco.CharucoDetector(board)
+            metadata["_constructor_fallback"] = "CharucoDetector(board)"
+    except Exception as exc:
+        detector = cv2.aruco.CharucoDetector(board)
+        metadata["_constructor_fallback"] = "CharucoDetector(board)"
+        metadata["_constructor_error"] = str(exc)
+    return detector, metadata
+
+
+def _set_detector_parameter(cv2, detector_parameters, name: str, value: Any) -> Any:
+    if name == "cornerRefinementMethod" and value == "CORNER_REFINE_SUBPIX":
+        actual = getattr(cv2.aruco, "CORNER_REFINE_SUBPIX", 1)
+    else:
+        actual = value
+    setattr(detector_parameters, name, actual)
+    return value
 
 
 def _candidate_legacy_patterns(spec: CharucoBoardSpec) -> tuple[bool, ...]:

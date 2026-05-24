@@ -110,6 +110,7 @@ def test_gui_command_builder_constructs_charuco_offline_command_with_board_defau
     assert command[command.index("--squares-y") + 1] == "8"
     assert command[command.index("--square-length-m") + 1] == "0.030"
     assert command[command.index("--marker-length-m") + 1] == "0.022"
+    assert command[command.index("--charuco-detector-preset") + 1] == "conservative-charuco"
     assert command[command.index("--object-xyz-m") + 1 : command.index("--object-xyz-m") + 4] == [
         "0.10",
         "0.02",
@@ -137,6 +138,7 @@ def test_gui_command_builder_constructs_charuco_axis_snapshot_command(tmp_path):
     assert "--capture-once" in command
     assert command[command.index("--preview-output") + 1] == "/tmp/axis.png"
     assert command[command.index("--axis-length-m") + 1] == "0.05"
+    assert command[command.index("--charuco-detector-preset") + 1] == "conservative-charuco"
     assert command[command.index("--device") + 1] == "auto"
 
 
@@ -185,6 +187,9 @@ def test_gui_command_builder_constructs_record_and_process_commands(tmp_path):
     assert "--record" in record
     assert "--process-recordings" in process
     assert "--reselect-recordings" in reselect
+    assert record[record.index("--charuco-detector-preset") + 1] == "conservative-charuco"
+    assert process[process.index("--charuco-detector-preset") + 1] == "conservative-charuco"
+    assert reselect[reselect.index("--charuco-detector-preset") + 1] == "conservative-charuco"
     assert record[record.index("--serial") + 1] == "abc123"
     assert record[record.index("--object-xyz-m") + 1 : record.index("--object-xyz-m") + 4] == [
         "0.01",

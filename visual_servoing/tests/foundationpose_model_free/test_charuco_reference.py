@@ -6,6 +6,8 @@ import pytest
 from visual_servoing.foundationpose_model_free.charuco_reference import (
     BoardObjectTransform,
     CharucoBoardSpec,
+    CharucoDetectorConfig,
+    CHARUCO_DETECTOR_PRESET_CONSERVATIVE,
     CharucoQualityConfig,
     DictionaryCandidateResult,
     camera_T_object_from_board,
@@ -13,6 +15,7 @@ from visual_servoing.foundationpose_model_free.charuco_reference import (
     choose_best_dictionary_result,
     detect_charuco_pose,
     draw_charuco_axes_overlay_bgr,
+    _create_charuco_detector,
 )
 from visual_servoing.point_pose.rgbd_geometry import CameraIntrinsics
 
@@ -81,6 +84,61 @@ def test_unsupported_dictionary_name_reports_clear_reject_reason():
 
     assert result.ok is False
     assert "unsupported ChArUco dictionary" in result.reject_reasons[0]
+
+
+def test_conservative_detector_preset_is_reported_in_metadata():
+    image = np.zeros((100, 100, 3), dtype=np.uint8)
+    intr = CameraIntrinsics(fx=100.0, fy=100.0, cx=50.0, cy=50.0, width=100, height=100)
+
+    result = detect_charuco_pose(
+        image,
+        intr,
+        board_spec=CharucoBoardSpec(dictionary="DICT_5X5_100"),
+        quality_config=CharucoQualityConfig(min_corners=1, min_markers=1),
+        detector_config=CharucoDetectorConfig(CHARUCO_DETECTOR_PRESET_CONSERVATIVE),
+    )
+
+    metadata = result.to_metadata()
+    assert metadata["detector_preset"] == CHARUCO_DETECTOR_PRESET_CONSERVATIVE
+    assert metadata["detector_parameters"]["cornerRefinementMethod"] == "CORNER_REFINE_SUBPIX"
+    assert result.candidates
+    assert result.candidates[0].detector_preset == CHARUCO_DETECTOR_PRESET_CONSERVATIVE
+
+
+def test_detector_preset_rejects_unknown_value():
+    with pytest.raises(ValueError, match="unsupported ChArUco detector preset"):
+        CharucoDetectorConfig("aggressive")
+
+
+def test_conservative_detector_constructor_fallback_keeps_error_metadata():
+    class FakeAruco:
+        class DetectorParameters:
+            pass
+
+        class CharucoParameters:
+            pass
+
+        class RefineParameters:
+            pass
+
+        @staticmethod
+        def CharucoDetector(*args):
+            if len(args) > 1:
+                raise RuntimeError("overload mismatch")
+            return "detector"
+
+    class FakeCv2:
+        aruco = FakeAruco
+
+    detector, metadata = _create_charuco_detector(
+        FakeCv2,
+        object(),
+        CharucoDetectorConfig(CHARUCO_DETECTOR_PRESET_CONSERVATIVE),
+    )
+
+    assert detector == "detector"
+    assert metadata["_constructor_fallback"] == "CharucoDetector(board)"
+    assert "overload mismatch" in metadata["_constructor_error"]
 
 
 def test_synthetic_charuco_board_detects_with_opencv_aruco():

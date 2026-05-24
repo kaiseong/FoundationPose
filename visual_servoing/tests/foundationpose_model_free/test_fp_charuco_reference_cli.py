@@ -7,8 +7,13 @@ import sys
 import numpy as np
 import pytest
 
+from visual_servoing.foundationpose_model_free.charuco_reference import (
+    CHARUCO_DETECTOR_PRESET_CONSERVATIVE,
+    CHARUCO_DETECTOR_PRESET_OPENCV_DEFAULT,
+)
 from visual_servoing.foundationpose_model_free.reference_dataset import save_reference_frame
 from visual_servoing.foundationpose_model_free.registry import ObjectProfileRegistry
+from visual_servoing.scripts.fp_charuco_reference import _charuco_detector_ab_payload
 from visual_servoing.point_pose.rgbd_geometry import CameraIntrinsics
 
 
@@ -28,6 +33,8 @@ def test_fp_charuco_reference_help_exits_successfully():
     assert "--reselect-recordings" in completed.stdout
     assert "--required-keyframes" in completed.stdout
     assert "--max-keyframes" in completed.stdout
+    assert "--charuco-detector-preset" in completed.stdout
+    assert "--compare-charuco-detector-presets" in completed.stdout
 
 
 def test_fp_charuco_reference_json_error_for_missing_board_object_transform():
@@ -206,6 +213,70 @@ def test_offline_generate_rejects_missing_board_detection_without_writing_pose(t
     payload = json.loads(completed.stdout)
     assert payload["ok"] is False
     assert "rejected frame" in payload["error"]
+
+
+def test_charuco_detector_ab_payload_reports_deterministic_metrics():
+    baseline = _FakeReport(
+        accepted=1,
+        rejected=1,
+        records=[
+            _accepted_record("DICT_5X5_100", 0.5, view_bin=0),
+            {"accepted": False, "reasons": ["planned"]},
+        ],
+    )
+    tuned = _FakeReport(
+        accepted=2,
+        rejected=0,
+        records=[
+            _accepted_record("DICT_5X5_100", 0.4, view_bin=0),
+            _accepted_record("DICT_5X5_100", 0.6, view_bin=1),
+        ],
+    )
+
+    payload = _charuco_detector_ab_payload(
+        "mouse",
+        {
+            CHARUCO_DETECTOR_PRESET_OPENCV_DEFAULT: baseline,
+            CHARUCO_DETECTOR_PRESET_CONSERVATIVE: tuned,
+        },
+    )
+
+    assert payload["comparison"]["accepted_delta"] == 1
+    assert payload["comparison"]["median_reprojection_delta_px"] == 0.0
+    assert payload["comparison"]["tuned_metrics"]["view_bins"] == {"0": 1, "1": 1}
+
+
+class _FakeReport:
+    def __init__(self, *, accepted: int, rejected: int, records: list[dict]):
+        self.accepted = accepted
+        self.rejected = rejected
+        self.records = records
+        self.processed_candidates = len(records)
+
+    def to_dict(self):
+        return {
+            "accepted": self.accepted,
+            "rejected": self.rejected,
+            "processed_candidates": self.processed_candidates,
+            "records": self.records,
+        }
+
+
+def _accepted_record(dictionary: str, reprojection_error_px: float, *, view_bin: int) -> dict:
+    return {
+        "accepted": True,
+        "view_bin": view_bin,
+        "charuco_pose": {
+            "selected_dictionary": dictionary,
+            "candidates": [
+                {
+                    "dictionary": dictionary,
+                    "ok": True,
+                    "reprojection_error_px": reprojection_error_px,
+                }
+            ],
+        },
+    }
 
 
 def _synthetic_charuco_rgb(cv2):

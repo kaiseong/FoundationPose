@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import inspect
 import json
 import os
 from pathlib import Path
@@ -17,8 +18,10 @@ from visual_servoing.point_pose.rgbd_geometry import CameraIntrinsics
 from .charuco_reference import (
     BoardObjectTransform,
     CharucoBoardSpec,
+    CharucoDetectorConfig,
     CharucoPoseResult,
     CharucoQualityConfig,
+    CHARUCO_DETECTOR_PRESET_OPENCV_DEFAULT,
     DictionaryCandidateResult,
     detect_charuco_pose,
     record_charuco_pose_provenance,
@@ -163,9 +166,11 @@ def process_recorded_references(
     quality_config: CharucoQualityConfig,
     board_object: BoardObjectTransform,
     config: ReferenceProcessingConfig | None = None,
+    detector_config: CharucoDetectorConfig | None = None,
     pose_detector: PoseDetector = detect_charuco_pose,
 ) -> ReferenceProcessingReport:
     config = config or ReferenceProcessingConfig()
+    detector_config = detector_config or CharucoDetectorConfig()
     run_id = _new_processing_run_id()
     try:
         sessions = [session for session in list_recording_sessions(profile)]
@@ -176,6 +181,7 @@ def process_recorded_references(
             quality_config=quality_config,
             board_object=board_object,
             config=config,
+            detector_config=detector_config,
             mask_provider=mask_provider,
         )
         source_cache_path, source_payload = source_cache if source_cache is not None else (None, None)
@@ -198,6 +204,7 @@ def process_recorded_references(
                 quality_config=quality_config,
                 board_object=board_object,
                 config=config,
+                detector_config=detector_config,
                 pose_detector=pose_detector,
             )
             for candidate in candidates
@@ -209,6 +216,7 @@ def process_recorded_references(
             quality_config=quality_config,
             board_object=board_object,
             config=config,
+            detector_config=detector_config,
             run_id=run_id,
             mask_provider=mask_provider,
             reusable_records=reusable_records,
@@ -219,6 +227,7 @@ def process_recorded_references(
                 "reused_cached_records": len(reusable_records),
                 "newly_processed_candidates": len(evaluated),
                 "total_recorded_frames": len(recorded_frame_index),
+                "detector_preset": detector_config.preset,
             },
         )
         _, cache_payload = load_processing_cache(profile, cache_dir=cache_path)
@@ -260,6 +269,8 @@ def process_recorded_references(
                 "reused_cached_records": len(reusable_records),
                 "newly_processed_candidates": len(evaluated),
                 "total_recorded_frames": len(recorded_frame_index),
+                "detector_preset": detector_config.preset,
+                "detector_config": detector_config.to_dict(),
             },
         )
         return write_processing_report(profile, report)
@@ -277,6 +288,7 @@ def evaluate_recorded_references(
     quality_config: CharucoQualityConfig,
     board_object: BoardObjectTransform,
     config: ReferenceProcessingConfig | None = None,
+    detector_config: CharucoDetectorConfig | None = None,
     pose_detector: PoseDetector = detect_charuco_pose,
 ) -> ReferenceProcessingReport:
     config = config or ReferenceProcessingConfig(publish=False)
@@ -297,6 +309,7 @@ def evaluate_recorded_references(
         quality_config=quality_config,
         board_object=board_object,
         config=config,
+        detector_config=detector_config,
         pose_detector=pose_detector,
     )
 
@@ -308,11 +321,13 @@ def reselect_recorded_references(
     quality_config: CharucoQualityConfig,
     board_object: BoardObjectTransform,
     config: ReferenceProcessingConfig | None = None,
+    detector_config: CharucoDetectorConfig | None = None,
     cache_dir: str | Path | None = None,
 ) -> ReferenceProcessingReport:
     """Republish references from the latest processing cache without rerunning SAM."""
 
     config = config or ReferenceProcessingConfig()
+    detector_config = detector_config or CharucoDetectorConfig()
     run_id = _new_processing_run_id()
     cache_path, cache_payload = load_processing_cache(profile, cache_dir=cache_dir)
     _validate_processing_cache(
@@ -320,6 +335,7 @@ def reselect_recorded_references(
         board_spec=board_spec,
         quality_config=quality_config,
         board_object=board_object,
+        detector_config=detector_config,
     )
     cached_records = list(cache_payload.get("records", []))
     selected_records = select_view_diverse_records(cached_records, config=config)
@@ -362,6 +378,7 @@ def write_processing_cache(
     quality_config: CharucoQualityConfig,
     board_object: BoardObjectTransform,
     config: ReferenceProcessingConfig,
+    detector_config: CharucoDetectorConfig,
     run_id: str,
     mask_provider: MaskProvider | None = None,
     reusable_records: list[dict[str, Any]] | None = None,
@@ -407,6 +424,8 @@ def write_processing_cache(
         "board_spec": board_spec.to_dict(),
         "quality_config": quality_config.to_dict(),
         "board_object": board_object.to_dict(),
+        "detector_config": detector_config.to_dict(),
+        "detector_preset": detector_config.preset,
         "thresholds": config.to_dict(),
         "frame_evaluation_config": _frame_evaluation_config(config),
         "mask_provider": _mask_provider_metadata(mask_provider),
@@ -456,6 +475,7 @@ def _load_reusable_processing_cache(
     quality_config: CharucoQualityConfig,
     board_object: BoardObjectTransform,
     config: ReferenceProcessingConfig,
+    detector_config: CharucoDetectorConfig,
     mask_provider: MaskProvider | None,
 ) -> tuple[Path, dict[str, Any]] | None:
     try:
@@ -468,6 +488,7 @@ def _load_reusable_processing_cache(
             board_spec=board_spec,
             quality_config=quality_config,
             board_object=board_object,
+            detector_config=detector_config,
         )
     except ValueError:
         return None
@@ -552,17 +573,20 @@ def evaluate_candidate(
     quality_config: CharucoQualityConfig,
     board_object: BoardObjectTransform,
     config: ReferenceProcessingConfig,
+    detector_config: CharucoDetectorConfig | None = None,
     pose_detector: PoseDetector = detect_charuco_pose,
 ) -> EvaluatedCandidate:
+    detector_config = detector_config or CharucoDetectorConfig()
     start = time.perf_counter()
     try:
-        pose = pose_detector(
-            candidate.rgb,
-            candidate.intrinsics,
-            board_spec=board_spec,
-            quality_config=quality_config,
-            board_object=board_object,
-        )
+        pose_kwargs = {
+            "board_spec": board_spec,
+            "quality_config": quality_config,
+            "board_object": board_object,
+        }
+        if _pose_detector_accepts_detector_config(pose_detector):
+            pose_kwargs["detector_config"] = detector_config
+        pose = pose_detector(candidate.rgb, candidate.intrinsics, **pose_kwargs)
     except Exception as exc:
         return EvaluatedCandidate(
             candidate=candidate,
@@ -1191,6 +1215,8 @@ def _cached_pose_result(record: dict[str, Any]) -> CharucoPoseResult:
             image_coverage_fraction=float(candidate.get("image_coverage_fraction", 0.0)),
             reject_reasons=list(candidate.get("reject_reasons", [])),
             distortion_policy=str(candidate.get("distortion_policy", "unknown")),
+            detector_preset=str(candidate.get("detector_preset", CHARUCO_DETECTOR_PRESET_OPENCV_DEFAULT)),
+            detector_parameters=dict(candidate.get("detector_parameters") or {}),
         )
         for candidate in pose.get("candidates", [])
         if isinstance(candidate, dict)
@@ -1208,12 +1234,24 @@ def _cached_pose_result(record: dict[str, Any]) -> CharucoPoseResult:
         camera_T_object=_matrix_from_metadata(pose.get("camera_T_object")),
         cam_in_ob=_matrix_from_metadata(pose.get("cam_in_ob")),
         reject_reasons=list(pose.get("reject_reasons", [])),
+        detector_preset=str(pose.get("detector_preset", CHARUCO_DETECTOR_PRESET_OPENCV_DEFAULT)),
+        detector_parameters=dict(pose.get("detector_parameters") or {}),
     )
 
 
 def _filter_kwargs(data: dict[str, Any], cls) -> dict[str, Any]:
     fields = getattr(cls, "__dataclass_fields__", {})
     return {key: value for key, value in data.items() if key in fields}
+
+
+def _pose_detector_accepts_detector_config(pose_detector: PoseDetector) -> bool:
+    try:
+        signature = inspect.signature(pose_detector)
+    except (TypeError, ValueError):
+        return True
+    return "detector_config" in signature.parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()
+    )
 
 
 def _matrix_from_metadata(value: Any) -> np.ndarray | None:
@@ -1231,6 +1269,7 @@ def _validate_processing_cache(
     board_spec: CharucoBoardSpec,
     quality_config: CharucoQualityConfig,
     board_object: BoardObjectTransform,
+    detector_config: CharucoDetectorConfig,
 ) -> None:
     if payload.get("object") is None:
         raise ValueError("processing cache is missing object metadata")
@@ -1241,6 +1280,8 @@ def _validate_processing_cache(
         raise ValueError("cached processing used different ChArUco board settings; run Processing again")
     if cached_quality != quality_config.to_dict():
         raise ValueError("cached processing used different ChArUco quality settings; run Processing again")
+    if _cache_detector_config(payload) != detector_config.to_dict():
+        raise ValueError("cached processing used different ChArUco detector settings; run Processing again")
     cached_matrix = None
     if isinstance(cached_object, dict):
         cached_matrix = cached_object.get("board_T_object")
@@ -1250,6 +1291,23 @@ def _validate_processing_cache(
         atol=1e-9,
     ):
         raise ValueError("cached processing used different Obj XYZ/RPY; run Processing again")
+
+
+def _cache_detector_config(payload: dict[str, Any]) -> dict[str, Any]:
+    config = payload.get("detector_config")
+    if isinstance(config, dict):
+        preset = str(config.get("detector_preset") or CHARUCO_DETECTOR_PRESET_OPENCV_DEFAULT)
+        parameters = config.get("detector_parameters")
+        if not isinstance(parameters, dict):
+            parameters = {}
+        return {
+            "detector_preset": preset,
+            "detector_parameters": dict(parameters),
+        }
+    preset = payload.get("detector_preset")
+    if preset is not None:
+        return CharucoDetectorConfig(str(preset)).to_dict()
+    return CharucoDetectorConfig().to_dict()
 
 
 def _frame_evaluation_config(config: ReferenceProcessingConfig) -> dict[str, Any]:
