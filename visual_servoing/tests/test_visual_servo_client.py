@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import subprocess
 import sys
@@ -9,15 +10,81 @@ import numpy as np
 import pytest
 
 from visual_servoing.visual_servo_client import (
+    RIGHT_ARM_CONTROL_ROOT_LINK,
     RobotContext,
     ServoLimits,
     clamp_translation_step,
     make_transform_from_xyz_rpy,
     plan_visual_servo_step,
+    process_remote_servo_iteration,
     parse_args,
+    run_remote_fixture,
     signed_angle_about_axis,
+    synthetic_rgbd_fixture,
     validate_args,
 )
+from visual_servoing.visual_servo_core import REMOTE_ACTION_CONTROL_MODE
+from visual_servoing.visual_servo_protocol import decode_visual_servo_request
+
+
+class FakeRobotContext:
+    def __init__(self, *, execute: bool = True):
+        self.execute = execute
+        self.sent_targets: list[np.ndarray] = []
+
+    def current_ee_pose(self):
+        return np.eye(4)
+
+    def send_right_arm_cartesian(self, target_t5_T_ee):
+        self.sent_targets.append(np.asarray(target_t5_T_ee, dtype=np.float64).copy())
+        return {"finish_code": "ok"}
+
+
+def _remote_args(*, execute: bool = True):
+    argv = ["--live", "--remote-server", "127.0.0.1:8080"]
+    if execute:
+        argv += ["--execute", "--address", "127.0.0.1:50051"]
+    args = parse_args(argv)
+    args.max_translation_step_m = 0.02
+    args.max_wrist_step_deg = 5.0
+    return args
+
+
+def _remote_fixture_call(args, robot_context):
+    rgb, depth_m, intrinsics = synthetic_rgbd_fixture()
+    return process_remote_servo_iteration(
+        args,
+        rgb=rgb,
+        depth_m=depth_m,
+        intrinsics=intrinsics,
+        t5_T_camera=np.eye(4),
+        current_t5_T_ee=np.eye(4),
+        robot_context=robot_context,
+        frame_index=2,
+    )
+
+
+def _tracking_response(body: bytes, *, target: np.ndarray | None = None, **overrides):
+    request = decode_visual_servo_request(body)
+    payload = {
+        "ok": True,
+        "status": "tracking",
+        "request_id": request.request_id,
+        "frame_index": request.frame_index,
+        "server_timing_ms": {"planning_ms": 0.1},
+        "action": {
+            "root_link": RIGHT_ARM_CONTROL_ROOT_LINK,
+            "ee_link": "link_right_arm_6",
+            "control_mode": REMOTE_ACTION_CONTROL_MODE,
+            "target_t5_T_ee": (target if target is not None else np.eye(4)).tolist(),
+            "command_recommended": True,
+        },
+    }
+    action_overrides = overrides.pop("action", None)
+    payload.update(overrides)
+    if action_overrides:
+        payload["action"].update(action_overrides)
+    return payload
 
 
 def test_make_transform_from_xyz_rpy_identity():
@@ -200,6 +267,156 @@ def test_validate_execute_accepts_right_arm_safe_defaults():
     args = parse_args(["--live", "--execute", "--address", "127.0.0.1:50051"])
 
     validate_args(args)
+
+
+def test_validate_remote_fixture_request_requires_remote_server():
+    args = parse_args(["--remote-fixture-request"])
+
+    with pytest.raises(SystemExit, match="requires --remote-server"):
+        validate_args(args)
+
+
+def test_validate_remote_fixture_request_rejects_execute():
+    args = parse_args(
+        [
+            "--remote-fixture-request",
+            "--remote-server",
+            "127.0.0.1:8080",
+            "--execute",
+            "--address",
+            "127.0.0.1:50051",
+        ]
+    )
+
+    with pytest.raises(SystemExit, match="cannot be used with --execute"):
+        validate_args(args)
+
+
+def test_remote_iteration_executes_only_valid_tracking_action(monkeypatch):
+    args = _remote_args(execute=True)
+    robot_context = FakeRobotContext(execute=True)
+    target = make_transform_from_xyz_rpy([0.01, 0.0, 0.0, 0.0, 0.0, 2.0])
+
+    def fake_send(server, body, *, timeout_s):
+        assert server == "127.0.0.1:8080"
+        assert timeout_s == args.remote_timeout_s
+        return _tracking_response(body, target=target)
+
+    monkeypatch.setattr("visual_servoing.visual_servo_client.send_remote_visual_servo_request", fake_send)
+
+    result, next_pose = _remote_fixture_call(args, robot_context)
+
+    assert result["command_sent"] is True
+    assert result["remote"]["action_executable"] is True
+    assert len(robot_context.sent_targets) == 1
+    np.testing.assert_allclose(robot_context.sent_targets[0], target)
+    np.testing.assert_allclose(next_pose, target)
+
+
+def test_remote_iteration_rejects_stale_before_command_path(monkeypatch):
+    args = _remote_args(execute=True)
+    args.stale_action_max_age_s = 0.001
+    robot_context = FakeRobotContext(execute=True)
+
+    def fake_send(server, body, *, timeout_s):
+        del server, timeout_s
+        import time
+
+        time.sleep(0.02)
+        return _tracking_response(body, target=make_transform_from_xyz_rpy([0.01, 0.0, 0.0, 0.0, 0.0, 0.0]))
+
+    monkeypatch.setattr("visual_servoing.visual_servo_client.send_remote_visual_servo_request", fake_send)
+
+    result, next_pose = _remote_fixture_call(args, robot_context)
+
+    assert result["command_sent"] is False
+    assert result["remote"]["stale"] is True
+    assert result["remote"]["action_executable"] is False
+    assert "stale" in result["reason"]
+    assert robot_context.sent_targets == []
+    np.testing.assert_allclose(next_pose, np.eye(4))
+
+
+@pytest.mark.parametrize("status", ["converged", "skipped", "error"])
+def test_remote_iteration_no_command_statuses_never_execute(monkeypatch, status):
+    args = _remote_args(execute=True)
+    robot_context = FakeRobotContext(execute=True)
+
+    def fake_send(server, body, *, timeout_s):
+        del server, timeout_s
+        return _tracking_response(body, status=status)
+
+    monkeypatch.setattr("visual_servoing.visual_servo_client.send_remote_visual_servo_request", fake_send)
+
+    result, next_pose = _remote_fixture_call(args, robot_context)
+
+    assert result["command_sent"] is False
+    assert result["remote"]["action_executable"] is False
+    assert robot_context.sent_targets == []
+    np.testing.assert_allclose(next_pose, np.eye(4))
+
+
+def test_remote_iteration_wrong_root_never_executes(monkeypatch):
+    args = _remote_args(execute=True)
+    robot_context = FakeRobotContext(execute=True)
+
+    def fake_send(server, body, *, timeout_s):
+        del server, timeout_s
+        return _tracking_response(body, action={"root_link": "base"})
+
+    monkeypatch.setattr("visual_servoing.visual_servo_client.send_remote_visual_servo_request", fake_send)
+
+    result, _next_pose = _remote_fixture_call(args, robot_context)
+
+    assert result["command_sent"] is False
+    assert result["remote"]["action_executable"] is False
+    assert "root_link" in result["reason"]
+    assert robot_context.sent_targets == []
+
+
+def test_remote_iteration_ok_false_never_executes(monkeypatch):
+    args = _remote_args(execute=True)
+    robot_context = FakeRobotContext(execute=True)
+
+    def fake_send(server, body, *, timeout_s):
+        del server, timeout_s
+        return _tracking_response(body, ok=False, status="skipped", reason="segmentation failed")
+
+    monkeypatch.setattr("visual_servoing.visual_servo_client.send_remote_visual_servo_request", fake_send)
+
+    result, _next_pose = _remote_fixture_call(args, robot_context)
+
+    assert result["ok"] is False
+    assert result["command_sent"] is False
+    assert robot_context.sent_targets == []
+
+
+def test_remote_fixture_does_not_stop_on_invalid_converged_status(monkeypatch, capsys):
+    args = parse_args(
+        [
+            "--remote-fixture-request",
+            "--remote-server",
+            "127.0.0.1:8080",
+            "--max-iterations",
+            "2",
+        ]
+    )
+    calls = {"count": 0}
+
+    def fake_process(*args_, **kwargs):
+        del args_, kwargs
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return {"ok": False, "status": "converged", "frame_index": 0}, np.eye(4)
+        return {"ok": True, "status": "converged", "frame_index": 1}, np.eye(4)
+
+    monkeypatch.setattr("visual_servoing.visual_servo_client.process_remote_servo_iteration", fake_process)
+
+    assert run_remote_fixture(args) == 0
+
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert calls["count"] == 2
+    assert [line["ok"] for line in lines] == [False, True]
 
 
 def test_cli_help_smoke():

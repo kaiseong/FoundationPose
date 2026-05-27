@@ -8,7 +8,6 @@ only when --execute is provided.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import json
 import logging
 import math
@@ -16,6 +15,8 @@ from pathlib import Path
 import sys
 import time
 from typing import Any
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 import numpy as np
 
@@ -28,13 +29,14 @@ if __package__ in (None, ""):
 
 from visual_servoing.point_pose.live_camera_config import SUPPORTED_LIVE_CAMERA_MODELS
 from visual_servoing.point_pose.realsense_d405 import LiveRgbdCamera
-from visual_servoing.point_pose.rgbd_geometry import (
-    CameraIntrinsics,
-    backproject_masked_depth,
-    estimate_phone_pose,
-    normalize_vector,
-)
+from visual_servoing.point_pose.rgbd_geometry import CameraIntrinsics
 from visual_servoing.point_pose.sam3_phone_segmenter import Sam3PhoneSegmenter, load_mask
+from visual_servoing.visual_servo_protocol import (
+    REQUEST_CONTENT_TYPE,
+    decode_visual_servo_response,
+    encode_visual_servo_request,
+)
+import visual_servoing.visual_servo_core as servo_core
 
 if _ADDED_PACKAGE_PARENT is not None:
     sys.path.remove(_ADDED_PACKAGE_PARENT)
@@ -43,41 +45,25 @@ if _ADDED_PACKAGE_PARENT is not None:
 HEAD_TO_CAMERA_XYZ_RPY = (0.047, 0.009, 0.057, -90.0, 0.0, -90.0)
 DEFAULT_RIGHT_ARM_STIFFNESS = (90.0, 90.0, 90.0, 70.0, 70.0, 70.0, 70.0)
 DEFAULT_RIGHT_ARM_TORQUE_LIMIT = (40.0, 40.0, 40.0, 30.0, 30.0, 30.0, 30.0)
-RIGHT_ARM_CONTROL_ROOT_LINK = "link_torso_5"
-RIGHT_ARM_EE_LINKS = frozenset({"link_right_arm_6", "ee_right"})
+RIGHT_ARM_CONTROL_ROOT_LINK = servo_core.RIGHT_ARM_CONTROL_ROOT_LINK
+RIGHT_ARM_EE_LINKS = servo_core.RIGHT_ARM_EE_LINKS
 RIGHT_ARM_POWER_SERVO_PATTERNS = frozenset({"right_arm.*", "^right_arm.*$"})
 
-
-@dataclass(frozen=True)
-class ServoLimits:
-    max_translation_step_m: float = 0.01
-    max_wrist_step_rad: float = math.radians(5.0)
-    position_tolerance_m: float = 0.005
-    wrist_tolerance_rad: float = math.radians(2.0)
-
-
-@dataclass(frozen=True)
-class VisualObservation:
-    camera_T_object: np.ndarray
-    t5_T_object: np.ndarray
-    centroid_camera_m: np.ndarray
-    object_long_axis_t5: np.ndarray
-    object_grasp_axis_t5: np.ndarray
-    masked_points: int
-
-
-@dataclass(frozen=True)
-class ServoStep:
-    status: str
-    current_t5_T_ee: np.ndarray
-    target_t5_T_ee: np.ndarray
-    desired_position_t5_m: np.ndarray
-    position_error_m: np.ndarray
-    translation_step_m: np.ndarray
-    wrist_error_rad: float
-    wrist_step_rad: float
-    command_recommended: bool
-    ignored_offset_rpy_deg: tuple[float, float]
+ServoLimits = servo_core.ServoLimits
+VisualObservation = servo_core.VisualObservation
+ServoStep = servo_core.ServoStep
+estimate_visual_observation = servo_core.estimate_visual_observation
+plan_visual_servo_step = servo_core.plan_visual_servo_step
+make_transform_from_xyz_rpy = servo_core.make_transform_from_xyz_rpy
+rotation_matrix_from_rpy = servo_core.rotation_matrix_from_rpy
+axis_angle_rotation = servo_core.axis_angle_rotation
+local_axis = servo_core.local_axis
+clamp_translation_step = servo_core.clamp_translation_step
+clamp_scalar = servo_core.clamp_scalar
+signed_angle_about_axis = servo_core.signed_angle_about_axis
+require_transform = servo_core.require_transform
+matrix_list = servo_core.matrix_list
+to_list = servo_core.to_list
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -106,6 +92,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"], help="SAM3 device.")
     parser.add_argument("--threshold", type=float, default=0.5, help="SAM3 confidence threshold.")
     parser.add_argument("--sam-resolution", type=int, default=1008)
+    parser.add_argument("--remote-server", help="Remote visual servo server as HOST:PORT or URL.")
+    parser.add_argument("--remote-timeout-s", type=float, default=2.0)
+    parser.add_argument("--stale-action-max-age-s", type=float, default=1.0)
+    parser.add_argument(
+        "--remote-fixture-request",
+        action="store_true",
+        help="Send one synthetic RGB-D request to --remote-server without a camera or robot.",
+    )
 
     parser.add_argument("--max-iterations", type=int, default=1, help="0 means run until interrupted.")
     parser.add_argument("--loop-sleep-s", type=float, default=0.0)
@@ -119,6 +113,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
         metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"),
         help="Current-EE-frame relative offset: meters and degrees.",
+    )
+    parser.add_argument(
+        "--object-offset",
+        type=float,
+        nargs=6,
+        default=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"),
+        help="Object-frame SE(3) target offset for remote visual servo: meters and degrees.",
     )
     parser.add_argument(
         "--current-ee-pose",
@@ -171,6 +173,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     validate_args(args)
+    if args.remote_fixture_request:
+        return run_remote_fixture(args)
     if is_live_mode(args):
         return run_live(args)
     return run_offline(args)
@@ -179,9 +183,19 @@ def main(argv: list[str] | None = None) -> int:
 def validate_args(args: argparse.Namespace) -> None:
     if args.max_iterations < 0:
         raise SystemExit("--max-iterations must be >= 0")
+    if args.remote_timeout_s <= 0.0:
+        raise SystemExit("--remote-timeout-s must be > 0")
+    if args.stale_action_max_age_s <= 0.0:
+        raise SystemExit("--stale-action-max-age-s must be > 0")
+    if args.remote_fixture_request and not args.remote_server:
+        raise SystemExit("--remote-fixture-request requires --remote-server")
+    if args.remote_fixture_request and args.execute:
+        raise SystemExit("--remote-fixture-request cannot be used with --execute")
+    if args.remote_server and not (is_live_mode(args) or args.remote_fixture_request):
+        raise SystemExit("--remote-server requires a live camera mode or --remote-fixture-request")
     if args.execute:
         validate_execute_safety(args)
-    if not is_live_mode(args):
+    if not is_live_mode(args) and not args.remote_fixture_request:
         missing = [name for name in ("depth", "mask", "intrinsics") if not getattr(args, name)]
         if missing:
             raise SystemExit(f"offline mode requires: {', '.join('--' + name for name in missing)}")
@@ -251,6 +265,8 @@ def run_offline(args: argparse.Namespace) -> int:
 
 
 def run_live(args: argparse.Namespace) -> int:
+    if args.remote_server:
+        return run_remote_live(args)
     camera_model = selected_camera_model(args)
     segmenter = Sam3PhoneSegmenter(
         prompt=args.prompt,
@@ -294,13 +310,243 @@ def run_live(args: argparse.Namespace) -> int:
                 except Exception as exc:
                     result = skipped_result(args, frame_index, str(exc))
                 print(json.dumps(result, separators=(",", ":")))
-                if result.get("status") == "converged":
+                if result.get("ok") is True and result.get("status") == "converged":
                     break
                 if args.loop_sleep_s > 0.0:
                     time.sleep(args.loop_sleep_s)
     finally:
         robot_context.close()
     return 0
+
+
+def run_remote_live(args: argparse.Namespace) -> int:
+    camera_model = selected_camera_model(args)
+    robot_context = RobotContext.connect(args) if args.execute else RobotContext.dry_run(args)
+    try:
+        current_t5_T_ee = robot_context.current_ee_pose()
+        t5_T_camera = fixed_t5_T_camera(args)
+        with LiveRgbdCamera(
+            model=camera_model,
+            serial=args.serial,
+            width=args.width,
+            height=args.height,
+            fps=args.fps,
+        ) as camera:
+            for frame_index in iteration_range(args.max_iterations):
+                frame = camera.read(timeout_ms=args.frame_timeout_ms)
+                result, current_t5_T_ee = process_remote_servo_iteration(
+                    args,
+                    rgb=frame.rgb,
+                    depth_m=frame.depth_m,
+                    intrinsics=frame.intrinsics,
+                    t5_T_camera=t5_T_camera,
+                    current_t5_T_ee=current_t5_T_ee,
+                    robot_context=robot_context,
+                    frame_index=frame_index,
+                )
+                print(json.dumps(result, separators=(",", ":")))
+                if result.get("ok") is True and result.get("status") == "converged":
+                    break
+                if args.loop_sleep_s > 0.0:
+                    time.sleep(args.loop_sleep_s)
+    finally:
+        robot_context.close()
+    return 0
+
+
+def run_remote_fixture(args: argparse.Namespace) -> int:
+    rgb, depth_m, intrinsics = synthetic_rgbd_fixture()
+    robot_context = RobotContext.dry_run(args)
+    current_t5_T_ee = robot_context.current_ee_pose()
+    t5_T_camera = fixed_t5_T_camera(args)
+    for frame_index in iteration_range(args.max_iterations):
+        result, current_t5_T_ee = process_remote_servo_iteration(
+            args,
+            rgb=rgb,
+            depth_m=depth_m,
+            intrinsics=intrinsics,
+            t5_T_camera=t5_T_camera,
+            current_t5_T_ee=current_t5_T_ee,
+            robot_context=robot_context,
+            frame_index=frame_index,
+        )
+        print(json.dumps(result, separators=(",", ":")))
+        if result.get("ok") is True and result.get("status") == "converged":
+            break
+    return 0
+
+
+def process_remote_servo_iteration(
+    args: argparse.Namespace,
+    *,
+    rgb: np.ndarray,
+    depth_m: np.ndarray,
+    intrinsics: CameraIntrinsics,
+    t5_T_camera: np.ndarray,
+    current_t5_T_ee: np.ndarray,
+    robot_context: "RobotContext",
+    frame_index: int,
+) -> tuple[dict[str, Any], np.ndarray]:
+    if robot_context.execute:
+        current_t5_T_ee = robot_context.current_ee_pose()
+    request_id = f"{time.monotonic_ns()}-{frame_index}"
+    object_T_offset = make_transform_from_xyz_rpy(args.object_offset)
+    capture_monotonic_ns = time.monotonic_ns()
+    metadata = remote_request_metadata(args)
+    metadata["ee_link"] = args.ee_link
+
+    encode_start = time.perf_counter()
+    body = encode_visual_servo_request(
+        rgb=rgb,
+        depth_m=depth_m,
+        intrinsics=intrinsics,
+        request_id=request_id,
+        frame_index=frame_index,
+        capture_monotonic_ns=capture_monotonic_ns,
+        t5_T_camera=t5_T_camera,
+        current_t5_T_ee=current_t5_T_ee,
+        object_T_offset=object_T_offset,
+        metadata=metadata,
+    )
+    encode_ms = (time.perf_counter() - encode_start) * 1000.0
+    send_start = time.perf_counter()
+    try:
+        response = send_remote_visual_servo_request(args.remote_server, body, timeout_s=args.remote_timeout_s)
+        round_trip_s = time.perf_counter() - send_start
+        validation = servo_core.validate_remote_action(
+            response,
+            request_id=request_id,
+            frame_index=frame_index,
+            round_trip_s=round_trip_s,
+            stale_action_max_age_s=args.stale_action_max_age_s,
+            current_t5_T_ee=current_t5_T_ee,
+            max_translation_step_m=args.max_translation_step_m,
+            max_wrist_step_rad=math.radians(args.max_wrist_step_deg),
+            expected_root_link=args.control_root_link,
+            allowed_ee_links=RIGHT_ARM_EE_LINKS,
+        )
+    except Exception as exc:
+        response = {"ok": False, "status": "skipped", "request_id": request_id, "frame_index": frame_index, "reason": str(exc)}
+        round_trip_s = time.perf_counter() - send_start
+        validation = servo_core.RemoteActionValidation(False, False, str(exc))
+
+    command_sent = False
+    command_feedback: dict[str, Any] | None = None
+    next_t5_T_ee = current_t5_T_ee
+    if validation.executable and validation.target_t5_T_ee is not None:
+        next_t5_T_ee = validation.target_t5_T_ee
+        if args.execute:
+            command_feedback = robot_context.send_right_arm_cartesian(validation.target_t5_T_ee)
+            command_sent = True
+    result = remote_diagnostic_payload(
+        args,
+        frame_index=frame_index,
+        request_id=request_id,
+        response=response,
+        validation=validation,
+        command_sent=command_sent,
+        command_feedback=command_feedback,
+        encode_ms=encode_ms,
+        round_trip_s=round_trip_s,
+    )
+    return result, next_t5_T_ee
+
+
+def send_remote_visual_servo_request(server: str, body: bytes, *, timeout_s: float) -> dict[str, Any]:
+    url = normalize_remote_server_url(server)
+    request = urllib_request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": REQUEST_CONTENT_TYPE},
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=float(timeout_s)) as response:
+            data = response.read()
+    except urllib_error.HTTPError as exc:
+        data = exc.read()
+        try:
+            payload = decode_visual_servo_response(data)
+        except Exception:
+            raise RuntimeError(f"remote visual servo server returned HTTP {exc.code}") from exc
+        raise RuntimeError(payload.get("reason") or payload.get("error") or f"HTTP {exc.code}") from exc
+    return decode_visual_servo_response(data)
+
+
+def normalize_remote_server_url(server: str) -> str:
+    value = str(server).strip()
+    if not value:
+        raise ValueError("--remote-server cannot be empty")
+    if not value.startswith(("http://", "https://")):
+        value = f"http://{value}"
+    return value.rstrip("/") + "/visual-servo/action"
+
+
+def remote_request_metadata(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "min_depth_m": float(args.min_depth_m),
+        "max_depth_m": float(args.max_depth_m),
+        "max_translation_step_m": float(args.max_translation_step_m),
+        "max_wrist_step_deg": float(args.max_wrist_step_deg),
+        "position_tolerance_m": float(args.position_tolerance_m),
+        "wrist_tolerance_deg": float(args.wrist_tolerance_deg),
+        "prompt": args.prompt,
+        "threshold": float(args.threshold),
+        "sam_resolution": int(args.sam_resolution),
+        "ee_align_axis": args.ee_align_axis,
+        "wrist_axis": args.wrist_axis,
+        "control_root_link": args.control_root_link,
+    }
+
+
+def remote_diagnostic_payload(
+    args: argparse.Namespace,
+    *,
+    frame_index: int,
+    request_id: str,
+    response: dict[str, Any],
+    validation: servo_core.RemoteActionValidation,
+    command_sent: bool,
+    command_feedback: dict[str, Any] | None,
+    encode_ms: float,
+    round_trip_s: float,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "ok": bool(response.get("ok", False)) and validation.ok,
+        "status": response.get("status", "skipped"),
+        "frame_index": frame_index,
+        "execute": bool(args.execute),
+        "command_sent": command_sent,
+        "reason": validation.reason,
+        "remote": {
+            "enabled": True,
+            "server": args.remote_server,
+            "request_id": request_id,
+            "round_trip_ms": float(round_trip_s) * 1000.0,
+            "stale_action_max_age_s": float(args.stale_action_max_age_s),
+            "stale": float(round_trip_s) > float(args.stale_action_max_age_s),
+            "request_encode_ms": float(encode_ms),
+            "action_valid": validation.ok,
+            "action_executable": validation.executable,
+        },
+        "server_timing_ms": response.get("server_timing_ms", {}),
+    }
+    for key in ("action", "observation", "servo_step", "mask"):
+        if key in response:
+            payload[key] = response[key]
+    if command_feedback is not None:
+        payload["command_feedback"] = command_feedback
+    return payload
+
+
+def synthetic_rgbd_fixture() -> tuple[np.ndarray, np.ndarray, CameraIntrinsics]:
+    height = 32
+    width = 32
+    rgb = np.zeros((height, width, 3), dtype=np.uint8)
+    rgb[8:24, 10:22] = np.array([220, 220, 220], dtype=np.uint8)
+    depth_m = np.full((height, width), 0.5, dtype=np.float32)
+    intrinsics = CameraIntrinsics(fx=100.0, fy=100.0, cx=width / 2.0, cy=height / 2.0, width=width, height=height)
+    return rgb, depth_m, intrinsics
 
 
 def process_servo_iteration(
@@ -363,102 +609,6 @@ def process_servo_iteration(
         return result, observation.camera_T_object, step.target_t5_T_ee
     except Exception as exc:
         return skipped_result(args, frame_index, str(exc)), previous_object_transform, current_t5_T_ee
-
-
-def estimate_visual_observation(
-    depth_m: np.ndarray,
-    mask: np.ndarray,
-    intrinsics: CameraIntrinsics,
-    *,
-    t5_T_camera: np.ndarray,
-    previous_transform: np.ndarray | None,
-    min_depth_m: float,
-    max_depth_m: float,
-) -> VisualObservation:
-    points, pixels = backproject_masked_depth(
-        depth_m,
-        mask,
-        intrinsics,
-        min_depth_m=min_depth_m,
-        max_depth_m=max_depth_m,
-    )
-    camera_T_object = estimate_phone_pose(
-        points,
-        pixels_xy=pixels,
-        intrinsics=intrinsics,
-        previous_transform=previous_transform,
-    )
-    t5_T_object = t5_T_camera @ camera_T_object
-    object_long_axis_t5 = normalize_vector(t5_T_object[:3, 1])
-    object_grasp_axis_t5 = normalize_vector(t5_T_object[:3, 0])
-    return VisualObservation(
-        camera_T_object=camera_T_object,
-        t5_T_object=t5_T_object,
-        centroid_camera_m=camera_T_object[:3, 3].copy(),
-        object_long_axis_t5=object_long_axis_t5,
-        object_grasp_axis_t5=object_grasp_axis_t5,
-        masked_points=int(points.shape[0]),
-    )
-
-
-def plan_visual_servo_step(
-    *,
-    current_t5_T_ee: np.ndarray,
-    visual_target_t5: np.ndarray,
-    ee_offset: np.ndarray,
-    ee_offset_rpy_deg: tuple[float, float, float],
-    limits: ServoLimits,
-    object_grasp_axis_t5: np.ndarray | None = None,
-    ee_align_axis: str = "y",
-    wrist_axis: str = "z",
-) -> ServoStep:
-    current_t5_T_ee = require_transform(current_t5_T_ee, "current_t5_T_ee")
-    visual_target_t5 = require_transform(visual_target_t5, "visual_target_t5")
-    ee_offset = require_transform(ee_offset, "ee_offset")
-
-    current_rotation = current_t5_T_ee[:3, :3]
-    offset_translation_t5 = current_rotation @ ee_offset[:3, 3]
-    desired_position_t5_m = visual_target_t5[:3, 3] + offset_translation_t5
-    position_error_m = desired_position_t5_m - current_t5_T_ee[:3, 3]
-    translation_step_m = clamp_translation_step(
-        position_error_m,
-        max_step_m=limits.max_translation_step_m,
-    )
-
-    target_axis = object_grasp_axis_t5
-    if target_axis is None:
-        target_axis = visual_target_t5[:3, 0]
-    target_axis = normalize_vector(np.asarray(target_axis, dtype=np.float64))
-    current_axis = current_rotation @ local_axis(ee_align_axis)
-    wrist_axis_t5 = current_rotation @ local_axis(wrist_axis)
-    wrist_error_rad = signed_angle_about_axis(current_axis, target_axis, wrist_axis_t5)
-    wrist_error_rad += math.radians(float(ee_offset_rpy_deg[2]))
-    wrist_step_rad = clamp_scalar(wrist_error_rad, limits.max_wrist_step_rad)
-
-    target_t5_T_ee = current_t5_T_ee.copy()
-    target_t5_T_ee[:3, 3] = current_t5_T_ee[:3, 3] + translation_step_m
-    target_t5_T_ee[:3, :3] = current_rotation @ axis_angle_rotation(local_axis(wrist_axis), wrist_step_rad)
-
-    converged = (
-        float(np.linalg.norm(position_error_m)) <= limits.position_tolerance_m
-        and abs(wrist_error_rad) <= limits.wrist_tolerance_rad
-    )
-    status = "converged" if converged else "tracking"
-    command_recommended = not converged and (
-        float(np.linalg.norm(translation_step_m)) > 1e-9 or abs(wrist_step_rad) > 1e-9
-    )
-    return ServoStep(
-        status=status,
-        current_t5_T_ee=current_t5_T_ee,
-        target_t5_T_ee=target_t5_T_ee,
-        desired_position_t5_m=desired_position_t5_m,
-        position_error_m=position_error_m,
-        translation_step_m=translation_step_m,
-        wrist_error_rad=float(wrist_error_rad),
-        wrist_step_rad=float(wrist_step_rad),
-        command_recommended=command_recommended,
-        ignored_offset_rpy_deg=(float(ee_offset_rpy_deg[0]), float(ee_offset_rpy_deg[1])),
-    )
 
 
 def command_reason(args: argparse.Namespace, step: ServoStep) -> str:
@@ -676,107 +826,6 @@ def require_cv2():
     except Exception as exc:  # pragma: no cover - depends on optional OpenCV install
         raise RuntimeError("OpenCV is required for image/mask file I/O.") from exc
     return cv2
-
-
-def make_transform_from_xyz_rpy(values: Any) -> np.ndarray:
-    values = np.asarray(values, dtype=np.float64).reshape(6)
-    transform = np.eye(4, dtype=np.float64)
-    transform[:3, :3] = rotation_matrix_from_rpy(
-        math.radians(float(values[3])),
-        math.radians(float(values[4])),
-        math.radians(float(values[5])),
-    )
-    transform[:3, 3] = values[:3]
-    return transform
-
-
-def rotation_matrix_from_rpy(roll: float, pitch: float, yaw: float) -> np.ndarray:
-    cr = math.cos(roll)
-    sr = math.sin(roll)
-    cp = math.cos(pitch)
-    sp = math.sin(pitch)
-    cy = math.cos(yaw)
-    sy = math.sin(yaw)
-    return np.array(
-        [
-            [cy * cp, sr * sp * cy - cr * sy, cr * sp * cy + sr * sy],
-            [sy * cp, sr * sp * sy + cr * cy, cr * sp * sy - sr * cy],
-            [-sp, cp * sr, cp * cr],
-        ],
-        dtype=np.float64,
-    )
-
-
-def axis_angle_rotation(axis: np.ndarray, angle: float) -> np.ndarray:
-    axis = normalize_vector(axis)
-    x, y, z = axis
-    c = math.cos(angle)
-    s = math.sin(angle)
-    one_c = 1.0 - c
-    return np.array(
-        [
-            [c + x * x * one_c, x * y * one_c - z * s, x * z * one_c + y * s],
-            [y * x * one_c + z * s, c + y * y * one_c, y * z * one_c - x * s],
-            [z * x * one_c - y * s, z * y * one_c + x * s, c + z * z * one_c],
-        ],
-        dtype=np.float64,
-    )
-
-
-def local_axis(name: str) -> np.ndarray:
-    sign = -1.0 if name.startswith("-") else 1.0
-    axis = name[1:] if name.startswith("-") else name
-    mapping = {
-        "x": np.array([1.0, 0.0, 0.0], dtype=np.float64),
-        "y": np.array([0.0, 1.0, 0.0], dtype=np.float64),
-        "z": np.array([0.0, 0.0, 1.0], dtype=np.float64),
-    }
-    return sign * mapping[axis]
-
-
-def clamp_translation_step(error: np.ndarray, *, max_step_m: float) -> np.ndarray:
-    error = np.asarray(error, dtype=np.float64).reshape(3)
-    norm = float(np.linalg.norm(error))
-    if norm <= max_step_m or norm < 1e-12:
-        return error.copy()
-    return error * (float(max_step_m) / norm)
-
-
-def clamp_scalar(value: float, limit: float) -> float:
-    limit = abs(float(limit))
-    return max(-limit, min(limit, float(value)))
-
-
-def signed_angle_about_axis(source: np.ndarray, target: np.ndarray, axis: np.ndarray) -> float:
-    axis = normalize_vector(axis)
-    source = np.asarray(source, dtype=np.float64).reshape(3)
-    target = np.asarray(target, dtype=np.float64).reshape(3)
-    source = source - axis * float(np.dot(source, axis))
-    target = target - axis * float(np.dot(target, axis))
-    if np.linalg.norm(source) < 1e-9 or np.linalg.norm(target) < 1e-9:
-        return 0.0
-    source = normalize_vector(source)
-    target = normalize_vector(target)
-    sine = float(np.dot(axis, np.cross(source, target)))
-    cosine = float(np.dot(source, target))
-    return math.atan2(sine, cosine)
-
-
-def require_transform(transform: np.ndarray, name: str) -> np.ndarray:
-    transform = np.asarray(transform, dtype=np.float64)
-    if transform.shape != (4, 4):
-        raise ValueError(f"{name} must be 4x4, got {transform.shape}")
-    if not np.all(np.isfinite(transform)):
-        raise ValueError(f"{name} contains non-finite values")
-    return transform
-
-
-def matrix_list(matrix: np.ndarray) -> list[list[float]]:
-    return np.asarray(matrix, dtype=float).tolist()
-
-
-def to_list(vector: np.ndarray) -> list[float]:
-    return np.asarray(vector, dtype=float).reshape(-1).tolist()
 
 
 if __name__ == "__main__":
