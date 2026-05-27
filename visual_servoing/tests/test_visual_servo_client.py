@@ -15,6 +15,8 @@ from visual_servoing.visual_servo_client import (
     DEFAULT_CAMERA_MOUNT_LINK,
     DEFAULT_RIGHT_ARM_EE_LINK,
     DEFAULT_T5_HEAD_XYZ_RPY,
+    REALSENSE_HEAD_TO_CAMERA_XYZ_RPY,
+    ZED_HEAD_TO_CAMERA_XYZ_RPY,
     LiveCameraPreview,
     RIGHT_ARM_CONTROL_ROOT_LINK,
     RobotContext,
@@ -234,10 +236,33 @@ def test_default_fixed_camera_pose_uses_head_1_45_degree_basis():
 
     assert args.camera_mount_link == DEFAULT_CAMERA_MOUNT_LINK
     assert tuple(args.t5_head_pose) == DEFAULT_T5_HEAD_XYZ_RPY
+    assert tuple(args.head_camera_pose) == REALSENSE_HEAD_TO_CAMERA_XYZ_RPY
+    assert args.camera_pose_preset_resolved == "realsense"
     expected = make_transform_from_xyz_rpy(DEFAULT_T5_HEAD_XYZ_RPY) @ make_transform_from_xyz_rpy(
         args.head_camera_pose
     )
     np.testing.assert_allclose(fixed_t5_T_camera(args), expected, atol=1e-12)
+
+
+def test_live_zed_uses_zed_camera_pose_preset_by_default():
+    args = parse_args(["--live-zed"])
+
+    assert tuple(args.head_camera_pose) == ZED_HEAD_TO_CAMERA_XYZ_RPY
+    assert args.camera_pose_preset_resolved == "zed"
+    t5_T_camera = fixed_t5_T_camera(args)
+    camera_z_axis_t5 = t5_T_camera[:3, :3] @ np.array([0.0, 0.0, 1.0])
+
+    np.testing.assert_allclose(camera_z_axis_t5, [0.70710678, 0.0, 0.70710678], atol=1e-8)
+
+
+def test_camera_pose_preset_and_explicit_pose_override_zed_default():
+    realsense_args = parse_args(["--live-zed", "--camera-pose-preset", "realsense"])
+    custom_args = parse_args(["--live-zed", "--head-camera-pose", "0", "0", "0", "0", "0", "0"])
+
+    assert tuple(realsense_args.head_camera_pose) == REALSENSE_HEAD_TO_CAMERA_XYZ_RPY
+    assert realsense_args.camera_pose_preset_resolved == "realsense"
+    assert tuple(custom_args.head_camera_pose) == (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    assert custom_args.camera_pose_preset_resolved == "custom"
 
 
 def test_zed_depth_mode_cli_defaults_to_neural_and_accepts_ultra():
@@ -908,6 +933,8 @@ def test_remote_target_offset_t5_metadata_is_explicit_t5_frame():
     assert metadata["offset_frame"] == "link_torso_5"
     assert metadata["orientation_policy"] == "preserve_reference_ee_rotation"
     assert metadata["servo_dofs"] == "xyz_position_only"
+    assert metadata["camera_pose_preset"] == "realsense"
+    assert metadata["head_camera_pose"] == list(REALSENSE_HEAD_TO_CAMERA_XYZ_RPY)
 
 
 def test_remote_rejects_object_frame_offset_to_avoid_axis_spin():

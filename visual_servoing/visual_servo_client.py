@@ -46,7 +46,14 @@ if _ADDED_PACKAGE_PARENT is not None:
 
 
 DEFAULT_T5_HEAD_XYZ_RPY = (0.0, 0.0, 0.0, 0.0, 45.0, 0.0)
-HEAD_TO_CAMERA_XYZ_RPY = (0.047, 0.009, 0.057, -90.0, 0.0, -90.0)
+REALSENSE_HEAD_TO_CAMERA_XYZ_RPY = (0.047, 0.009, 0.057, -90.0, 0.0, -90.0)
+ZED_HEAD_TO_CAMERA_XYZ_RPY = (0.047, 0.009, 0.057, 0.0, 0.0, 90.0)
+HEAD_TO_CAMERA_XYZ_RPY = REALSENSE_HEAD_TO_CAMERA_XYZ_RPY
+CAMERA_POSE_PRESETS = {
+    "realsense": REALSENSE_HEAD_TO_CAMERA_XYZ_RPY,
+    "zed": ZED_HEAD_TO_CAMERA_XYZ_RPY,
+}
+CAMERA_POSE_PRESET_CHOICES = ("auto", *CAMERA_POSE_PRESETS.keys())
 DEFAULT_CAMERA_MOUNT_LINK = "link_head_2"
 DEFAULT_RIGHT_ARM_STIFFNESS = (90.0, 90.0, 90.0, 70.0, 70.0, 70.0, 70.0)
 DEFAULT_RIGHT_ARM_TORQUE_LIMIT = (40.0, 40.0, 40.0, 30.0, 30.0, 30.0, 30.0)
@@ -185,12 +192,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Fixed T5-to-head pose for dry-run/live geometry. Defaults to head_1=45 deg.",
     )
     parser.add_argument(
+        "--camera-pose-preset",
+        choices=CAMERA_POSE_PRESET_CHOICES,
+        default="auto",
+        help="Camera mount pose preset. auto selects zed for --live-zed and realsense otherwise.",
+    )
+    parser.add_argument(
         "--head-camera-pose",
         type=float,
         nargs=6,
-        default=HEAD_TO_CAMERA_XYZ_RPY,
+        default=None,
         metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"),
-        help="Camera-mount-link-to-camera pose: meters and degrees.",
+        help="Override camera-mount-link-to-camera pose: meters and degrees.",
     )
     parser.add_argument(
         "--camera-mount-link",
@@ -233,7 +246,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--angular-limit", type=float, default=math.pi / 2.0)
     parser.add_argument("--linear-gain", type=float, default=50.0)
     parser.add_argument("--angular-gain", type=float, default=math.pi * 20.0)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    resolve_head_camera_pose_args(args)
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -272,6 +287,23 @@ def validate_args(args: argparse.Namespace) -> None:
         missing = [name for name in ("depth", "mask", "intrinsics") if not getattr(args, name)]
         if missing:
             raise SystemExit(f"offline mode requires: {', '.join('--' + name for name in missing)}")
+
+
+def resolve_head_camera_pose_args(args: argparse.Namespace) -> None:
+    if args.head_camera_pose is not None:
+        args.head_camera_pose = tuple(float(value) for value in args.head_camera_pose)
+        args.camera_pose_preset_resolved = "custom"
+        return
+    preset = resolve_camera_pose_preset(args)
+    args.head_camera_pose = CAMERA_POSE_PRESETS[preset]
+    args.camera_pose_preset_resolved = preset
+
+
+def resolve_camera_pose_preset(args: argparse.Namespace) -> str:
+    preset = str(args.camera_pose_preset)
+    if preset != "auto":
+        return preset
+    return "zed" if selected_camera_model(args) == "zed" else "realsense"
 
 
 def validate_execute_safety(args: argparse.Namespace) -> None:
@@ -664,6 +696,8 @@ def remote_request_metadata(args: argparse.Namespace, *, target_t5_R_ee: np.ndar
         "wrist_axis": args.wrist_axis,
         "control_root_link": args.control_root_link,
         "camera_mount_link": args.camera_mount_link,
+        "camera_pose_preset": args.camera_pose_preset_resolved,
+        "head_camera_pose": [float(value) for value in args.head_camera_pose],
         "return_mask_preview": bool(args.show_mask_window and not args.no_window),
     }
     if target_t5_R_ee is not None:

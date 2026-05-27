@@ -13,7 +13,7 @@ the operator-facing entry points are the server/client commands below.
   - Converts the target to `link_torso_5` / T5 and returns an EE target.
   - Does not import or command `rby1_sdk`.
 - Jetson Orin / robot side: runs `visual_servoing.visual_servo_client`.
-  - Captures D435 RGB-D frames.
+  - Captures D435 or ZED RGB-D frames.
   - Reads robot FK for the live camera mount and current `ee_right` pose.
   - Sends frames and pose metadata to the server.
   - Validates freshness and step limits.
@@ -85,6 +85,21 @@ python -m visual_servoing.visual_servo_client \
   --show-mask-window
 ```
 
+For the ZED setup, use the ZED live backend. `--live-zed` now selects the ZED
+camera mount pose preset automatically:
+
+```bash
+python -m visual_servoing.visual_servo_client \
+  --live-zed \
+  --zed-depth-mode ULTRA \
+  --remote-server 192.168.0.3:8080 \
+  --prompt multimeter \
+  --address 192.168.30.1:50051 \
+  --max-translation-step-m 0.03 \
+  --show-camera-window \
+  --show-mask-window
+```
+
 Important defaults:
 
 - `--execute` is enabled by default. Use `--no-execute` for dry-run.
@@ -94,6 +109,9 @@ Important defaults:
 - `--max-iterations 0` means run until interrupted.
 - `--remote-timeout-s 2` and `--stale-action-max-age-s 1.0` are defaults.
 - Default EE link is `ee_right`; `link_right_arm_6` is still accepted.
+- `--camera-pose-preset auto` selects `zed` for `--live-zed` and `realsense`
+  for D405/D435. Use `--camera-pose-preset realsense` to force the old
+  RealSense pose, or `--head-camera-pose X Y Z R P Y` for manual calibration.
 - ZED uses `--zed-depth-mode NEURAL` by default. If the Jetson/ZED SDK reports
   missing TensorRT or `NEURAL TRT NOT FOUND`, either fix the ZED TensorRT
   installation or retry with `--zed-depth-mode ULTRA`.
