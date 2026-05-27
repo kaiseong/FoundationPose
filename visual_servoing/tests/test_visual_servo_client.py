@@ -5,6 +5,7 @@ import json
 import math
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -20,6 +21,8 @@ from visual_servoing.visual_servo_client import (
     ServoLimits,
     clamp_translation_step,
     decode_mask_preview,
+    emit_iteration_output,
+    format_iteration_summary,
     make_transform_from_xyz_rpy,
     plan_visual_servo_step,
     process_remote_servo_iteration,
@@ -1032,6 +1035,7 @@ def test_remote_fixture_does_not_stop_on_invalid_converged_status(monkeypatch, c
             "127.0.0.1:8080",
             "--max-iterations",
             "2",
+            "--debug",
         ]
     )
     calls = {"count": 0}
@@ -1050,6 +1054,48 @@ def test_remote_fixture_does_not_stop_on_invalid_converged_status(monkeypatch, c
     lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert calls["count"] == 2
     assert [line["ok"] for line in lines] == [False, True]
+
+
+def test_default_output_is_concise_timing_summary():
+    frame_start = 100.0
+    result = {
+        "ok": False,
+        "status": "skipped",
+        "frame_index": 205,
+        "command_sent": False,
+        "reason": "remote response not ok: No usable object mask was produced.",
+        "remote": {
+            "round_trip_ms": 172.149,
+            "request_encode_ms": 6.845,
+        },
+    }
+
+    summary = format_iteration_summary(result, frame_start)
+
+    assert summary.startswith("frame=205 status=skipped ok=false")
+    assert "action_latency_ms=172.1" in summary
+    assert "encode_ms=6.8" in summary
+    assert "command=skip" in summary
+    assert "No usable object mask" in summary
+    assert not summary.startswith("{")
+
+
+def test_debug_output_prints_json(capsys):
+    args = parse_args(["--live", "--debug"])
+    result = {
+        "ok": False,
+        "status": "skipped",
+        "frame_index": 1,
+        "command_sent": False,
+        "reason": "no mask",
+        "mask": {"preview": {"encoding": "packbits-b64-v1"}, "area": 10},
+    }
+
+    emit_iteration_output(args, result, time.perf_counter())
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["frame_index"] == 1
+    assert payload["mask"] == {"area": 10}
 
 
 def test_cli_help_smoke():

@@ -115,7 +115,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Stop live tracking when the target is inside the configured servo tolerances.",
     )
-    parser.add_argument("--print-json", action="store_true", help="Accepted for compatibility; JSON is always printed.")
+    parser.add_argument("--debug", action="store_true", help="Print full per-frame diagnostic JSON instead of concise timing.")
+    parser.add_argument(
+        "--print-json",
+        action="store_true",
+        help="Compatibility alias for --debug.",
+    )
     parser.add_argument("--no-window", action="store_true", help="Disable any local OpenCV preview window.")
     parser.add_argument(
         "--show-camera-window",
@@ -304,6 +309,7 @@ def run_offline(args: argparse.Namespace) -> int:
         t5_T_camera = fixed_t5_T_camera(args)
 
         for frame_index in iteration_range(args.max_iterations):
+            frame_start = time.perf_counter()
             result, previous_object_transform, current_t5_T_ee = process_servo_iteration(
                 args,
                 depth_m=depth_m,
@@ -315,7 +321,7 @@ def run_offline(args: argparse.Namespace) -> int:
                 robot_context=robot_context,
                 frame_index=frame_index,
             )
-            print(json.dumps(result, separators=(",", ":")))
+            emit_iteration_output(args, result, frame_start)
             if result.get("status") == "converged":
                 break
             if args.loop_sleep_s > 0.0:
@@ -347,6 +353,7 @@ def run_live(args: argparse.Namespace) -> int:
             fps=args.fps,
         ) as camera:
             for frame_index in iteration_range(args.max_iterations):
+                frame_start = time.perf_counter()
                 frame = camera.read(timeout_ms=args.frame_timeout_ms)
                 if not preview.show(frame.rgb):
                     break
@@ -383,7 +390,7 @@ def run_live(args: argparse.Namespace) -> int:
                         result["command_feedback"] = robot_context.cancel_command_stream(
                             f"local segmentation skipped: {exc}"
                         )
-                print(json.dumps(result, separators=(",", ":")))
+                emit_iteration_output(args, result, frame_start)
                 if live_should_stop_after_result(args, result):
                     break
                 if args.loop_sleep_s > 0.0:
@@ -406,6 +413,7 @@ def run_remote_live(args: argparse.Namespace) -> int:
             fps=args.fps,
         ) as camera:
             for frame_index in iteration_range(args.max_iterations):
+                frame_start = time.perf_counter()
                 frame = camera.read(timeout_ms=args.frame_timeout_ms)
                 if not preview.show(frame.rgb):
                     break
@@ -422,7 +430,7 @@ def run_remote_live(args: argparse.Namespace) -> int:
                 )
                 if preview.enabled and not preview.show_result(frame.rgb, result):
                     break
-                print(json.dumps(strip_mask_preview_for_logging(result), separators=(",", ":")))
+                emit_iteration_output(args, result, frame_start)
                 if live_should_stop_after_result(args, result):
                     break
                 if args.loop_sleep_s > 0.0:
@@ -438,6 +446,7 @@ def run_remote_fixture(args: argparse.Namespace) -> int:
     current_t5_T_ee = robot_context.current_ee_pose()
     t5_T_camera = fixed_t5_T_camera(args)
     for frame_index in iteration_range(args.max_iterations):
+        frame_start = time.perf_counter()
         result, current_t5_T_ee = process_remote_servo_iteration(
             args,
             rgb=rgb,
@@ -448,7 +457,7 @@ def run_remote_fixture(args: argparse.Namespace) -> int:
             robot_context=robot_context,
             frame_index=frame_index,
         )
-        print(json.dumps(result, separators=(",", ":")))
+        emit_iteration_output(args, result, frame_start)
         if result.get("ok") is True and result.get("status") == "converged":
             break
     return 0
@@ -721,6 +730,42 @@ def live_should_stop_after_result(args: argparse.Namespace, result: dict[str, An
         and result.get("ok") is True
         and result.get("status") == "converged"
     )
+
+
+def emit_iteration_output(args: argparse.Namespace, result: dict[str, Any], frame_start: float) -> None:
+    if getattr(args, "debug", False) or getattr(args, "print_json", False):
+        print(json.dumps(strip_mask_preview_for_logging(result), separators=(",", ":")))
+        return
+    print(format_iteration_summary(result, frame_start))
+
+
+def format_iteration_summary(result: dict[str, Any], frame_start: float) -> str:
+    elapsed_ms = max((time.perf_counter() - frame_start) * 1000.0, 0.0)
+    fps = 1000.0 / elapsed_ms if elapsed_ms > 0.0 else 0.0
+    status = str(result.get("status", "unknown"))
+    ok = bool(result.get("ok", False))
+    command = "sent" if result.get("command_sent") else "skip"
+    parts = [
+        f"frame={int(result.get('frame_index', -1))}",
+        f"status={status}",
+        f"ok={str(ok).lower()}",
+        f"fps={fps:.1f}",
+    ]
+    remote = result.get("remote")
+    if isinstance(remote, dict):
+        round_trip_ms = remote.get("round_trip_ms")
+        if isinstance(round_trip_ms, (int, float)):
+            parts.append(f"action_latency_ms={float(round_trip_ms):.1f}")
+        request_encode_ms = remote.get("request_encode_ms")
+        if isinstance(request_encode_ms, (int, float)):
+            parts.append(f"encode_ms={float(request_encode_ms):.1f}")
+    else:
+        parts.append(f"loop_ms={elapsed_ms:.1f}")
+    parts.append(f"command={command}")
+    reason = str(result.get("reason", "")).strip()
+    if reason:
+        parts.append(f"reason={reason}")
+    return " ".join(parts)
 
 
 def diagnostic_payload(
