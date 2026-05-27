@@ -33,6 +33,7 @@ from visual_servoing.point_pose.live_camera_config import SUPPORTED_LIVE_CAMERA_
 from visual_servoing.point_pose.realsense_d405 import LiveRgbdCamera
 from visual_servoing.point_pose.rgbd_geometry import CameraIntrinsics
 from visual_servoing.point_pose.sam3_phone_segmenter import Sam3PhoneSegmenter, load_mask
+from visual_servoing.point_pose.zed_camera import DEFAULT_ZED_DEPTH_MODE, ZED_DEPTH_MODES
 from visual_servoing.visual_servo_protocol import (
     REQUEST_CONTENT_TYPE,
     decode_visual_servo_response,
@@ -96,6 +97,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--frame-timeout-ms", type=int, default=5000)
+    parser.add_argument(
+        "--zed-depth-mode",
+        choices=ZED_DEPTH_MODES,
+        default=DEFAULT_ZED_DEPTH_MODE,
+        help="ZED SDK depth mode. NEURAL requires TensorRT; use ULTRA if NEURAL cannot open.",
+    )
     parser.add_argument("--prompt", default="object", help="SAM3 prompt for live segmentation.")
     parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"], help="SAM3 device.")
     parser.add_argument("--threshold", type=float, default=0.5, help="SAM3 confidence threshold.")
@@ -358,6 +365,7 @@ def run_live(args: argparse.Namespace) -> int:
             width=args.width,
             height=args.height,
             fps=args.fps,
+            zed_depth_mode=args.zed_depth_mode,
         ) as camera:
             for frame_index in iteration_range(args.max_iterations):
                 frame_start = time.perf_counter()
@@ -419,6 +427,7 @@ def run_remote_live(args: argparse.Namespace) -> int:
             width=args.width,
             height=args.height,
             fps=args.fps,
+            zed_depth_mode=args.zed_depth_mode,
         ) as camera:
             for frame_index in iteration_range(args.max_iterations):
                 frame_start = time.perf_counter()

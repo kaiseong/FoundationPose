@@ -240,6 +240,14 @@ def test_default_fixed_camera_pose_uses_head_1_45_degree_basis():
     np.testing.assert_allclose(fixed_t5_T_camera(args), expected, atol=1e-12)
 
 
+def test_zed_depth_mode_cli_defaults_to_neural_and_accepts_ultra():
+    default_args = parse_args(["--live-zed"])
+    explicit_args = parse_args(["--live-zed", "--zed-depth-mode", "ULTRA"])
+
+    assert default_args.zed_depth_mode == "NEURAL"
+    assert explicit_args.zed_depth_mode == "ULTRA"
+
+
 def test_current_camera_pose_uses_mount_link_fk_when_robot_executes(monkeypatch):
     args = parse_args(["--live", "--camera-mount-link", "link_head_2"])
     mount_t5 = make_transform_from_xyz_rpy([0.1, 0.2, 0.3, 0, 10, 0])

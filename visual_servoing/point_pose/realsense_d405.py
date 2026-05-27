@@ -36,6 +36,7 @@ class LiveRgbdCamera:
         width: int | None = None,
         height: int | None = None,
         fps: int = 15,
+        zed_depth_mode: str | None = None,
     ):
         config = resolve_live_camera_config(model=model, serial=serial, width=width, height=height, fps=fps)
         if config.model in SUPPORTED_REALSENSE_MODELS:
@@ -49,7 +50,7 @@ class LiveRgbdCamera:
                 fps=config.fps,
             )
         if config.model == "zed":
-            from .zed_camera import ZedCamera
+            from .zed_camera import DEFAULT_ZED_DEPTH_MODE, ZedCamera
 
             return ZedCamera(
                 model=config.model,
@@ -57,6 +58,7 @@ class LiveRgbdCamera:
                 width=config.width,
                 height=config.height,
                 fps=config.fps,
+                depth_mode=zed_depth_mode or DEFAULT_ZED_DEPTH_MODE,
             )
         raise ValueError(f"unsupported RGB-D camera model: {config.model}")
 

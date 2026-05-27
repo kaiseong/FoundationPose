@@ -16,6 +16,8 @@ from .realsense_d405 import RgbdFrame
 
 
 ZED_CONFIDENCE_THRESHOLD = 95
+DEFAULT_ZED_DEPTH_MODE = "NEURAL"
+ZED_DEPTH_MODES = ("NEURAL", "ULTRA", "QUALITY", "PERFORMANCE")
 
 
 class ZedUnavailableError(RuntimeError):
@@ -51,6 +53,7 @@ class ZedCamera:
         width: int | None = None,
         height: int | None = None,
         fps: int = 15,
+        depth_mode: str = DEFAULT_ZED_DEPTH_MODE,
     ) -> None:
         self.config: LiveCameraConfig = resolve_live_camera_config(
             model=model,
@@ -59,6 +62,7 @@ class ZedCamera:
             height=height,
             fps=fps,
         )
+        self.depth_mode = normalize_zed_depth_mode(depth_mode)
         self._sl = None
         self._camera = None
         self._runtime_params = None
@@ -70,7 +74,7 @@ class ZedCamera:
         camera = sl.Camera()
         init_params = sl.InitParameters()
         init_params.coordinate_units = sl.UNIT.METER
-        init_params.depth_mode = sl.DEPTH_MODE.NEURAL
+        init_params.depth_mode = zed_depth_mode_constant(sl, self.depth_mode)
         init_params.camera_fps = int(self.config.fps)
         if self.config.sdk_resolution:
             init_params.camera_resolution = getattr(sl.RESOLUTION, self.config.sdk_resolution)
@@ -82,7 +86,7 @@ class ZedCamera:
 
         status = camera.open(init_params)
         if not _is_success(sl, status):
-            raise RuntimeError(f"ZED camera open failed: {status}")
+            raise RuntimeError(zed_open_error_message(status, self.depth_mode))
 
         runtime_params = sl.RuntimeParameters()
         runtime_params.confidence_threshold = ZED_CONFIDENCE_THRESHOLD
@@ -151,6 +155,32 @@ def _import_sl():
 
 def _is_success(sl, status: Any) -> bool:
     return status == getattr(sl.ERROR_CODE, "SUCCESS", 0)
+
+
+def normalize_zed_depth_mode(depth_mode: str) -> str:
+    normalized = str(depth_mode).strip().upper()
+    if normalized not in ZED_DEPTH_MODES:
+        allowed = ", ".join(ZED_DEPTH_MODES)
+        raise ValueError(f"unsupported ZED depth mode: {depth_mode}; allowed: {allowed}")
+    return normalized
+
+
+def zed_depth_mode_constant(sl, depth_mode: str):
+    normalized = normalize_zed_depth_mode(depth_mode)
+    try:
+        return getattr(sl.DEPTH_MODE, normalized)
+    except AttributeError as exc:
+        raise RuntimeError(f"ZED SDK does not expose DEPTH_MODE.{normalized}") from exc
+
+
+def zed_open_error_message(status: Any, depth_mode: str) -> str:
+    message = f"ZED camera open failed: {status}"
+    if normalize_zed_depth_mode(depth_mode) == "NEURAL":
+        message += (
+            "; NEURAL depth requires a working ZED SDK TensorRT installation. "
+            "Install/fix TensorRT for ZED, or retry with --zed-depth-mode ULTRA."
+        )
+    return message
 
 
 def _retrieve_image(camera, mat, sl, view) -> None:

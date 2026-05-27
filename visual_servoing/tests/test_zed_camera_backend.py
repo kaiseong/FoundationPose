@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from visual_servoing.point_pose import zed_camera
-from visual_servoing.point_pose.zed_camera import ZedCamera, ZedUnavailableError
+from visual_servoing.point_pose.zed_camera import ZedCamera, ZedUnavailableError, normalize_zed_depth_mode
 
 
 def test_missing_zed_sdk_has_helpful_error(monkeypatch):
@@ -50,6 +50,30 @@ def test_zed_camera_start_read_stop_uses_neural_depth_confidence_and_left_rgb(mo
     assert frame.intrinsics.height == 2
 
 
+def test_zed_camera_allows_non_neural_depth_mode(monkeypatch):
+    fake_sl, cameras = make_fake_sl()
+    monkeypatch.setattr(zed_camera, "_import_sl", lambda: fake_sl)
+
+    camera = ZedCamera(width=1280, height=720, depth_mode="ULTRA")
+    camera.start()
+    camera.stop()
+
+    assert cameras[0].init_params.depth_mode == fake_sl.DEPTH_MODE.ULTRA
+
+
+def test_zed_camera_neural_open_failure_mentions_tensor_rt(monkeypatch):
+    fake_sl, _ = make_fake_sl(open_status="CORRUPTED SDK INSTALLATION")
+    monkeypatch.setattr(zed_camera, "_import_sl", lambda: fake_sl)
+
+    with pytest.raises(RuntimeError, match="TensorRT"):
+        ZedCamera(depth_mode="NEURAL").start()
+
+
+def test_zed_depth_mode_validation_rejects_unknown_mode():
+    with pytest.raises(ValueError, match="unsupported ZED depth mode"):
+        normalize_zed_depth_mode("FAST")
+
+
 def test_zed_camera_rejects_shape_mismatch(monkeypatch):
     fake_sl, _ = make_fake_sl(depth_shape=(4, 3))
     monkeypatch.setattr(zed_camera, "_import_sl", lambda: fake_sl)
@@ -61,7 +85,7 @@ def test_zed_camera_rejects_shape_mismatch(monkeypatch):
         camera.read()
 
 
-def make_fake_sl(*, depth_shape: tuple[int, int] = (2, 3)):
+def make_fake_sl(*, depth_shape: tuple[int, int] = (2, 3), open_status=0):
     cameras = []
 
     class InitParameters:
@@ -97,7 +121,7 @@ def make_fake_sl(*, depth_shape: tuple[int, int] = (2, 3)):
 
         def open(self, init_params):
             self.init_params = init_params
-            return 0
+            return open_status
 
         def grab(self, runtime_params):
             self.runtime_params = runtime_params
@@ -144,7 +168,7 @@ def make_fake_sl(*, depth_shape: tuple[int, int] = (2, 3)):
         RuntimeParameters=RuntimeParameters,
         Mat=Mat,
         UNIT=SimpleNamespace(METER="meter"),
-        DEPTH_MODE=SimpleNamespace(NEURAL="neural"),
+        DEPTH_MODE=SimpleNamespace(NEURAL="neural", ULTRA="ultra", QUALITY="quality", PERFORMANCE="performance"),
         RESOLUTION=SimpleNamespace(VGA="vga", HD720="hd720"),
         VIEW=SimpleNamespace(LEFT="left"),
         MEASURE=SimpleNamespace(DEPTH="depth"),

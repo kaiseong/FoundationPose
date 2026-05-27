@@ -94,6 +94,9 @@ Important defaults:
 - `--max-iterations 0` means run until interrupted.
 - `--remote-timeout-s 2` and `--stale-action-max-age-s 1.0` are defaults.
 - Default EE link is `ee_right`; `link_right_arm_6` is still accepted.
+- ZED uses `--zed-depth-mode NEURAL` by default. If the Jetson/ZED SDK reports
+  missing TensorRT or `NEURAL TRT NOT FOUND`, either fix the ZED TensorRT
+  installation or retry with `--zed-depth-mode ULTRA`.
 
 ## Quick Connectivity Check
 
