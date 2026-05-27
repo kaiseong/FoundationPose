@@ -12,6 +12,7 @@ from visual_servoing.phone_pose.realsense_d405 import (
     LiveRgbdCamera,
     RealSenseUnavailableError,
     SUPPORTED_LIVE_CAMERA_MODELS,
+    bgr_to_rgb,
 )
 from visual_servoing.phone_pose.sam3_phone_segmenter import select_single_mask
 
@@ -49,6 +50,14 @@ def test_d435_camera_wrapper_selects_d435_model():
 
     assert camera.model == "d435"
     assert camera.label == "D435"
+
+
+def test_realsense_bgr_frames_are_returned_as_rgb():
+    image_bgr = np.array([[[10, 20, 30], [1, 2, 3]]], dtype=np.uint8)
+
+    image_rgb = bgr_to_rgb(image_bgr)
+
+    np.testing.assert_array_equal(image_rgb, np.array([[[30, 20, 10], [3, 2, 1]]], dtype=np.uint8))
 
 
 def test_live_camera_model_selection_prefers_explicit_camera_flag():

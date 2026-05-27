@@ -90,7 +90,10 @@ class RealSenseCamera:
         config = rs.config()
         if self.serial:
             config.enable_device(self.serial)
-        config.enable_stream(rs.stream.color, self.width, self.height, rs.format.rgb8, self.fps)
+        # D435/D435I can advertise RGB8 but intermittently never deliver frames
+        # for RGB8+Z16 at 640x480/15fps. BGR8 is stable; convert below so the
+        # shared RgbdFrame contract remains RGB.
+        config.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps)
         config.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.fps)
         profile = pipeline.start(config)
         depth_sensor = profile.get_device().first_depth_sensor()
@@ -114,7 +117,7 @@ class RealSenseCamera:
         if not color_frame or not depth_frame:
             raise RuntimeError(f"{self.label} did not provide both color and aligned depth frames.")
 
-        rgb = np.asanyarray(color_frame.get_data()).copy()
+        rgb = bgr_to_rgb(np.asanyarray(color_frame.get_data()))
         depth_m = np.asanyarray(depth_frame.get_data()).astype(np.float32) * self._depth_scale
         intr = color_frame.profile.as_video_stream_profile().intrinsics
         distortion_coeffs = tuple(float(value) for value in getattr(intr, "coeffs", []))
@@ -153,6 +156,13 @@ class RealSenseCamera:
             ) from exc
         self._rs = rs
         return rs
+
+
+def bgr_to_rgb(image_bgr: np.ndarray) -> np.ndarray:
+    image = np.asarray(image_bgr)
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise RuntimeError(f"RealSense color frame must be HxWx3 BGR, got shape {image.shape}")
+    return image[..., ::-1].copy()
 
 
 class D405Camera(RealSenseCamera):
