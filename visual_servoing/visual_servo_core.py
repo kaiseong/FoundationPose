@@ -17,10 +17,11 @@ from visual_servoing.point_pose.rgbd_geometry import (
 
 
 RIGHT_ARM_CONTROL_ROOT_LINK = "link_torso_5"
-RIGHT_ARM_EE_LINKS = frozenset({"link_right_arm_6", "ee_right"})
+DEFAULT_RIGHT_ARM_EE_LINK = "ee_right"
+RIGHT_ARM_EE_LINKS = frozenset({"link_right_arm_6", DEFAULT_RIGHT_ARM_EE_LINK})
 REMOTE_ACTION_CONTROL_MODE = "right_arm_cartesian"
 REMOTE_OFFSET_FRAME = RIGHT_ARM_CONTROL_ROOT_LINK
-POSITION_ONLY_ORIENTATION_POLICY = "preserve_current_ee_rotation"
+POSITION_ONLY_ORIENTATION_POLICY = "fixed_t5_rpy_zero"
 EXECUTABLE_REMOTE_STATUS = "tracking"
 NO_COMMAND_REMOTE_STATUSES = frozenset({"converged", "skipped", "error"})
 
@@ -123,13 +124,20 @@ def plan_t5_position_servo_action(
         max_step_m=limits.max_translation_step_m,
     )
 
-    target_t5_T_ee = current_t5_T_ee.copy()
+    target_rotation = np.eye(3, dtype=np.float64)
+    target_t5_T_ee = np.eye(4, dtype=np.float64)
     target_t5_T_ee[:3, 3] = current_t5_T_ee[:3, 3] + translation_step_m
-    target_t5_T_ee[:3, :3] = current_t5_T_ee[:3, :3]
+    target_t5_T_ee[:3, :3] = target_rotation
 
-    converged = float(np.linalg.norm(position_error_m)) <= limits.position_tolerance_m
+    wrist_error_rad = rotation_angle(current_t5_T_ee[:3, :3].T @ target_rotation)
+    converged = (
+        float(np.linalg.norm(position_error_m)) <= limits.position_tolerance_m
+        and abs(wrist_error_rad) <= limits.wrist_tolerance_rad
+    )
     status = "converged" if converged else "tracking"
-    command_recommended = not converged and float(np.linalg.norm(translation_step_m)) > 1e-9
+    command_recommended = not converged and (
+        float(np.linalg.norm(translation_step_m)) > 1e-9 or abs(wrist_error_rad) > 1e-9
+    )
     return ServoStep(
         status=status,
         current_t5_T_ee=current_t5_T_ee,
@@ -137,8 +145,8 @@ def plan_t5_position_servo_action(
         desired_position_t5_m=desired_position_t5_m,
         position_error_m=position_error_m,
         translation_step_m=translation_step_m,
-        wrist_error_rad=0.0,
-        wrist_step_rad=0.0,
+        wrist_error_rad=float(wrist_error_rad),
+        wrist_step_rad=float(wrist_error_rad),
         command_recommended=command_recommended,
         ignored_offset_rpy_deg=(0.0, 0.0),
     )
@@ -287,9 +295,14 @@ def validate_remote_action(
     if translation_delta > float(max_translation_step_m) + 1e-9:
         return RemoteActionValidation(False, False, "remote action translation step exceeds limit")
 
-    rotation_delta = rotation_angle(current[:3, :3].T @ target[:3, :3])
-    if rotation_delta > float(max_wrist_step_rad) + 1e-9:
-        return RemoteActionValidation(False, False, "remote action wrist step exceeds limit")
+    orientation_policy = str(action.get("orientation_policy", ""))
+    if orientation_policy == POSITION_ONLY_ORIENTATION_POLICY:
+        if not np.allclose(target[:3, :3], np.eye(3), atol=rotation_tolerance):
+            return RemoteActionValidation(False, False, "remote action fixed_t5_rpy_zero target is not identity rotation")
+    else:
+        rotation_delta = rotation_angle(current[:3, :3].T @ target[:3, :3])
+        if rotation_delta > float(max_wrist_step_rad) + 1e-9:
+            return RemoteActionValidation(False, False, "remote action wrist step exceeds limit")
 
     return RemoteActionValidation(True, True, "remote action validated", target_t5_T_ee=target)
 

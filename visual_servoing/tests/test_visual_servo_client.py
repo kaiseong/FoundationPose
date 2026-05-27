@@ -11,6 +11,8 @@ import numpy as np
 import pytest
 
 from visual_servoing.visual_servo_client import (
+    DEFAULT_CAMERA_MOUNT_LINK,
+    DEFAULT_RIGHT_ARM_EE_LINK,
     DEFAULT_T5_HEAD_XYZ_RPY,
     LiveCameraPreview,
     RIGHT_ARM_CONTROL_ROOT_LINK,
@@ -22,7 +24,9 @@ from visual_servoing.visual_servo_client import (
     plan_visual_servo_step,
     process_remote_servo_iteration,
     parse_args,
+    current_t5_T_camera,
     fixed_t5_T_camera,
+    live_should_stop_after_result,
     remote_request_metadata,
     run_remote_fixture,
     signed_angle_about_axis,
@@ -60,6 +64,18 @@ class FakeBuilder:
 
     def _chain(self, *args, **kwargs):
         del args, kwargs
+        return self
+
+
+class FakeCartesianImpedanceControlCommandBuilder(FakeBuilder):
+    instances: list["FakeCartesianImpedanceControlCommandBuilder"] = []
+
+    def __init__(self):
+        self.targets = []
+        self.instances.append(self)
+
+    def add_target(self, *args):
+        self.targets.append(args)
         return self
 
 
@@ -139,7 +155,7 @@ class FakeRby:
             Idle = "idle"
             Running = "running"
 
-    CartesianImpedanceControlCommandBuilder = FakeBuilder
+    CartesianImpedanceControlCommandBuilder = FakeCartesianImpedanceControlCommandBuilder
     JointPositionCommandBuilder = FakeBuilder
     CommandHeaderBuilder = FakeBuilder
     RobotCommandBuilder = FakeBuilder
@@ -210,11 +226,43 @@ def test_make_transform_from_xyz_rpy_translation_and_rotation():
 def test_default_fixed_camera_pose_uses_head_1_45_degree_basis():
     args = parse_args(["--live"])
 
+    assert args.camera_mount_link == DEFAULT_CAMERA_MOUNT_LINK
     assert tuple(args.t5_head_pose) == DEFAULT_T5_HEAD_XYZ_RPY
     expected = make_transform_from_xyz_rpy(DEFAULT_T5_HEAD_XYZ_RPY) @ make_transform_from_xyz_rpy(
         args.head_camera_pose
     )
     np.testing.assert_allclose(fixed_t5_T_camera(args), expected, atol=1e-12)
+
+
+def test_current_camera_pose_uses_mount_link_fk_when_robot_executes(monkeypatch):
+    args = parse_args(["--live", "--camera-mount-link", "link_head_2"])
+    mount_t5 = make_transform_from_xyz_rpy([0.1, 0.2, 0.3, 0, 10, 0])
+    calls = []
+
+    def fake_compute_fk(robot, ee_link, base_link):
+        calls.append((robot, ee_link, base_link))
+        return mount_t5
+
+    monkeypatch.setattr("visual_servoing.visual_servo_client.compute_fk", fake_compute_fk)
+    robot = object()
+    context = SimpleNamespace(execute=True, robot=robot)
+
+    expected = mount_t5 @ make_transform_from_xyz_rpy(args.head_camera_pose)
+
+    np.testing.assert_allclose(current_t5_T_camera(args, context), expected, atol=1e-12)
+    assert calls == [(robot, "link_head_2", RIGHT_ARM_CONTROL_ROOT_LINK)]
+
+
+def test_current_camera_pose_falls_back_to_fixed_pose_for_dry_run(monkeypatch):
+    args = parse_args(["--live"])
+
+    def fail_compute_fk(*args, **kwargs):
+        raise AssertionError("dry-run camera pose must not read robot FK")
+
+    monkeypatch.setattr("visual_servoing.visual_servo_client.compute_fk", fail_compute_fk)
+    context = SimpleNamespace(execute=False, robot=None)
+
+    np.testing.assert_allclose(current_t5_T_camera(args, context), fixed_t5_T_camera(args), atol=1e-12)
 
 
 def test_camera_preview_disabled_by_default():
@@ -289,6 +337,19 @@ def test_show_mask_window_requests_remote_mask_preview():
     assert remote_request_metadata(args)["return_mask_preview"] is True
 
 
+def test_live_converged_result_keeps_tracking_by_default():
+    args = parse_args(["--live"])
+
+    assert live_should_stop_after_result(args, {"ok": True, "status": "converged"}) is False
+
+
+def test_live_converged_result_can_stop_when_requested():
+    args = parse_args(["--live", "--stop-on-converged"])
+
+    assert live_should_stop_after_result(args, {"ok": True, "status": "converged"}) is True
+    assert live_should_stop_after_result(args, {"ok": False, "status": "converged"}) is False
+
+
 def test_no_window_disables_remote_mask_preview_request():
     args = parse_args(["--live", "--remote-server", "127.0.0.1:8080", "--show-mask-window", "--no-window"])
 
@@ -348,6 +409,79 @@ def test_camera_preview_overlays_mask_preview(monkeypatch):
     assert fake_cv2.images[0][0] == "visual_servo_client"
     np.testing.assert_array_equal(fake_cv2.images[0][1][0, 0], [0, 255, 0])
     np.testing.assert_array_equal(fake_cv2.images[0][1][0, 1], [0, 0, 0])
+
+
+def test_camera_preview_draws_estimated_depth_overlay(monkeypatch):
+    class FakeCv2:
+        COLOR_RGB2BGR = 1
+        WINDOW_NORMAL = 2
+        INTER_NEAREST = 3
+        FONT_HERSHEY_SIMPLEX = 4
+        LINE_AA = 5
+
+        def __init__(self):
+            self.images = []
+            self.texts = []
+            self.rectangles = []
+
+        def namedWindow(self, name, flag):
+            del name, flag
+
+        def cvtColor(self, image, code):
+            assert code == self.COLOR_RGB2BGR
+            return image[..., ::-1]
+
+        def resize(self, image, *args, **kwargs):
+            del args, kwargs
+            return image
+
+        def rectangle(self, image, pt1, pt2, color, thickness):
+            del image
+            self.rectangles.append((pt1, pt2, color, thickness))
+
+        def putText(self, image, text, org, font, scale, color, thickness, line_type):
+            del image, org, font, scale, color, thickness, line_type
+            self.texts.append(text)
+
+        def imshow(self, name, image):
+            self.images.append((name, image.copy()))
+
+        def waitKey(self, delay_ms):
+            assert delay_ms == 1
+            return -1
+
+        def destroyWindow(self, name):
+            del name
+
+    fake_cv2 = FakeCv2()
+    import visual_servoing.visual_servo_client as client
+
+    monkeypatch.setattr(client, "require_cv2", lambda: fake_cv2)
+    args = parse_args(["--live", "--show-camera-window"])
+
+    with LiveCameraPreview(args) as preview:
+        keep_running = preview.show_result(
+            np.zeros((40, 120, 3), dtype=np.uint8),
+            {"observation": {"centroid_camera_m": [0.0, 0.0, 0.2134]}},
+        )
+        keep_running = keep_running and preview.show(np.zeros((40, 120, 3), dtype=np.uint8))
+        keep_running = keep_running and preview.show_result(
+            np.zeros((40, 120, 3), dtype=np.uint8),
+            {"ok": False, "reason": "No usable object mask was produced."},
+        )
+        keep_running = keep_running and preview.show_result(
+            np.zeros((40, 120, 3), dtype=np.uint8),
+            {"observation": {"centroid_camera_m": [0.0, 0.0, 0.4172]}},
+        )
+
+    assert keep_running is True
+    assert fake_cv2.texts == [
+        "depth z=0.213 m",
+        "depth z=0.213 m",
+        "depth z=0.213 m",
+        "depth z=0.417 m",
+    ]
+    assert fake_cv2.rectangles
 
 
 def test_decode_mask_preview_round_trip():
@@ -486,8 +620,9 @@ def test_send_right_arm_cartesian_uses_command_stream_with_timeout():
     args = parse_args(["--live", "--command-priority", "7", "--command-timeout-s", "1.25"])
     robot = FakeCommandRobot()
     context = RobotContext(args, robot=robot, rby=FakeRby)
+    target = make_transform_from_xyz_rpy([0.1, -0.2, 0.3, 0, 0, 0])
 
-    feedback = context.send_right_arm_cartesian(np.eye(4))
+    feedback = context.send_right_arm_cartesian(target)
 
     assert feedback == {
         "finish_code": "stream-ok",
@@ -502,6 +637,16 @@ def test_send_right_arm_cartesian_uses_command_stream_with_timeout():
     assert len(robot.streams[0].send_args) == 2
     assert robot.streams[0].send_args[1] == 1250
     assert robot.wait_calls == []
+    target_args = FakeCartesianImpedanceControlCommandBuilder.instances[-1].targets[-1]
+    assert target_args[0] == args.control_root_link
+    assert target_args[1] == args.ee_link
+    np.testing.assert_allclose(target_args[2], target)
+    assert target_args[3:] == (
+        float(args.linear_limit),
+        float(args.angular_limit),
+        float(args.linear_gain),
+        float(args.angular_gain),
+    )
 
 
 def test_send_right_arm_cartesian_cancels_active_control_before_waiting():
@@ -634,6 +779,7 @@ def test_validate_execute_defaults_to_m_model_and_all_power_servo():
     args = parse_args(["--live", "--execute", "--address", "127.0.0.1:50051"])
 
     assert args.model == "m"
+    assert args.ee_link == DEFAULT_RIGHT_ARM_EE_LINK
     assert args.power == ".*"
     assert args.servo == ".*"
     assert args.move_to_ready_on_connect is False
@@ -718,7 +864,7 @@ def test_remote_target_offset_t5_metadata_is_explicit_t5_frame():
 
     assert metadata["target_offset_t5_m"] == [0.1, -0.2, 0.3]
     assert metadata["offset_frame"] == "link_torso_5"
-    assert metadata["orientation_policy"] == "preserve_current_ee_rotation"
+    assert metadata["orientation_policy"] == "fixed_t5_rpy_zero"
     assert metadata["servo_dofs"] == "xyz_position_only"
 
 

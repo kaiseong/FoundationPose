@@ -45,10 +45,12 @@ if _ADDED_PACKAGE_PARENT is not None:
 
 DEFAULT_T5_HEAD_XYZ_RPY = (0.0, 0.0, 0.0, 0.0, 45.0, 0.0)
 HEAD_TO_CAMERA_XYZ_RPY = (0.047, 0.009, 0.057, -90.0, 0.0, -90.0)
+DEFAULT_CAMERA_MOUNT_LINK = "link_head_2"
 DEFAULT_RIGHT_ARM_STIFFNESS = (90.0, 90.0, 90.0, 70.0, 70.0, 70.0, 70.0)
 DEFAULT_RIGHT_ARM_TORQUE_LIMIT = (40.0, 40.0, 40.0, 30.0, 30.0, 30.0, 30.0)
 RIGHT_ARM_CARTESIAN_READY_POSE_DEG = (0.0, -5.0, 0.0, -120.0, 0.0, 40.0, 0.0)
 RIGHT_ARM_CONTROL_ROOT_LINK = servo_core.RIGHT_ARM_CONTROL_ROOT_LINK
+DEFAULT_RIGHT_ARM_EE_LINK = servo_core.DEFAULT_RIGHT_ARM_EE_LINK
 RIGHT_ARM_EE_LINKS = servo_core.RIGHT_ARM_EE_LINKS
 REMOTE_OFFSET_FRAME = servo_core.REMOTE_OFFSET_FRAME
 POSITION_ONLY_ORIENTATION_POLICY = servo_core.POSITION_ONLY_ORIENTATION_POLICY
@@ -108,6 +110,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     parser.add_argument("--max-iterations", type=int, default=1, help="0 means run until interrupted.")
     parser.add_argument("--loop-sleep-s", type=float, default=0.0)
+    parser.add_argument(
+        "--stop-on-converged",
+        action="store_true",
+        help="Stop live tracking when the target is inside the configured servo tolerances.",
+    )
     parser.add_argument("--print-json", action="store_true", help="Accepted for compatibility; JSON is always printed.")
     parser.add_argument("--no-window", action="store_true", help="Disable any local OpenCV preview window.")
     parser.add_argument(
@@ -170,7 +177,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         nargs=6,
         default=HEAD_TO_CAMERA_XYZ_RPY,
         metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"),
-        help="Head-to-camera pose: meters and degrees.",
+        help="Camera-mount-link-to-camera pose: meters and degrees.",
+    )
+    parser.add_argument(
+        "--camera-mount-link",
+        default=DEFAULT_CAMERA_MOUNT_LINK,
+        help="Robot link the camera bracket is mounted to. Execute mode uses live FK from this link to T5.",
     )
     parser.add_argument("--max-translation-step-m", type=float, default=0.01)
     parser.add_argument("--max-wrist-step-deg", type=float, default=5.0)
@@ -185,7 +197,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--power", default=".*", help="Power-on component pattern. Defaults to all components.")
     parser.add_argument("--servo", default=".*", help="Servo-on component pattern. Defaults to all components.")
     parser.add_argument("--control-root-link", default=RIGHT_ARM_CONTROL_ROOT_LINK)
-    parser.add_argument("--ee-link", default="link_right_arm_6")
+    parser.add_argument("--ee-link", default=DEFAULT_RIGHT_ARM_EE_LINK)
     parser.add_argument("--command-min-time-s", type=float, default=0.25)
     parser.add_argument("--command-hold-time-s", type=float, default=0.5)
     parser.add_argument("--command-timeout-s", type=float, default=2.0)
@@ -327,7 +339,6 @@ def run_live(args: argparse.Namespace) -> int:
     try:
         previous_object_transform = None
         current_t5_T_ee = robot_context.current_ee_pose()
-        t5_T_camera = fixed_t5_T_camera(args)
         with LiveCameraPreview(args) as preview, LiveRgbdCamera(
             model=camera_model,
             serial=args.serial,
@@ -341,6 +352,7 @@ def run_live(args: argparse.Namespace) -> int:
                     break
                 try:
                     selection = segmenter.segment(frame.rgb)
+                    t5_T_camera = current_t5_T_camera(args, robot_context)
                     result, previous_object_transform, current_t5_T_ee = process_servo_iteration(
                         args,
                         depth_m=frame.depth_m,
@@ -358,10 +370,11 @@ def run_live(args: argparse.Namespace) -> int:
                         "area": selection.area,
                         "box_xyxy": selection.box_xyxy,
                     }
-                    if args.show_mask_window and not preview.show(
+                    result_mask = selection.mask if args.show_mask_window else None
+                    if preview.enabled and not preview.show_result(
                         frame.rgb,
-                        mask=selection.mask,
-                        box_xyxy=selection.box_xyxy,
+                        result,
+                        mask=result_mask,
                     ):
                         break
                 except Exception as exc:
@@ -371,7 +384,7 @@ def run_live(args: argparse.Namespace) -> int:
                             f"local segmentation skipped: {exc}"
                         )
                 print(json.dumps(result, separators=(",", ":")))
-                if result.get("ok") is True and result.get("status") == "converged":
+                if live_should_stop_after_result(args, result):
                     break
                 if args.loop_sleep_s > 0.0:
                     time.sleep(args.loop_sleep_s)
@@ -385,7 +398,6 @@ def run_remote_live(args: argparse.Namespace) -> int:
     robot_context = RobotContext.connect(args) if args.execute else RobotContext.dry_run(args)
     try:
         current_t5_T_ee = robot_context.current_ee_pose()
-        t5_T_camera = fixed_t5_T_camera(args)
         with LiveCameraPreview(args) as preview, LiveRgbdCamera(
             model=camera_model,
             serial=args.serial,
@@ -397,6 +409,7 @@ def run_remote_live(args: argparse.Namespace) -> int:
                 frame = camera.read(timeout_ms=args.frame_timeout_ms)
                 if not preview.show(frame.rgb):
                     break
+                t5_T_camera = current_t5_T_camera(args, robot_context)
                 result, current_t5_T_ee = process_remote_servo_iteration(
                     args,
                     rgb=frame.rgb,
@@ -407,10 +420,10 @@ def run_remote_live(args: argparse.Namespace) -> int:
                     robot_context=robot_context,
                     frame_index=frame_index,
                 )
-                if args.show_mask_window and not preview.show_result(frame.rgb, result):
+                if preview.enabled and not preview.show_result(frame.rgb, result):
                     break
                 print(json.dumps(strip_mask_preview_for_logging(result), separators=(",", ":")))
-                if result.get("ok") is True and result.get("status") == "converged":
+                if live_should_stop_after_result(args, result):
                     break
                 if args.loop_sleep_s > 0.0:
                     time.sleep(args.loop_sleep_s)
@@ -567,6 +580,7 @@ def remote_request_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "ee_align_axis": args.ee_align_axis,
         "wrist_axis": args.wrist_axis,
         "control_root_link": args.control_root_link,
+        "camera_mount_link": args.camera_mount_link,
         "return_mask_preview": bool(args.show_mask_window and not args.no_window),
     }
 
@@ -699,6 +713,14 @@ def command_reason(args: argparse.Namespace, step: ServoStep) -> str:
     if not step.command_recommended:
         return "no command recommended"
     return "ready to send right-arm Cartesian command"
+
+
+def live_should_stop_after_result(args: argparse.Namespace, result: dict[str, Any]) -> bool:
+    return bool(
+        getattr(args, "stop_on_converged", False)
+        and result.get("ok") is True
+        and result.get("status") == "converged"
+    )
 
 
 def diagnostic_payload(
@@ -989,6 +1011,7 @@ class LiveCameraPreview:
         self.enabled = bool((args.show_camera_window or args.show_mask_window) and not args.no_window)
         self.cv2 = None
         self.window_name = str(args.camera_window_name)
+        self._last_overlay_lines: list[str] = []
 
     def __enter__(self) -> "LiveCameraPreview":
         if not self.enabled:
@@ -1008,6 +1031,7 @@ class LiveCameraPreview:
         mask: np.ndarray | None = None,
         mask_preview: dict[str, Any] | None = None,
         box_xyxy: list[float] | tuple[float, float, float, float] | None = None,
+        overlay_lines: list[str] | None = None,
     ) -> bool:
         if not self.enabled:
             return True
@@ -1027,18 +1051,29 @@ class LiveCameraPreview:
         scale = float(self.args.camera_window_scale)
         if abs(scale - 1.0) > 1e-12:
             image = self.cv2.resize(image, None, fx=scale, fy=scale, interpolation=self.cv2.INTER_NEAREST)
+        lines_to_draw = self._overlay_lines_to_draw(overlay_lines)
+        if lines_to_draw:
+            image = self._draw_overlay_lines(image, lines_to_draw)
         self.cv2.imshow(self.window_name, image)
         key = self.cv2.waitKey(1) & 0xFF
         return key not in (ord("q"), 27)
 
-    def show_result(self, rgb: np.ndarray, result: dict[str, Any]) -> bool:
+    def show_result(
+        self,
+        rgb: np.ndarray,
+        result: dict[str, Any],
+        *,
+        mask: np.ndarray | None = None,
+    ) -> bool:
         mask_payload = result.get("mask")
         if not isinstance(mask_payload, dict):
-            return self.show(rgb)
+            mask_payload = {}
         return self.show(
             rgb,
+            mask=mask,
             mask_preview=mask_payload.get("preview"),
             box_xyxy=mask_payload.get("box_xyxy"),
+            overlay_lines=self._result_overlay_lines(result),
         )
 
     def _overlay_mask(self, image_rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -1050,6 +1085,11 @@ class LiveCameraPreview:
         overlay = image_rgb.astype(np.float32)
         overlay[mask_bool] = overlay[mask_bool] * (1.0 - alpha) + color * alpha
         return np.clip(overlay, 0, 255).astype(np.uint8)
+
+    def _overlay_lines_to_draw(self, overlay_lines: list[str] | None) -> list[str]:
+        if overlay_lines:
+            self._last_overlay_lines = list(overlay_lines)
+        return list(self._last_overlay_lines)
 
     def _mask_for_image(self, mask: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
         mask_u8 = np.asarray(mask, dtype=np.uint8)
@@ -1081,6 +1121,43 @@ class LiveCameraPreview:
         image_rgb[y1, x0 : x1 + 1] = [255, 0, 0]
         return image_rgb
 
+    def _draw_overlay_lines(self, image_bgr: np.ndarray, lines: list[str]) -> np.ndarray:
+        if self.cv2 is None or not hasattr(self.cv2, "putText"):
+            return image_bgr
+        height, width = image_bgr.shape[:2]
+        if height <= 0 or width <= 0:
+            return image_bgr
+        line_height = 18
+        pad = 5
+        box_height = min(height, pad * 2 + line_height * len(lines))
+        box_width = min(width, 190)
+        if hasattr(self.cv2, "rectangle"):
+            self.cv2.rectangle(image_bgr, (0, 0), (max(0, box_width - 1), max(0, box_height - 1)), (0, 0, 0), -1)
+        font = getattr(self.cv2, "FONT_HERSHEY_SIMPLEX", 0)
+        line_type = getattr(self.cv2, "LINE_AA", 8)
+        for index, line in enumerate(lines):
+            y = min(height - 4, pad + 12 + index * line_height)
+            if y <= 0:
+                continue
+            self.cv2.putText(image_bgr, line, (pad, y), font, 0.45, (255, 255, 255), 1, line_type)
+        return image_bgr
+
+    @staticmethod
+    def _result_overlay_lines(result: dict[str, Any]) -> list[str]:
+        observation = result.get("observation")
+        if not isinstance(observation, dict):
+            return []
+        centroid = observation.get("centroid_camera_m")
+        if not isinstance(centroid, (list, tuple)) or len(centroid) < 3:
+            return []
+        try:
+            depth_m = float(centroid[2])
+        except (TypeError, ValueError):
+            return []
+        if not math.isfinite(depth_m):
+            return []
+        return [f"depth z={depth_m:.3f} m"]
+
 
 def compute_fk(robot, ee_link: str, base_link: str) -> np.ndarray:
     robot_state = robot.get_state()
@@ -1102,6 +1179,14 @@ def require_rby():
 
 def fixed_t5_T_camera(args: argparse.Namespace) -> np.ndarray:
     return make_transform_from_xyz_rpy(args.t5_head_pose) @ make_transform_from_xyz_rpy(args.head_camera_pose)
+
+
+def current_t5_T_camera(args: argparse.Namespace, robot_context: RobotContext) -> np.ndarray:
+    if robot_context.execute:
+        return compute_fk(robot_context.robot, args.camera_mount_link, args.control_root_link) @ make_transform_from_xyz_rpy(
+            args.head_camera_pose
+        )
+    return fixed_t5_T_camera(args)
 
 
 def selected_camera_model(args: argparse.Namespace) -> str:

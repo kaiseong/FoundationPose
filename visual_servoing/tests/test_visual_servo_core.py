@@ -61,7 +61,7 @@ def test_plan_visual_servo_action_applies_object_offset_not_current_ee_frame():
     np.testing.assert_allclose(step.desired_position_t5_m, [1.0, 1.1, 0.0], atol=1e-12)
 
 
-def test_plan_t5_position_servo_action_uses_t5_offset_and_preserves_rotation():
+def test_plan_t5_position_servo_action_uses_t5_offset_and_fixed_zero_rpy():
     current = make_transform_from_xyz_rpy([0.0, 0.0, 0.0, 0.0, 0.0, 90.0])
 
     step = plan_t5_position_servo_action(
@@ -72,16 +72,16 @@ def test_plan_t5_position_servo_action_uses_t5_offset_and_preserves_rotation():
     )
 
     assert REMOTE_OFFSET_FRAME == RIGHT_ARM_CONTROL_ROOT_LINK
-    assert POSITION_ONLY_ORIENTATION_POLICY == "preserve_current_ee_rotation"
+    assert POSITION_ONLY_ORIENTATION_POLICY == "fixed_t5_rpy_zero"
     np.testing.assert_allclose(step.desired_position_t5_m, [1.1, 0.8, 0.3], atol=1e-12)
     np.testing.assert_allclose(step.target_t5_T_ee[:3, 3], [1.1, 0.8, 0.3], atol=1e-12)
-    np.testing.assert_allclose(step.target_t5_T_ee[:3, :3], current[:3, :3], atol=1e-12)
-    assert step.wrist_error_rad == 0.0
-    assert step.wrist_step_rad == 0.0
+    np.testing.assert_allclose(step.target_t5_T_ee[:3, :3], np.eye(3), atol=1e-12)
+    assert math.isclose(step.wrist_error_rad, math.radians(90.0), abs_tol=1e-12)
+    assert math.isclose(step.wrist_step_rad, math.radians(90.0), abs_tol=1e-12)
 
 
-def test_plan_t5_position_servo_action_converges_on_position_only():
-    current = make_transform_from_xyz_rpy([1.001, 1.0, 1.0, 0.0, 0.0, 180.0])
+def test_plan_t5_position_servo_action_converges_on_position_and_zero_rpy():
+    current = make_transform_from_xyz_rpy([1.001, 1.0, 1.0, 0.0, 0.0, 0.0])
 
     step = plan_t5_position_servo_action(
         current_t5_T_ee=current,
@@ -92,7 +92,7 @@ def test_plan_t5_position_servo_action_converges_on_position_only():
 
     assert step.status == "converged"
     assert step.command_recommended is False
-    np.testing.assert_allclose(step.target_t5_T_ee[:3, :3], current[:3, :3], atol=1e-12)
+    np.testing.assert_allclose(step.target_t5_T_ee[:3, :3], np.eye(3), atol=1e-12)
 
 
 def test_validate_remote_action_accepts_tracking_with_bounded_target():
@@ -268,6 +268,46 @@ def test_validate_remote_action_rejects_oversized_wrist_step():
 
     assert validation.ok is False
     assert "wrist" in validation.reason
+
+
+def test_validate_remote_action_accepts_fixed_zero_rpy_policy_without_wrist_step_limit():
+    current = make_transform_from_xyz_rpy([0.0, 0.0, 0.0, 0.0, 0.0, 90.0])
+    response = _response(np.eye(4))
+    response["action"]["orientation_policy"] = POSITION_ONLY_ORIENTATION_POLICY
+
+    validation = validate_remote_action(
+        response,
+        request_id="req-1",
+        frame_index=3,
+        round_trip_s=0.1,
+        stale_action_max_age_s=1.0,
+        current_t5_T_ee=current,
+        max_translation_step_m=0.02,
+        max_wrist_step_rad=math.radians(5.0),
+    )
+
+    assert validation.ok is True
+    assert validation.executable is True
+    np.testing.assert_allclose(validation.target_t5_T_ee[:3, :3], np.eye(3), atol=1e-12)
+
+
+def test_validate_remote_action_rejects_fixed_zero_rpy_policy_with_non_identity_rotation():
+    response = _response(make_transform_from_xyz_rpy([0.0, 0.0, 0.0, 0.0, 0.0, 10.0]))
+    response["action"]["orientation_policy"] = POSITION_ONLY_ORIENTATION_POLICY
+
+    validation = validate_remote_action(
+        response,
+        request_id="req-1",
+        frame_index=3,
+        round_trip_s=0.1,
+        stale_action_max_age_s=1.0,
+        current_t5_T_ee=np.eye(4),
+        max_translation_step_m=0.02,
+        max_wrist_step_rad=math.radians(5.0),
+    )
+
+    assert validation.ok is False
+    assert "identity rotation" in validation.reason
 
 
 def test_validate_remote_action_rejects_non_finite_target():

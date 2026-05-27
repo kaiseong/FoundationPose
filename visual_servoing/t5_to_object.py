@@ -47,7 +47,7 @@ def compute_fk(robot, ee_link, base_link="link_torso_5"):
     return dyn_model.compute_transformation(dyn_state, 0, 1)
 
 def calc_t5_to_object(robot, cam_to_object_tf):
-    t5_to_head_tf = compute_fk(robot, "link_head_1", "link_torso_5")
+    t5_to_head_tf = compute_fk(robot, "link_head_2", "link_torso_5")
     head_to_cam_tf = make_transform([0.047, 0.009, 0.057, -90.0, 0.0, -90.0])
     t5_to_object_tf = t5_to_head_tf @ head_to_cam_tf @ cam_to_object_tf
     return t5_to_object_tf
@@ -92,8 +92,8 @@ def main(address, model_name, power, servo):
     logging.info("Robot initialized successfully.")
     
     try:
-        # Get relative coordinate system of head from T5
-        t5_to_head_tf = compute_fk(robot, "link_head_1", "link_torso_5")
+        # Get relative coordinate system of the camera mount from T5.
+        t5_to_head_tf = compute_fk(robot, "link_head_2", "link_torso_5")
         
         print("\n=== Current Pose (t5_to_head_tf) ===")
         print(t5_to_head_tf)

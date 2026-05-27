@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 from http.server import ThreadingHTTPServer
+import math
 import subprocess
 import sys
 import threading
@@ -11,7 +12,11 @@ from urllib import request as urllib_request
 import numpy as np
 
 from visual_servoing.point_pose.sam3_phone_segmenter import MaskSelection
-from visual_servoing.visual_servo_core import POSITION_ONLY_ORIENTATION_POLICY, make_transform_from_xyz_rpy
+from visual_servoing.visual_servo_core import (
+    DEFAULT_RIGHT_ARM_EE_LINK,
+    POSITION_ONLY_ORIENTATION_POLICY,
+    make_transform_from_xyz_rpy,
+)
 from visual_servoing.visual_servo_protocol import (
     REQUEST_CONTENT_TYPE,
     decode_visual_servo_request,
@@ -87,7 +92,7 @@ def test_server_handles_one_valid_request_without_robot_sdk():
     assert "servo" not in payload["action"]
 
 
-def test_server_returns_t5_position_only_action_with_current_rotation_preserved():
+def test_server_returns_t5_position_action_with_fixed_zero_rpy():
     current = make_transform_from_xyz_rpy([0.0, 0.0, 0.0, 0.0, 0.0, 45.0])
     metadata = {
         "ee_link": "link_right_arm_6",
@@ -105,14 +110,14 @@ def test_server_returns_t5_position_only_action_with_current_rotation_preserved(
     assert payload["target_offset_t5_m"] == [0.1, -0.2, 0.3]
     assert payload["action"]["orientation_policy"] == POSITION_ONLY_ORIENTATION_POLICY
     target = np.asarray(payload["action"]["target_t5_T_ee"], dtype=np.float64)
-    np.testing.assert_allclose(target[:3, :3], current[:3, :3], atol=1e-12)
+    np.testing.assert_allclose(target[:3, :3], np.eye(3), atol=1e-12)
     object_centroid = np.asarray(payload["observation"]["t5_T_object"], dtype=np.float64)[:3, 3]
     np.testing.assert_allclose(
         payload["servo_step"]["desired_position_t5_m"],
         object_centroid + np.array([0.1, -0.2, 0.3]),
         atol=1e-12,
     )
-    assert payload["servo_step"]["wrist_step_rad"] == 0.0
+    assert math.isclose(payload["servo_step"]["wrist_step_rad"], math.radians(45.0), abs_tol=1e-12)
 
 
 def test_server_omits_mask_preview_by_default():
@@ -121,6 +126,14 @@ def test_server_omits_mask_preview_by_default():
 
     assert payload["ok"] is True
     assert "preview" not in payload["mask"]
+
+
+def test_server_defaults_to_tool_tcp_link_when_metadata_omits_ee_link():
+    request = decode_visual_servo_request(_request_body_with_metadata({"max_translation_step_m": 0.02}))
+    payload = VisualServoService(segmenter_factory=FakeSegmenter).handle(request)
+
+    assert payload["ok"] is True
+    assert payload["action"]["ee_link"] == DEFAULT_RIGHT_ARM_EE_LINK
 
 
 def test_server_returns_optional_packbits_mask_preview():

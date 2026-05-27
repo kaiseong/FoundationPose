@@ -14,6 +14,7 @@ import numpy as np
 
 from visual_servoing.point_pose.sam3_phone_segmenter import Sam3PhoneSegmenter
 from visual_servoing.visual_servo_core import (
+    DEFAULT_RIGHT_ARM_EE_LINK,
     POSITION_ONLY_ORIENTATION_POLICY,
     REMOTE_ACTION_CONTROL_MODE,
     REMOTE_OFFSET_FRAME,
@@ -72,7 +73,7 @@ class VisualServoService:
         timing_ms: dict[str, float] = {}
         try:
             metadata = request.metadata
-            ee_link = str(metadata.get("ee_link", "link_right_arm_6"))
+            ee_link = str(metadata.get("ee_link", DEFAULT_RIGHT_ARM_EE_LINK))
             if ee_link not in RIGHT_ARM_EE_LINKS:
                 allowed = ", ".join(sorted(RIGHT_ARM_EE_LINKS))
                 raise ValueError(f"ee_link {ee_link!r} is not an allowed right-arm EE link; allowed: {allowed}")
