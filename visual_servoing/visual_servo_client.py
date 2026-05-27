@@ -47,10 +47,7 @@ if _ADDED_PACKAGE_PARENT is not None:
 
 DEFAULT_T5_HEAD_XYZ_RPY = (0.0, 0.0, 0.0, 0.0, 45.0, 0.0)
 REALSENSE_HEAD_TO_CAMERA_XYZ_RPY = (0.047, 0.009, 0.057, -90.0, 0.0, -90.0)
-# Same bracket origin as the D435 baseline, but the live ZED observations show
-# image x/y directions inverted. Keep optical depth forward and rotate 180 deg
-# around that optical axis.
-ZED_HEAD_TO_CAMERA_XYZ_RPY = (0.047, 0.009, 0.057, 90.0, 0.0, 90.0)
+ZED_HEAD_TO_CAMERA_XYZ_RPY = REALSENSE_HEAD_TO_CAMERA_XYZ_RPY
 HEAD_TO_CAMERA_XYZ_RPY = REALSENSE_HEAD_TO_CAMERA_XYZ_RPY
 CAMERA_POSE_PRESETS = {
     "realsense": REALSENSE_HEAD_TO_CAMERA_XYZ_RPY,
