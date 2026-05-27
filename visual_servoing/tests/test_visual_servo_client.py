@@ -1190,6 +1190,12 @@ def test_default_output_is_concise_timing_summary():
         },
         "servo_step": {
             "desired_position_t5_m": [0.767559344, -0.111039346, 0.171243989],
+            "current_t5_T_ee": [
+                [1.0, 0.0, 0.0, 0.396052219],
+                [0.0, 1.0, 0.0, -0.253822572],
+                [0.0, 0.0, 1.0, -0.329319159],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
             "target_t5_T_ee": [
                 [1.0, 0.0, 0.0, 0.413480065],
                 [0.0, 1.0, 0.0, -0.247124440],
@@ -1206,7 +1212,9 @@ def test_default_output_is_concise_timing_summary():
     assert "encode_ms=6.8" in summary
     assert "cam_xyz_m=(0.120,0.086,0.699)" in summary
     assert "target_t5_xyz_m=(0.768,-0.111,0.171)" in summary
+    assert "current_t5_xyz_m=(0.396,-0.254,-0.329)" in summary
     assert "ee_cmd_t5_xyz_m=(0.413,-0.247,-0.306)" in summary
+    assert "cmd_delta_t5_m=(0.017,0.007,0.023)" in summary
     assert "command=skip" in summary
     assert "No usable object mask" in summary
     assert not summary.startswith("{")

@@ -893,9 +893,15 @@ def format_iteration_coordinate_parts(result: dict[str, Any]) -> list[str]:
         desired_position = vector3_from_value(servo_step.get("desired_position_t5_m"))
         if desired_position is not None:
             parts.append(f"target_t5_xyz_m={format_xyz_m(desired_position)}")
+        current_t5_T_ee = matrix_translation_from_value(servo_step.get("current_t5_T_ee"))
+        if current_t5_T_ee is not None:
+            parts.append(f"current_t5_xyz_m={format_xyz_m(current_t5_T_ee)}")
         target_t5_T_ee = matrix_translation_from_value(servo_step.get("target_t5_T_ee"))
         if target_t5_T_ee is not None:
             parts.append(f"ee_cmd_t5_xyz_m={format_xyz_m(target_t5_T_ee)}")
+        if current_t5_T_ee is not None and target_t5_T_ee is not None:
+            cmd_delta = tuple(target - current for target, current in zip(target_t5_T_ee, current_t5_T_ee))
+            parts.append(f"cmd_delta_t5_m={format_xyz_m(cmd_delta)}")
     elif isinstance(observation, dict):
         object_t5 = matrix_translation_from_value(observation.get("t5_T_object"))
         if object_t5 is not None:
