@@ -170,6 +170,8 @@ def _remote_args(*, execute: bool = True):
     argv = ["--live", "--remote-server", "127.0.0.1:8080"]
     if execute:
         argv += ["--execute", "--address", "127.0.0.1:50051"]
+    else:
+        argv += ["--no-execute"]
     args = parse_args(argv)
     args.max_translation_step_m = 0.02
     args.max_wrist_step_deg = 5.0
@@ -781,10 +783,27 @@ def test_validate_execute_rejects_non_right_arm_ee_link():
 def test_validate_execute_defaults_to_m_model_and_all_power_servo():
     args = parse_args(["--live", "--execute", "--address", "127.0.0.1:50051"])
 
+    assert args.execute is True
+    assert args.width == 1280
+    assert args.height == 720
+    assert args.fps == 15
+    assert args.max_iterations == 0
+    assert args.max_translation_step_m == 0.06
+    assert args.remote_timeout_s == 2.0
+    assert args.stale_action_max_age_s == 1.0
+    assert args.target_offset_t5 == (0.0, 0.0, 0.0)
     assert args.model == "m"
     assert args.ee_link == DEFAULT_RIGHT_ARM_EE_LINK
     assert args.power == ".*"
     assert args.servo == ".*"
+    assert args.move_to_ready_on_connect is True
+    validate_args(args)
+
+
+def test_no_execute_and_no_ready_flags_disable_robot_defaults():
+    args = parse_args(["--live", "--no-execute", "--no-move-to-ready-on-connect"])
+
+    assert args.execute is False
     assert args.move_to_ready_on_connect is False
     validate_args(args)
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Baseline point-cloud visual servo client.
 
-The default path is intentionally dry-run only. Real robot motion is enabled
-only when --execute is provided.
+Robot motion is guarded by execute safety checks and requires --address. Use
+--no-execute for dry-run operation.
 """
 
 from __future__ import annotations
@@ -91,8 +91,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     parser.add_argument("--camera", choices=SUPPORTED_LIVE_CAMERA_MODELS, default=None)
     parser.add_argument("--serial", default=None)
-    parser.add_argument("--width", type=int, default=None)
-    parser.add_argument("--height", type=int, default=None)
+    parser.add_argument("--width", type=int, default=1280)
+    parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--frame-timeout-ms", type=int, default=5000)
     parser.add_argument("--prompt", default="object", help="SAM3 prompt for live segmentation.")
@@ -108,7 +108,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Send one synthetic RGB-D request to --remote-server without a camera or robot.",
     )
 
-    parser.add_argument("--max-iterations", type=int, default=1, help="0 means run until interrupted.")
+    parser.add_argument("--max-iterations", type=int, default=0, help="0 means run until interrupted.")
     parser.add_argument("--loop-sleep-s", type=float, default=0.0)
     parser.add_argument(
         "--stop-on-converged",
@@ -189,14 +189,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_CAMERA_MOUNT_LINK,
         help="Robot link the camera bracket is mounted to. Execute mode uses live FK from this link to T5.",
     )
-    parser.add_argument("--max-translation-step-m", type=float, default=0.01)
+    parser.add_argument("--max-translation-step-m", type=float, default=0.06)
     parser.add_argument("--max-wrist-step-deg", type=float, default=5.0)
     parser.add_argument("--position-tolerance-m", type=float, default=0.005)
     parser.add_argument("--wrist-tolerance-deg", type=float, default=2.0)
     parser.add_argument("--ee-align-axis", default="y", choices=["x", "y", "z", "-x", "-y", "-z"])
     parser.add_argument("--wrist-axis", default="z", choices=["x", "y", "z", "-x", "-y", "-z"])
 
-    parser.add_argument("--execute", action="store_true", help="Allow real robot right-arm Cartesian commands.")
+    parser.add_argument(
+        "--execute",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow real robot right-arm Cartesian commands. Use --no-execute for dry-run.",
+    )
     parser.add_argument("--address", help="Robot address; required with --execute.")
     parser.add_argument("--model", default=ROBOT_MODEL, help="Robot model. Execute mode is fixed to m.")
     parser.add_argument("--power", default=".*", help="Power-on component pattern. Defaults to all components.")
@@ -210,7 +215,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--control-ready-timeout-ms", type=int, default=1000)
     parser.add_argument(
         "--move-to-ready-on-connect",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Move only the right arm to a Cartesian-ready bent pose before visual servo commands.",
     )
     parser.add_argument("--ready-min-time-s", type=float, default=3.0)
