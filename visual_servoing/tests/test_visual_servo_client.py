@@ -220,31 +220,31 @@ def test_validate_execute_rejects_non_right_arm_ee_link():
         validate_args(args)
 
 
-def test_validate_execute_rejects_broad_power_servo():
-    args = parse_args(["--live", "--execute", "--address", "127.0.0.1:50051", "--power", ".*"])
+def test_validate_execute_defaults_to_m_model_and_all_power_servo():
+    args = parse_args(["--live", "--execute", "--address", "127.0.0.1:50051"])
 
-    with pytest.raises(SystemExit, match="--power must use a strict right-arm-only pattern"):
+    assert args.model == "m"
+    assert args.power == ".*"
+    assert args.servo == ".*"
+    validate_args(args)
+
+
+def test_validate_execute_rejects_non_m_model():
+    args = parse_args(["--live", "--execute", "--address", "127.0.0.1:50051", "--model", "a"])
+
+    with pytest.raises(SystemExit, match="--model 'm'"):
         validate_args(args)
 
 
-def test_validate_execute_rejects_loose_right_power_pattern():
-    args = parse_args(["--live", "--execute", "--address", "127.0.0.1:50051", "--power", "right.*"])
+def test_validate_execute_rejects_empty_power_or_servo_pattern():
+    args = parse_args(["--live", "--execute", "--address", "127.0.0.1:50051", "--power", ""])
 
-    with pytest.raises(SystemExit, match="--power must use a strict right-arm-only pattern"):
+    with pytest.raises(SystemExit, match="--power cannot be empty"):
         validate_args(args)
 
+    args = parse_args(["--live", "--execute", "--address", "127.0.0.1:50051", "--servo", ""])
 
-def test_validate_execute_rejects_bright_substring_power_pattern():
-    args = parse_args(["--live", "--execute", "--address", "127.0.0.1:50051", "--power", "bright_component"])
-
-    with pytest.raises(SystemExit, match="--power must use a strict right-arm-only pattern"):
-        validate_args(args)
-
-
-def test_validate_execute_rejects_loose_right_servo_pattern():
-    args = parse_args(["--live", "--execute", "--address", "127.0.0.1:50051", "--servo", "right.*"])
-
-    with pytest.raises(SystemExit, match="--servo must use a strict right-arm-only pattern"):
+    with pytest.raises(SystemExit, match="--servo cannot be empty"):
         validate_args(args)
 
 
@@ -264,7 +264,7 @@ def test_validate_execute_rejects_non_t5_root_link():
         validate_args(args)
 
 
-def test_validate_execute_accepts_right_arm_safe_defaults():
+def test_validate_execute_accepts_robot_safe_defaults():
     args = parse_args(["--live", "--execute", "--address", "127.0.0.1:50051"])
 
     validate_args(args)

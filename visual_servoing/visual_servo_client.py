@@ -49,7 +49,7 @@ RIGHT_ARM_CONTROL_ROOT_LINK = servo_core.RIGHT_ARM_CONTROL_ROOT_LINK
 RIGHT_ARM_EE_LINKS = servo_core.RIGHT_ARM_EE_LINKS
 REMOTE_OFFSET_FRAME = servo_core.REMOTE_OFFSET_FRAME
 POSITION_ONLY_ORIENTATION_POLICY = servo_core.POSITION_ONLY_ORIENTATION_POLICY
-RIGHT_ARM_POWER_SERVO_PATTERNS = frozenset({"right_arm.*", "^right_arm.*$"})
+ROBOT_MODEL = "m"
 
 ServoLimits = servo_core.ServoLimits
 VisualObservation = servo_core.VisualObservation
@@ -165,9 +165,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     parser.add_argument("--execute", action="store_true", help="Allow real robot right-arm Cartesian commands.")
     parser.add_argument("--address", help="Robot address; required with --execute.")
-    parser.add_argument("--model", default="a", help="Robot model.")
-    parser.add_argument("--power", default="right_arm.*")
-    parser.add_argument("--servo", default="right_arm.*")
+    parser.add_argument("--model", default=ROBOT_MODEL, help="Robot model. Execute mode is fixed to m.")
+    parser.add_argument("--power", default=".*", help="Power-on component pattern. Defaults to all components.")
+    parser.add_argument("--servo", default=".*", help="Servo-on component pattern. Defaults to all components.")
     parser.add_argument("--control-root-link", default=RIGHT_ARM_CONTROL_ROOT_LINK)
     parser.add_argument("--ee-link", default="link_right_arm_6")
     parser.add_argument("--command-min-time-s", type=float, default=0.25)
@@ -221,21 +221,18 @@ def validate_execute_safety(args: argparse.Namespace) -> None:
             f"--execute is restricted to --control-root-link {RIGHT_ARM_CONTROL_ROOT_LINK!r}; "
             "torso/head/base frames are out of scope for this baseline"
         )
+    if args.model != ROBOT_MODEL:
+        raise SystemExit(f"--execute is fixed to --model {ROBOT_MODEL!r}")
     if args.ee_link not in RIGHT_ARM_EE_LINKS:
         allowed = ", ".join(sorted(RIGHT_ARM_EE_LINKS))
         raise SystemExit(f"--execute is restricted to right-arm EE links: {allowed}")
-    validate_right_arm_regex("--power", args.power)
-    validate_right_arm_regex("--servo", args.servo)
+    validate_component_pattern("--power", args.power)
+    validate_component_pattern("--servo", args.servo)
 
 
-def validate_right_arm_regex(flag: str, value: str) -> None:
-    normalized = str(value).strip().lower()
-    if normalized not in RIGHT_ARM_POWER_SERVO_PATTERNS:
-        allowed = ", ".join(sorted(RIGHT_ARM_POWER_SERVO_PATTERNS))
-        raise SystemExit(
-            f"{flag} must use a strict right-arm-only pattern when --execute is used; "
-            f"got {value!r}; allowed: {allowed}"
-        )
+def validate_component_pattern(flag: str, value: str) -> None:
+    if not str(value).strip():
+        raise SystemExit(f"{flag} cannot be empty")
 
 
 def is_live_mode(args: argparse.Namespace) -> bool:
