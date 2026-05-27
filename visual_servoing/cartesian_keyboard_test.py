@@ -37,7 +37,7 @@ if _ADDED_PACKAGE_PARENT is not None:
 
 
 AXIS_CHOICES = ("x", "y", "z", "-x", "-y", "-z")
-KEY_PRESET_CHOICES = ("custom", "robot-minus-x-left-y-up-z")
+KEY_PRESET_CHOICES = ("custom", "robot-plus-x-left-y-up-z", "robot-minus-x-left-y-up-z")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -68,8 +68,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=KEY_PRESET_CHOICES,
         default="custom",
         help=(
-            "Keyboard mapping preset. robot-minus-x-left-y-up-z maps Left/Right to +/-y, "
-            "Up/Down to +/-z, and f/b to -/+x."
+            "Keyboard mapping preset. robot-plus-x-left-y-up-z maps Left/Right to +/-y, "
+            "Up/Down to +/-z, and f/b to +/-x. robot-minus-x-left-y-up-z is the legacy "
+            "inverted-x preset."
         ),
     )
     parser.add_argument(
@@ -179,8 +180,10 @@ def make_key_map(
     horizontal_delta: np.ndarray,
     vertical_delta: np.ndarray,
 ) -> dict[int, np.ndarray]:
-    if args.key_preset == "robot-minus-x-left-y-up-z":
-        robot_toward = axis_delta("-x", args.step_m)
+    if args.key_preset in {"robot-plus-x-left-y-up-z", "robot-minus-x-left-y-up-z"}:
+        robot_toward = axis_delta("x", args.step_m)
+        if args.key_preset == "robot-minus-x-left-y-up-z":
+            robot_toward = -robot_toward
         robot_left = axis_delta("y", args.step_m)
         up = axis_delta("z", args.step_m)
         return {
@@ -238,8 +241,10 @@ def draw_screen(
 
 
 def key_help(args: argparse.Namespace) -> str:
+    if args.key_preset == "robot-plus-x-left-y-up-z":
+        return "Left:+y robot-left  Right:-y  Up:+z  Down:-z  f/PgDn:+x robot-forward  b/PgUp:-x"
     if args.key_preset == "robot-minus-x-left-y-up-z":
-        return "Left:+y robot-left  Right:-y  Up:+z  Down:-z  f/PgDn:-x robot-toward  b/PgUp:+x"
+        return "Legacy inverted-x: Left:+y  Right:-y  Up:+z  Down:-z  f/PgDn:-x  b/PgUp:+x"
     return f"Left/Right: -/+ {args.horizontal_axis}    Up/Down: +/- {args.vertical_axis}"
 
 
