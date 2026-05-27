@@ -21,7 +21,11 @@ DEFAULT_RIGHT_ARM_EE_LINK = "ee_right"
 RIGHT_ARM_EE_LINKS = frozenset({"link_right_arm_6", DEFAULT_RIGHT_ARM_EE_LINK})
 REMOTE_ACTION_CONTROL_MODE = "right_arm_cartesian"
 REMOTE_OFFSET_FRAME = RIGHT_ARM_CONTROL_ROOT_LINK
-POSITION_ONLY_ORIENTATION_POLICY = "preserve_reference_ee_rotation"
+POSITION_ONLY_ORIENTATION_POLICY = "preserve_current_ee_rotation"
+LEGACY_POSITION_ONLY_ORIENTATION_POLICY = "preserve_reference_ee_rotation"
+POSITION_ONLY_ORIENTATION_POLICIES = frozenset(
+    {POSITION_ONLY_ORIENTATION_POLICY, LEGACY_POSITION_ONLY_ORIENTATION_POLICY}
+)
 EXECUTABLE_REMOTE_STATUS = "tracking"
 NO_COMMAND_REMOTE_STATUSES = frozenset({"converged", "skipped", "error"})
 
@@ -301,14 +305,14 @@ def validate_remote_action(
         return RemoteActionValidation(False, False, "remote action translation step exceeds limit")
 
     orientation_policy = str(action.get("orientation_policy", ""))
-    if orientation_policy == POSITION_ONLY_ORIENTATION_POLICY:
+    if orientation_policy in POSITION_ONLY_ORIENTATION_POLICIES:
         expected_rotation = (
             current[:3, :3]
             if target_t5_R_ee is None
             else require_rotation_matrix(target_t5_R_ee, "target_t5_R_ee", tolerance=rotation_tolerance)
         )
         if not np.allclose(target[:3, :3], expected_rotation, atol=rotation_tolerance):
-            return RemoteActionValidation(False, False, "remote action target rotation does not match reference EE rotation")
+            return RemoteActionValidation(False, False, "remote action target rotation does not match expected EE rotation")
     else:
         rotation_delta = rotation_angle(current[:3, :3].T @ target[:3, :3])
         if rotation_delta > float(max_wrist_step_rad) + 1e-9:

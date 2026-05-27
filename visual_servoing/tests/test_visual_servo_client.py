@@ -45,13 +45,14 @@ from visual_servoing.visual_servo_protocol import decode_visual_servo_request
 
 
 class FakeRobotContext:
-    def __init__(self, *, execute: bool = True):
+    def __init__(self, *, execute: bool = True, current_pose: np.ndarray | None = None):
         self.execute = execute
+        self._current_pose = np.eye(4) if current_pose is None else np.asarray(current_pose, dtype=np.float64).copy()
         self.sent_targets: list[np.ndarray] = []
         self.cancel_reasons: list[str] = []
 
     def current_ee_pose(self):
-        return np.eye(4)
+        return self._current_pose.copy()
 
     def send_right_arm_cartesian(self, target_t5_T_ee):
         self.sent_targets.append(np.asarray(target_t5_T_ee, dtype=np.float64).copy())
@@ -938,7 +939,7 @@ def test_remote_target_offset_t5_metadata_is_explicit_t5_frame():
 
     assert metadata["target_offset_t5_m"] == [0.1, -0.2, 0.3]
     assert metadata["offset_frame"] == "link_torso_5"
-    assert metadata["orientation_policy"] == "preserve_reference_ee_rotation"
+    assert metadata["orientation_policy"] == "preserve_current_ee_rotation"
     assert metadata["servo_dofs"] == "xyz_position_only"
     assert metadata["camera_pose_preset"] == "realsense"
     assert metadata["head_camera_pose"] == list(REALSENSE_HEAD_TO_CAMERA_XYZ_RPY)
@@ -1000,7 +1001,7 @@ def test_remote_iteration_executes_only_valid_tracking_action(monkeypatch):
         np.testing.assert_allclose(request.object_T_offset, np.eye(4), atol=1e-12)
         assert request.metadata["target_offset_t5_m"] == [0.1, -0.2, 0.3]
         assert request.metadata["offset_frame"] == "link_torso_5"
-        assert request.metadata["orientation_policy"] == "preserve_reference_ee_rotation"
+        assert request.metadata["orientation_policy"] == "preserve_current_ee_rotation"
         np.testing.assert_allclose(request.metadata["target_t5_R_ee"], np.eye(3), atol=1e-12)
         return _tracking_response(body, target=target)
 
@@ -1015,20 +1016,20 @@ def test_remote_iteration_executes_only_valid_tracking_action(monkeypatch):
     np.testing.assert_allclose(next_pose, target)
 
 
-def test_remote_iteration_accepts_locked_reference_rotation(monkeypatch):
+def test_remote_iteration_preserves_current_rotation_for_legacy_server_response(monkeypatch):
     args = _remote_args(execute=True)
-    robot_context = FakeRobotContext(execute=True)
     rgb, depth_m, intrinsics = synthetic_rgbd_fixture()
-    reference = make_transform_from_xyz_rpy([0.0, 0.0, 0.0, 0.0, 0.0, 45.0])
+    current = make_transform_from_xyz_rpy([0.0, 0.0, 0.0, 0.0, 0.0, 45.0])
+    robot_context = FakeRobotContext(execute=True, current_pose=current)
     target_from_legacy_server = np.eye(4)
     target_from_legacy_server[:3, 3] = [0.01, 0.0, 0.0]
-    expected_target = reference.copy()
+    expected_target = current.copy()
     expected_target[:3, 3] = target_from_legacy_server[:3, 3]
 
     def fake_send(server, body, *, timeout_s):
         del server, timeout_s
         request = decode_visual_servo_request(body)
-        np.testing.assert_allclose(request.metadata["target_t5_R_ee"], reference[:3, :3], atol=1e-12)
+        np.testing.assert_allclose(request.metadata["target_t5_R_ee"], current[:3, :3], atol=1e-12)
         return _tracking_response(
             body,
             target=target_from_legacy_server,
@@ -1046,7 +1047,6 @@ def test_remote_iteration_accepts_locked_reference_rotation(monkeypatch):
         intrinsics=intrinsics,
         t5_T_camera=np.eye(4),
         current_t5_T_ee=np.eye(4),
-        reference_t5_R_ee=reference[:3, :3],
         robot_context=robot_context,
         frame_index=2,
     )

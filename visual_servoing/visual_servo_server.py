@@ -16,6 +16,7 @@ import numpy as np
 from visual_servoing.point_pose.sam3_phone_segmenter import Sam3PhoneSegmenter
 from visual_servoing.visual_servo_core import (
     DEFAULT_RIGHT_ARM_EE_LINK,
+    LEGACY_POSITION_ONLY_ORIENTATION_POLICY,
     POSITION_ONLY_ORIENTATION_POLICY,
     REMOTE_ACTION_CONTROL_MODE,
     REMOTE_OFFSET_FRAME,
@@ -115,10 +116,13 @@ class VisualServoService:
                 metadata.get("target_offset_t5_m", metadata.get("target_offset_t5", [0.0, 0.0, 0.0])),
                 "target_offset_t5",
             )
-            target_t5_R_ee = require_rotation_matrix(
-                metadata.get("target_t5_R_ee", request.current_t5_T_ee[:3, :3]),
-                "target_t5_R_ee",
+            orientation_policy = str(metadata.get("orientation_policy", POSITION_ONLY_ORIENTATION_POLICY))
+            target_t5_R_ee_value = (
+                metadata.get("target_t5_R_ee", request.current_t5_T_ee[:3, :3])
+                if orientation_policy == LEGACY_POSITION_ONLY_ORIENTATION_POLICY
+                else request.current_t5_T_ee[:3, :3]
             )
+            target_t5_R_ee = require_rotation_matrix(target_t5_R_ee_value, "target_t5_R_ee")
             step = plan_t5_position_servo_action(
                 current_t5_T_ee=request.current_t5_T_ee,
                 object_centroid_t5=observation.t5_T_object[:3, 3],

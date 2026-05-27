@@ -61,7 +61,7 @@ def test_plan_visual_servo_action_applies_object_offset_not_current_ee_frame():
     np.testing.assert_allclose(step.desired_position_t5_m, [1.0, 1.1, 0.0], atol=1e-12)
 
 
-def test_plan_t5_position_servo_action_uses_t5_offset_and_reference_rotation():
+def test_plan_t5_position_servo_action_uses_t5_offset_and_target_rotation():
     current = make_transform_from_xyz_rpy([0.0, 0.0, 0.0, 0.0, 0.0, 90.0])
     reference = make_transform_from_xyz_rpy([0.0, 0.0, 0.0, 0.0, 0.0, 30.0])
 
@@ -74,7 +74,7 @@ def test_plan_t5_position_servo_action_uses_t5_offset_and_reference_rotation():
     )
 
     assert REMOTE_OFFSET_FRAME == RIGHT_ARM_CONTROL_ROOT_LINK
-    assert POSITION_ONLY_ORIENTATION_POLICY == "preserve_reference_ee_rotation"
+    assert POSITION_ONLY_ORIENTATION_POLICY == "preserve_current_ee_rotation"
     np.testing.assert_allclose(step.desired_position_t5_m, [1.1, 0.8, 0.3], atol=1e-12)
     np.testing.assert_allclose(step.target_t5_T_ee[:3, 3], [1.1, 0.8, 0.3], atol=1e-12)
     np.testing.assert_allclose(step.target_t5_T_ee[:3, :3], reference[:3, :3], atol=1e-12)
@@ -272,7 +272,7 @@ def test_validate_remote_action_rejects_oversized_wrist_step():
     assert "wrist" in validation.reason
 
 
-def test_validate_remote_action_accepts_reference_rotation_policy_without_wrist_step_limit():
+def test_validate_remote_action_accepts_current_rotation_policy_without_wrist_step_limit():
     current = make_transform_from_xyz_rpy([0.0, 0.0, 0.0, 0.0, 0.0, 90.0])
     reference = make_transform_from_xyz_rpy([0.0, 0.0, 0.0, 0.0, 0.0, 30.0])
     target = reference.copy()
@@ -296,7 +296,7 @@ def test_validate_remote_action_accepts_reference_rotation_policy_without_wrist_
     np.testing.assert_allclose(validation.target_t5_T_ee[:3, :3], reference[:3, :3], atol=1e-12)
 
 
-def test_validate_remote_action_rejects_reference_rotation_policy_with_mismatched_rotation():
+def test_validate_remote_action_rejects_current_rotation_policy_with_mismatched_rotation():
     response = _response(make_transform_from_xyz_rpy([0.0, 0.0, 0.0, 0.0, 0.0, 10.0]))
     response["action"]["orientation_policy"] = POSITION_ONLY_ORIENTATION_POLICY
     reference = np.eye(3)
@@ -314,7 +314,7 @@ def test_validate_remote_action_rejects_reference_rotation_policy_with_mismatche
     )
 
     assert validation.ok is False
-    assert "reference EE rotation" in validation.reason
+    assert "expected EE rotation" in validation.reason
 
 
 def test_validate_remote_action_rejects_non_finite_target():
