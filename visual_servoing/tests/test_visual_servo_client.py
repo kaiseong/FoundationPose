@@ -1152,6 +1152,18 @@ def test_default_output_is_concise_timing_summary():
             "round_trip_ms": 172.149,
             "request_encode_ms": 6.845,
         },
+        "observation": {
+            "centroid_camera_m": [0.120039346, 0.085829463, 0.698559344],
+        },
+        "servo_step": {
+            "desired_position_t5_m": [0.767559344, -0.111039346, 0.171243989],
+            "target_t5_T_ee": [
+                [1.0, 0.0, 0.0, 0.413480065],
+                [0.0, 1.0, 0.0, -0.247124440],
+                [0.0, 0.0, 1.0, -0.305837140],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        },
     }
 
     summary = format_iteration_summary(result, frame_start)
@@ -1159,6 +1171,9 @@ def test_default_output_is_concise_timing_summary():
     assert summary.startswith("frame=205 status=skipped ok=false")
     assert "action_latency_ms=172.1" in summary
     assert "encode_ms=6.8" in summary
+    assert "cam_xyz_m=(0.120,0.086,0.699)" in summary
+    assert "target_t5_xyz_m=(0.768,-0.111,0.171)" in summary
+    assert "ee_cmd_t5_xyz_m=(0.413,-0.247,-0.306)" in summary
     assert "command=skip" in summary
     assert "No usable object mask" in summary
     assert not summary.startswith("{")

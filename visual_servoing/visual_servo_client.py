@@ -838,11 +838,64 @@ def format_iteration_summary(result: dict[str, Any], frame_start: float) -> str:
             parts.append(f"encode_ms={float(request_encode_ms):.1f}")
     else:
         parts.append(f"loop_ms={elapsed_ms:.1f}")
+    parts.extend(format_iteration_coordinate_parts(result))
     parts.append(f"command={command}")
     reason = str(result.get("reason", "")).strip()
     if reason:
         parts.append(f"reason={reason}")
     return " ".join(parts)
+
+
+def format_iteration_coordinate_parts(result: dict[str, Any]) -> list[str]:
+    parts: list[str] = []
+    observation = result.get("observation")
+    if isinstance(observation, dict):
+        centroid_camera = vector3_from_value(observation.get("centroid_camera_m"))
+        if centroid_camera is not None:
+            parts.append(f"cam_xyz_m={format_xyz_m(centroid_camera)}")
+
+    servo_step = result.get("servo_step")
+    if isinstance(servo_step, dict):
+        desired_position = vector3_from_value(servo_step.get("desired_position_t5_m"))
+        if desired_position is not None:
+            parts.append(f"target_t5_xyz_m={format_xyz_m(desired_position)}")
+        target_t5_T_ee = matrix_translation_from_value(servo_step.get("target_t5_T_ee"))
+        if target_t5_T_ee is not None:
+            parts.append(f"ee_cmd_t5_xyz_m={format_xyz_m(target_t5_T_ee)}")
+    elif isinstance(observation, dict):
+        object_t5 = matrix_translation_from_value(observation.get("t5_T_object"))
+        if object_t5 is not None:
+            parts.append(f"target_t5_xyz_m={format_xyz_m(object_t5)}")
+    return parts
+
+
+def vector3_from_value(value: Any) -> tuple[float, float, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) < 3:
+        return None
+    coords: list[float] = []
+    for item in value[:3]:
+        if not isinstance(item, (int, float)):
+            return None
+        coords.append(float(item))
+    return (coords[0], coords[1], coords[2])
+
+
+def matrix_translation_from_value(value: Any) -> tuple[float, float, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) < 3:
+        return None
+    translation: list[float] = []
+    for row in value[:3]:
+        if not isinstance(row, (list, tuple)) or len(row) < 4:
+            return None
+        item = row[3]
+        if not isinstance(item, (int, float)):
+            return None
+        translation.append(float(item))
+    return (translation[0], translation[1], translation[2])
+
+
+def format_xyz_m(coords: tuple[float, float, float]) -> str:
+    return f"({coords[0]:.3f},{coords[1]:.3f},{coords[2]:.3f})"
 
 
 def diagnostic_payload(
