@@ -764,7 +764,7 @@ class RobotContext:
                 rby.BodyComponentBasedCommandBuilder().set_right_arm_command(builder)
             )
         )
-        feedback = self.robot.send_command(command, float(self.args.command_timeout_s)).get()
+        feedback = self.robot.send_command(command).get()
         finish_code = getattr(feedback, "finish_code", None)
         return {"finish_code": str(finish_code)}
 

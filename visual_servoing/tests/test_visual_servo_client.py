@@ -41,6 +41,39 @@ class FakeRobotContext:
         return {"finish_code": "ok"}
 
 
+class FakeBuilder:
+    def __getattr__(self, name):
+        if name.startswith(("add_", "set_")):
+            return self._chain
+        raise AttributeError(name)
+
+    def _chain(self, *args, **kwargs):
+        del args, kwargs
+        return self
+
+
+class FakeCommandHandler:
+    def get(self):
+        return SimpleNamespace(finish_code="ok")
+
+
+class FakeCommandRobot:
+    def __init__(self):
+        self.send_args = None
+
+    def send_command(self, *args):
+        self.send_args = args
+        return FakeCommandHandler()
+
+
+class FakeRby:
+    CartesianImpedanceControlCommandBuilder = FakeBuilder
+    CommandHeaderBuilder = FakeBuilder
+    RobotCommandBuilder = FakeBuilder
+    ComponentBasedCommandBuilder = FakeBuilder
+    BodyComponentBasedCommandBuilder = FakeBuilder
+
+
 def _remote_args(*, execute: bool = True):
     argv = ["--live", "--remote-server", "127.0.0.1:8080"]
     if execute:
@@ -211,6 +244,18 @@ def test_dry_run_context_does_not_import_robot_sdk(monkeypatch):
     pose = RobotContext.dry_run(args).current_ee_pose()
 
     np.testing.assert_allclose(pose, np.eye(4))
+
+
+def test_send_right_arm_cartesian_uses_sdk_send_command_without_timeout_argument():
+    args = parse_args(["--live"])
+    robot = FakeCommandRobot()
+    context = RobotContext(args, robot=robot, rby=FakeRby)
+
+    feedback = context.send_right_arm_cartesian(np.eye(4))
+
+    assert feedback == {"finish_code": "ok"}
+    assert robot.send_args is not None
+    assert len(robot.send_args) == 1
 
 
 def test_validate_execute_rejects_non_right_arm_ee_link():
