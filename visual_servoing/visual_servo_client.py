@@ -405,6 +405,7 @@ def run_remote_live(args: argparse.Namespace) -> int:
     robot_context = RobotContext.connect(args) if args.execute else RobotContext.dry_run(args)
     try:
         current_t5_T_ee = robot_context.current_ee_pose()
+        reference_t5_R_ee = current_t5_T_ee[:3, :3].copy()
         with LiveCameraPreview(args) as preview, LiveRgbdCamera(
             model=camera_model,
             serial=args.serial,
@@ -425,6 +426,7 @@ def run_remote_live(args: argparse.Namespace) -> int:
                     intrinsics=frame.intrinsics,
                     t5_T_camera=t5_T_camera,
                     current_t5_T_ee=current_t5_T_ee,
+                    reference_t5_R_ee=reference_t5_R_ee,
                     robot_context=robot_context,
                     frame_index=frame_index,
                 )
@@ -444,6 +446,7 @@ def run_remote_fixture(args: argparse.Namespace) -> int:
     rgb, depth_m, intrinsics = synthetic_rgbd_fixture()
     robot_context = RobotContext.dry_run(args)
     current_t5_T_ee = robot_context.current_ee_pose()
+    reference_t5_R_ee = current_t5_T_ee[:3, :3].copy()
     t5_T_camera = fixed_t5_T_camera(args)
     for frame_index in iteration_range(args.max_iterations):
         frame_start = time.perf_counter()
@@ -454,6 +457,7 @@ def run_remote_fixture(args: argparse.Namespace) -> int:
             intrinsics=intrinsics,
             t5_T_camera=t5_T_camera,
             current_t5_T_ee=current_t5_T_ee,
+            reference_t5_R_ee=reference_t5_R_ee,
             robot_context=robot_context,
             frame_index=frame_index,
         )
@@ -473,13 +477,16 @@ def process_remote_servo_iteration(
     current_t5_T_ee: np.ndarray,
     robot_context: "RobotContext",
     frame_index: int,
+    reference_t5_R_ee: np.ndarray | None = None,
 ) -> tuple[dict[str, Any], np.ndarray]:
     if robot_context.execute:
         current_t5_T_ee = robot_context.current_ee_pose()
+    if reference_t5_R_ee is None:
+        reference_t5_R_ee = current_t5_T_ee[:3, :3].copy()
     request_id = f"{time.monotonic_ns()}-{frame_index}"
     object_T_offset = np.eye(4, dtype=np.float64)
     capture_monotonic_ns = time.monotonic_ns()
-    metadata = remote_request_metadata(args)
+    metadata = remote_request_metadata(args, target_t5_R_ee=reference_t5_R_ee)
     metadata["ee_link"] = args.ee_link
 
     encode_start = time.perf_counter()
@@ -499,6 +506,7 @@ def process_remote_servo_iteration(
     send_start = time.perf_counter()
     try:
         response = send_remote_visual_servo_request(args.remote_server, body, timeout_s=args.remote_timeout_s)
+        response = coerce_remote_target_rotation(response, reference_t5_R_ee)
         round_trip_s = time.perf_counter() - send_start
         validation = servo_core.validate_remote_action(
             response,
@@ -511,6 +519,7 @@ def process_remote_servo_iteration(
             max_wrist_step_rad=math.radians(args.max_wrist_step_deg),
             expected_root_link=args.control_root_link,
             allowed_ee_links=RIGHT_ARM_EE_LINKS,
+            target_t5_R_ee=reference_t5_R_ee,
         )
     except Exception as exc:
         response = {"ok": False, "status": "skipped", "request_id": request_id, "frame_index": frame_index, "reason": str(exc)}
@@ -562,6 +571,42 @@ def send_remote_visual_servo_request(server: str, body: bytes, *, timeout_s: flo
     return decode_visual_servo_response(data)
 
 
+def coerce_remote_target_rotation(response: dict[str, Any], reference_t5_R_ee: np.ndarray) -> dict[str, Any]:
+    action = response.get("action")
+    if not isinstance(action, dict) or "target_t5_T_ee" not in action:
+        return response
+    policy = str(action.get("orientation_policy", response.get("orientation_policy", "")))
+    if policy not in {POSITION_ONLY_ORIENTATION_POLICY, "fixed_t5_rpy_zero"}:
+        return response
+    try:
+        reference_rotation = servo_core.require_rotation_matrix(reference_t5_R_ee, "reference_t5_R_ee")
+        target_t5_T_ee = servo_core.require_rigid_transform(action["target_t5_T_ee"], "target_t5_T_ee")
+    except ValueError:
+        return response
+
+    corrected_target = target_t5_T_ee.copy()
+    corrected_target[:3, :3] = reference_rotation
+
+    corrected_action = dict(action)
+    corrected_action["target_t5_T_ee"] = matrix_list(corrected_target)
+    corrected_action["orientation_policy"] = POSITION_ONLY_ORIENTATION_POLICY
+    corrected_action["target_t5_R_ee"] = matrix_list(reference_rotation)
+
+    corrected_response = dict(response)
+    corrected_response["action"] = corrected_action
+    corrected_response["orientation_policy"] = POSITION_ONLY_ORIENTATION_POLICY
+    corrected_response["target_t5_R_ee"] = matrix_list(reference_rotation)
+
+    servo_step = response.get("servo_step")
+    if isinstance(servo_step, dict):
+        corrected_servo_step = dict(servo_step)
+        corrected_servo_step["target_t5_T_ee"] = matrix_list(corrected_target)
+        corrected_servo_step["orientation_policy"] = POSITION_ONLY_ORIENTATION_POLICY
+        corrected_servo_step["target_t5_R_ee"] = matrix_list(reference_rotation)
+        corrected_response["servo_step"] = corrected_servo_step
+    return corrected_response
+
+
 def normalize_remote_server_url(server: str) -> str:
     value = str(server).strip()
     if not value:
@@ -571,8 +616,8 @@ def normalize_remote_server_url(server: str) -> str:
     return value.rstrip("/") + "/visual-servo/action"
 
 
-def remote_request_metadata(args: argparse.Namespace) -> dict[str, Any]:
-    return {
+def remote_request_metadata(args: argparse.Namespace, *, target_t5_R_ee: np.ndarray | None = None) -> dict[str, Any]:
+    metadata = {
         "min_depth_m": float(args.min_depth_m),
         "max_depth_m": float(args.max_depth_m),
         "max_translation_step_m": float(args.max_translation_step_m),
@@ -592,6 +637,9 @@ def remote_request_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "camera_mount_link": args.camera_mount_link,
         "return_mask_preview": bool(args.show_mask_window and not args.no_window),
     }
+    if target_t5_R_ee is not None:
+        metadata["target_t5_R_ee"] = matrix_list(servo_core.require_rotation_matrix(target_t5_R_ee, "target_t5_R_ee"))
+    return metadata
 
 
 def remote_diagnostic_payload(
@@ -629,7 +677,7 @@ def remote_diagnostic_payload(
     for key in ("action", "observation", "servo_step", "mask"):
         if key in response:
             payload[key] = response[key]
-    for key in ("offset_frame", "orientation_policy", "target_offset_t5_m"):
+    for key in ("offset_frame", "orientation_policy", "target_offset_t5_m", "target_t5_R_ee"):
         if key in response:
             payload[key] = response[key]
     if command_feedback is not None:

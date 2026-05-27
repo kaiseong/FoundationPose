@@ -21,7 +21,7 @@ DEFAULT_RIGHT_ARM_EE_LINK = "ee_right"
 RIGHT_ARM_EE_LINKS = frozenset({"link_right_arm_6", DEFAULT_RIGHT_ARM_EE_LINK})
 REMOTE_ACTION_CONTROL_MODE = "right_arm_cartesian"
 REMOTE_OFFSET_FRAME = RIGHT_ARM_CONTROL_ROOT_LINK
-POSITION_ONLY_ORIENTATION_POLICY = "fixed_t5_rpy_zero"
+POSITION_ONLY_ORIENTATION_POLICY = "preserve_reference_ee_rotation"
 EXECUTABLE_REMOTE_STATUS = "tracking"
 NO_COMMAND_REMOTE_STATUSES = frozenset({"converged", "skipped", "error"})
 
@@ -112,10 +112,15 @@ def plan_t5_position_servo_action(
     object_centroid_t5: np.ndarray,
     target_offset_t5: np.ndarray,
     limits: ServoLimits,
+    target_t5_R_ee: np.ndarray | None = None,
 ) -> ServoStep:
     current_t5_T_ee = require_transform(current_t5_T_ee, "current_t5_T_ee")
     object_centroid_t5 = require_vector3(object_centroid_t5, "object_centroid_t5")
     target_offset_t5 = require_vector3(target_offset_t5, "target_offset_t5")
+    if target_t5_R_ee is None:
+        target_rotation = current_t5_T_ee[:3, :3].copy()
+    else:
+        target_rotation = require_rotation_matrix(target_t5_R_ee, "target_t5_R_ee")
 
     desired_position_t5_m = object_centroid_t5 + target_offset_t5
     position_error_m = desired_position_t5_m - current_t5_T_ee[:3, 3]
@@ -124,7 +129,6 @@ def plan_t5_position_servo_action(
         max_step_m=limits.max_translation_step_m,
     )
 
-    target_rotation = np.eye(3, dtype=np.float64)
     target_t5_T_ee = np.eye(4, dtype=np.float64)
     target_t5_T_ee[:3, 3] = current_t5_T_ee[:3, 3] + translation_step_m
     target_t5_T_ee[:3, :3] = target_rotation
@@ -250,6 +254,7 @@ def validate_remote_action(
     max_wrist_step_rad: float,
     expected_root_link: str = RIGHT_ARM_CONTROL_ROOT_LINK,
     allowed_ee_links: frozenset[str] = RIGHT_ARM_EE_LINKS,
+    target_t5_R_ee: np.ndarray | None = None,
     rotation_tolerance: float = 1e-5,
 ) -> RemoteActionValidation:
     if not bool(response.get("ok", False)):
@@ -297,8 +302,13 @@ def validate_remote_action(
 
     orientation_policy = str(action.get("orientation_policy", ""))
     if orientation_policy == POSITION_ONLY_ORIENTATION_POLICY:
-        if not np.allclose(target[:3, :3], np.eye(3), atol=rotation_tolerance):
-            return RemoteActionValidation(False, False, "remote action fixed_t5_rpy_zero target is not identity rotation")
+        expected_rotation = (
+            current[:3, :3]
+            if target_t5_R_ee is None
+            else require_rotation_matrix(target_t5_R_ee, "target_t5_R_ee", tolerance=rotation_tolerance)
+        )
+        if not np.allclose(target[:3, :3], expected_rotation, atol=rotation_tolerance):
+            return RemoteActionValidation(False, False, "remote action target rotation does not match reference EE rotation")
     else:
         rotation_delta = rotation_angle(current[:3, :3].T @ target[:3, :3])
         if rotation_delta > float(max_wrist_step_rad) + 1e-9:
@@ -311,13 +321,22 @@ def require_rigid_transform(value: Any, name: str, *, tolerance: float = 1e-5) -
     transform = require_transform(value, name)
     if not np.allclose(transform[3, :], [0.0, 0.0, 0.0, 1.0], atol=tolerance):
         raise ValueError(f"{name} final row is not homogeneous")
-    rotation = transform[:3, :3]
+    require_rotation_matrix(transform[:3, :3], f"{name} rotation", tolerance=tolerance)
+    return transform
+
+
+def require_rotation_matrix(value: Any, name: str, *, tolerance: float = 1e-5) -> np.ndarray:
+    rotation = np.asarray(value, dtype=np.float64)
+    if rotation.shape != (3, 3):
+        raise ValueError(f"{name} must be 3x3, got {rotation.shape}")
+    if not np.all(np.isfinite(rotation)):
+        raise ValueError(f"{name} contains non-finite values")
     if not np.allclose(rotation.T @ rotation, np.eye(3), atol=tolerance):
-        raise ValueError(f"{name} rotation is not orthonormal")
+        raise ValueError(f"{name} is not orthonormal")
     det = float(np.linalg.det(rotation))
     if abs(det - 1.0) > tolerance:
-        raise ValueError(f"{name} rotation determinant is not +1")
-    return transform
+        raise ValueError(f"{name} determinant is not +1")
+    return rotation.copy()
 
 
 def require_transform(transform: Any, name: str) -> np.ndarray:

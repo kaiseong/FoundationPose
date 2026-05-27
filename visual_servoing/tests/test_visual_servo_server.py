@@ -92,12 +92,14 @@ def test_server_handles_one_valid_request_without_robot_sdk():
     assert "servo" not in payload["action"]
 
 
-def test_server_returns_t5_position_action_with_fixed_zero_rpy():
+def test_server_returns_t5_position_action_with_reference_rotation():
     current = make_transform_from_xyz_rpy([0.0, 0.0, 0.0, 0.0, 0.0, 45.0])
+    reference = make_transform_from_xyz_rpy([0.0, 0.0, 0.0, 0.0, 0.0, -30.0])
     metadata = {
         "ee_link": "link_right_arm_6",
         "max_translation_step_m": 2.0,
         "target_offset_t5_m": [0.1, -0.2, 0.3],
+        "target_t5_R_ee": reference[:3, :3].tolist(),
     }
     rgb = np.zeros((10, 10, 3), dtype=np.uint8)
     depth = np.full((10, 10), 0.5, dtype=np.float32)
@@ -108,16 +110,17 @@ def test_server_returns_t5_position_action_with_fixed_zero_rpy():
     assert payload["offset_frame"] == "link_torso_5"
     assert payload["orientation_policy"] == POSITION_ONLY_ORIENTATION_POLICY
     assert payload["target_offset_t5_m"] == [0.1, -0.2, 0.3]
+    np.testing.assert_allclose(payload["target_t5_R_ee"], reference[:3, :3], atol=1e-12)
     assert payload["action"]["orientation_policy"] == POSITION_ONLY_ORIENTATION_POLICY
     target = np.asarray(payload["action"]["target_t5_T_ee"], dtype=np.float64)
-    np.testing.assert_allclose(target[:3, :3], np.eye(3), atol=1e-12)
+    np.testing.assert_allclose(target[:3, :3], reference[:3, :3], atol=1e-12)
     object_centroid = np.asarray(payload["observation"]["t5_T_object"], dtype=np.float64)[:3, 3]
     np.testing.assert_allclose(
         payload["servo_step"]["desired_position_t5_m"],
         object_centroid + np.array([0.1, -0.2, 0.3]),
         atol=1e-12,
     )
-    assert math.isclose(payload["servo_step"]["wrist_step_rad"], math.radians(45.0), abs_tol=1e-12)
+    assert math.isclose(payload["servo_step"]["wrist_step_rad"], math.radians(75.0), abs_tol=1e-12)
 
 
 def test_server_omits_mask_preview_by_default():

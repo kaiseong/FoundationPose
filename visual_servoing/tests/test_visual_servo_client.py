@@ -37,7 +37,7 @@ from visual_servoing.visual_servo_client import (
     synthetic_rgbd_fixture,
     validate_args,
 )
-from visual_servoing.visual_servo_core import REMOTE_ACTION_CONTROL_MODE
+from visual_servoing.visual_servo_core import POSITION_ONLY_ORIENTATION_POLICY, REMOTE_ACTION_CONTROL_MODE
 from visual_servoing.visual_servo_protocol import decode_visual_servo_request
 
 
@@ -867,7 +867,7 @@ def test_remote_target_offset_t5_metadata_is_explicit_t5_frame():
 
     assert metadata["target_offset_t5_m"] == [0.1, -0.2, 0.3]
     assert metadata["offset_frame"] == "link_torso_5"
-    assert metadata["orientation_policy"] == "fixed_t5_rpy_zero"
+    assert metadata["orientation_policy"] == "preserve_reference_ee_rotation"
     assert metadata["servo_dofs"] == "xyz_position_only"
 
 
@@ -927,6 +927,8 @@ def test_remote_iteration_executes_only_valid_tracking_action(monkeypatch):
         np.testing.assert_allclose(request.object_T_offset, np.eye(4), atol=1e-12)
         assert request.metadata["target_offset_t5_m"] == [0.1, -0.2, 0.3]
         assert request.metadata["offset_frame"] == "link_torso_5"
+        assert request.metadata["orientation_policy"] == "preserve_reference_ee_rotation"
+        np.testing.assert_allclose(request.metadata["target_t5_R_ee"], np.eye(3), atol=1e-12)
         return _tracking_response(body, target=target)
 
     monkeypatch.setattr("visual_servoing.visual_servo_client.send_remote_visual_servo_request", fake_send)
@@ -938,6 +940,49 @@ def test_remote_iteration_executes_only_valid_tracking_action(monkeypatch):
     assert len(robot_context.sent_targets) == 1
     np.testing.assert_allclose(robot_context.sent_targets[0], target)
     np.testing.assert_allclose(next_pose, target)
+
+
+def test_remote_iteration_accepts_locked_reference_rotation(monkeypatch):
+    args = _remote_args(execute=True)
+    robot_context = FakeRobotContext(execute=True)
+    rgb, depth_m, intrinsics = synthetic_rgbd_fixture()
+    reference = make_transform_from_xyz_rpy([0.0, 0.0, 0.0, 0.0, 0.0, 45.0])
+    target_from_legacy_server = np.eye(4)
+    target_from_legacy_server[:3, 3] = [0.01, 0.0, 0.0]
+    expected_target = reference.copy()
+    expected_target[:3, 3] = target_from_legacy_server[:3, 3]
+
+    def fake_send(server, body, *, timeout_s):
+        del server, timeout_s
+        request = decode_visual_servo_request(body)
+        np.testing.assert_allclose(request.metadata["target_t5_R_ee"], reference[:3, :3], atol=1e-12)
+        return _tracking_response(
+            body,
+            target=target_from_legacy_server,
+            action={
+                "orientation_policy": "fixed_t5_rpy_zero",
+            },
+        )
+
+    monkeypatch.setattr("visual_servoing.visual_servo_client.send_remote_visual_servo_request", fake_send)
+
+    result, next_pose = process_remote_servo_iteration(
+        args,
+        rgb=rgb,
+        depth_m=depth_m,
+        intrinsics=intrinsics,
+        t5_T_camera=np.eye(4),
+        current_t5_T_ee=np.eye(4),
+        reference_t5_R_ee=reference[:3, :3],
+        robot_context=robot_context,
+        frame_index=2,
+    )
+
+    assert result["command_sent"] is True
+    assert result["remote"]["action_executable"] is True
+    assert result["orientation_policy"] == POSITION_ONLY_ORIENTATION_POLICY
+    np.testing.assert_allclose(robot_context.sent_targets[0], expected_target)
+    np.testing.assert_allclose(next_pose, expected_target)
 
 
 def test_remote_iteration_rejects_stale_before_command_path(monkeypatch):

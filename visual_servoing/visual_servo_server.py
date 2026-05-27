@@ -24,6 +24,7 @@ from visual_servoing.visual_servo_core import (
     estimate_visual_observation,
     matrix_list,
     plan_t5_position_servo_action,
+    require_rotation_matrix,
     require_vector3,
     to_list,
 )
@@ -102,11 +103,16 @@ class VisualServoService:
                 metadata.get("target_offset_t5_m", metadata.get("target_offset_t5", [0.0, 0.0, 0.0])),
                 "target_offset_t5",
             )
+            target_t5_R_ee = require_rotation_matrix(
+                metadata.get("target_t5_R_ee", request.current_t5_T_ee[:3, :3]),
+                "target_t5_R_ee",
+            )
             step = plan_t5_position_servo_action(
                 current_t5_T_ee=request.current_t5_T_ee,
                 object_centroid_t5=observation.t5_T_object[:3, 3],
                 target_offset_t5=target_offset_t5,
                 limits=limits,
+                target_t5_R_ee=target_t5_R_ee,
             )
             timing_ms["planning_ms"] = (time.perf_counter() - plan_start) * 1000.0
             server_completed_ns = time.monotonic_ns()
@@ -129,6 +135,7 @@ class VisualServoService:
                 "offset_frame": REMOTE_OFFSET_FRAME,
                 "orientation_policy": POSITION_ONLY_ORIENTATION_POLICY,
                 "target_offset_t5_m": to_list(target_offset_t5),
+                "target_t5_R_ee": matrix_list(target_t5_R_ee),
                 "action": {
                     "root_link": RIGHT_ARM_CONTROL_ROOT_LINK,
                     "ee_link": ee_link,
@@ -137,6 +144,7 @@ class VisualServoService:
                     "command_recommended": bool(step.command_recommended),
                     "offset_frame": REMOTE_OFFSET_FRAME,
                     "orientation_policy": POSITION_ONLY_ORIENTATION_POLICY,
+                    "target_t5_R_ee": matrix_list(target_t5_R_ee),
                 },
                 "observation": {
                     "masked_points": observation.masked_points,
@@ -154,6 +162,7 @@ class VisualServoService:
                     "wrist_step_rad": step.wrist_step_rad,
                     "ignored_offset_rpy_deg": list(step.ignored_offset_rpy_deg),
                     "target_offset_t5_m": to_list(target_offset_t5),
+                    "target_t5_R_ee": matrix_list(target_t5_R_ee),
                     "offset_frame": REMOTE_OFFSET_FRAME,
                     "orientation_policy": POSITION_ONLY_ORIENTATION_POLICY,
                     "current_t5_T_ee": matrix_list(step.current_t5_T_ee),
