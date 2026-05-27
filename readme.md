@@ -41,7 +41,6 @@ conda activate visual
 python -m visual_servoing.visual_servo_server \
   --host 0.0.0.0 \
   --port 8080 \
-  --prompt multimeter \
   --device cuda
 ```
 
@@ -185,8 +184,8 @@ PY
 
 ## Operational Notes
 
-- The server prompt controls SAM3 segmentation. Keep the server and client
-  prompt values aligned for logs and metadata.
+- In remote mode, the client `--prompt` controls SAM3 segmentation. Server
+  `--prompt` is only a fallback for requests that omit prompt metadata.
 - Client logs are concise by default: frame index, status, fps, action latency,
   encode latency, command result, and reason. Use `--debug` for full JSON.
 - `--show-mask-window` requests the selected server mask preview and overlays it

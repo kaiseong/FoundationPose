@@ -7,6 +7,7 @@ import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
+import threading
 import time
 from typing import Any, Callable
 
@@ -68,6 +69,8 @@ class VisualServoService:
         self.sam_resolution = sam_resolution
         self._segmenter_factory = segmenter_factory
         self._segmenter = None
+        self._segmenter_config: tuple[float, int] | None = None
+        self._segmenter_lock = threading.Lock()
 
     def handle(self, request: VisualServoRequest) -> dict[str, Any]:
         server_received_ns = time.monotonic_ns()
@@ -79,8 +82,17 @@ class VisualServoService:
                 allowed = ", ".join(sorted(RIGHT_ARM_EE_LINKS))
                 raise ValueError(f"ee_link {ee_link!r} is not an allowed right-arm EE link; allowed: {allowed}")
 
+            prompt = self._request_prompt(metadata)
+            threshold = float(metadata.get("threshold", self.threshold))
+            sam_resolution = int(metadata.get("sam_resolution", self.sam_resolution))
             segment_start = time.perf_counter()
-            selection = self._segmenter_instance().segment(request.rgb)
+            with self._segmenter_lock:
+                segmenter = self._segmenter_instance(
+                    threshold=threshold,
+                    sam_resolution=sam_resolution,
+                )
+                setattr(segmenter, "prompt", prompt)
+                selection = segmenter.segment(request.rgb)
             timing_ms["segmentation_ms"] = (time.perf_counter() - segment_start) * 1000.0
 
             plan_start = time.perf_counter()
@@ -132,6 +144,11 @@ class VisualServoService:
                 "server_received_monotonic_ns": server_received_ns,
                 "server_completed_monotonic_ns": server_completed_ns,
                 "server_timing_ms": timing_ms,
+                "segmentation": {
+                    "prompt": prompt,
+                    "threshold": threshold,
+                    "sam_resolution": sam_resolution,
+                },
                 "offset_frame": REMOTE_OFFSET_FRAME,
                 "orientation_policy": POSITION_ONLY_ORIENTATION_POLICY,
                 "target_offset_t5_m": to_list(target_offset_t5),
@@ -182,17 +199,23 @@ class VisualServoService:
                 "reason": str(exc),
             }
 
-    def _segmenter_instance(self):
-        if self._segmenter is None:
+    def _request_prompt(self, metadata: dict[str, Any]) -> str:
+        prompt = str(metadata.get("prompt", self.prompt)).strip()
+        return prompt or self.prompt
+
+    def _segmenter_instance(self, *, threshold: float, sam_resolution: int):
+        config = (float(threshold), int(sam_resolution))
+        if self._segmenter is None or self._segmenter_config != config:
             if self._segmenter_factory is not None:
                 self._segmenter = self._segmenter_factory()
             else:
                 self._segmenter = Sam3PhoneSegmenter(
                     prompt=self.prompt,
                     device=self.device,
-                    confidence_threshold=self.threshold,
-                    resolution=self.sam_resolution,
+                    confidence_threshold=float(threshold),
+                    resolution=int(sam_resolution),
                 )
+            self._segmenter_config = config
         return self._segmenter
 
 

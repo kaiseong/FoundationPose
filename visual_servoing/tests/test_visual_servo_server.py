@@ -35,7 +35,12 @@ def _decode_mask_preview(preview):
 
 
 class FakeSegmenter:
+    def __init__(self):
+        self.prompt = "unset"
+        self.prompts = []
+
     def segment(self, image_rgb):
+        self.prompts.append(self.prompt)
         mask = np.zeros(image_rgb.shape[:2], dtype=bool)
         mask[2:8, 2:8] = True
         return MaskSelection(mask=mask, index=0, score=0.9, area=int(mask.sum()), box_xyxy=[2, 2, 7, 7])
@@ -137,6 +142,30 @@ def test_server_defaults_to_tool_tcp_link_when_metadata_omits_ee_link():
 
     assert payload["ok"] is True
     assert payload["action"]["ee_link"] == DEFAULT_RIGHT_ARM_EE_LINK
+
+
+def test_server_uses_request_prompt_for_segmentation():
+    segmenter = FakeSegmenter()
+    metadata = {"prompt": "multimeter", "max_translation_step_m": 0.02}
+    request = decode_visual_servo_request(_request_body_with_metadata(metadata))
+
+    payload = VisualServoService(prompt="server-default", segmenter_factory=lambda: segmenter).handle(request)
+
+    assert payload["ok"] is True
+    assert segmenter.prompts == ["multimeter"]
+    assert payload["segmentation"]["prompt"] == "multimeter"
+
+
+def test_server_uses_server_prompt_when_request_prompt_is_blank():
+    segmenter = FakeSegmenter()
+    metadata = {"prompt": "   ", "max_translation_step_m": 0.02}
+    request = decode_visual_servo_request(_request_body_with_metadata(metadata))
+
+    payload = VisualServoService(prompt="fallback-object", segmenter_factory=lambda: segmenter).handle(request)
+
+    assert payload["ok"] is True
+    assert segmenter.prompts == ["fallback-object"]
+    assert payload["segmentation"]["prompt"] == "fallback-object"
 
 
 def test_server_returns_optional_packbits_mask_preview():
