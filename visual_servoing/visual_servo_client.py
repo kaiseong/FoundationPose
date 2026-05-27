@@ -47,6 +47,8 @@ DEFAULT_RIGHT_ARM_STIFFNESS = (90.0, 90.0, 90.0, 70.0, 70.0, 70.0, 70.0)
 DEFAULT_RIGHT_ARM_TORQUE_LIMIT = (40.0, 40.0, 40.0, 30.0, 30.0, 30.0, 30.0)
 RIGHT_ARM_CONTROL_ROOT_LINK = servo_core.RIGHT_ARM_CONTROL_ROOT_LINK
 RIGHT_ARM_EE_LINKS = servo_core.RIGHT_ARM_EE_LINKS
+REMOTE_OFFSET_FRAME = servo_core.REMOTE_OFFSET_FRAME
+POSITION_ONLY_ORIENTATION_POLICY = servo_core.POSITION_ONLY_ORIENTATION_POLICY
 RIGHT_ARM_POWER_SERVO_PATTERNS = frozenset({"right_arm.*", "^right_arm.*$"})
 
 ServoLimits = servo_core.ServoLimits
@@ -120,7 +122,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         nargs=6,
         default=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
         metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"),
-        help="Object-frame SE(3) target offset for remote visual servo: meters and degrees.",
+        help="Deprecated for remote visual servo; use --target-offset-t5 for position-only t5 offsets.",
+    )
+    parser.add_argument(
+        "--target-offset-t5",
+        type=float,
+        nargs=3,
+        default=(0.0, 0.0, 0.0),
+        metavar=("X", "Y", "Z"),
+        help="Remote visual servo target offset in link_torso_5/T5 frame: meters.",
     )
     parser.add_argument(
         "--current-ee-pose",
@@ -193,6 +203,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--remote-fixture-request cannot be used with --execute")
     if args.remote_server and not (is_live_mode(args) or args.remote_fixture_request):
         raise SystemExit("--remote-server requires a live camera mode or --remote-fixture-request")
+    if args.remote_server and any(abs(float(value)) > 1e-12 for value in args.object_offset):
+        raise SystemExit("--object-offset is object-frame SE(3); use --target-offset-t5 X Y Z for remote position-only servo")
     if args.execute:
         validate_execute_safety(args)
     if not is_live_mode(args) and not args.remote_fixture_request:
@@ -390,7 +402,7 @@ def process_remote_servo_iteration(
     if robot_context.execute:
         current_t5_T_ee = robot_context.current_ee_pose()
     request_id = f"{time.monotonic_ns()}-{frame_index}"
-    object_T_offset = make_transform_from_xyz_rpy(args.object_offset)
+    object_T_offset = np.eye(4, dtype=np.float64)
     capture_monotonic_ns = time.monotonic_ns()
     metadata = remote_request_metadata(args)
     metadata["ee_link"] = args.ee_link
@@ -493,6 +505,10 @@ def remote_request_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "prompt": args.prompt,
         "threshold": float(args.threshold),
         "sam_resolution": int(args.sam_resolution),
+        "target_offset_t5_m": [float(value) for value in args.target_offset_t5],
+        "offset_frame": REMOTE_OFFSET_FRAME,
+        "orientation_policy": POSITION_ONLY_ORIENTATION_POLICY,
+        "servo_dofs": "xyz_position_only",
         "ee_align_axis": args.ee_align_axis,
         "wrist_axis": args.wrist_axis,
         "control_root_link": args.control_root_link,
@@ -532,6 +548,9 @@ def remote_diagnostic_payload(
         "server_timing_ms": response.get("server_timing_ms", {}),
     }
     for key in ("action", "observation", "servo_step", "mask"):
+        if key in response:
+            payload[key] = response[key]
+    for key in ("offset_frame", "orientation_policy", "target_offset_t5_m"):
         if key in response:
             payload[key] = response[key]
     if command_feedback is not None:

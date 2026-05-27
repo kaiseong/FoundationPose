@@ -13,13 +13,16 @@ import numpy as np
 
 from visual_servoing.point_pose.sam3_phone_segmenter import Sam3PhoneSegmenter
 from visual_servoing.visual_servo_core import (
+    POSITION_ONLY_ORIENTATION_POLICY,
     REMOTE_ACTION_CONTROL_MODE,
+    REMOTE_OFFSET_FRAME,
     RIGHT_ARM_CONTROL_ROOT_LINK,
     RIGHT_ARM_EE_LINKS,
     ServoLimits,
     estimate_visual_observation,
     matrix_list,
-    plan_visual_servo_action,
+    plan_t5_position_servo_action,
+    require_vector3,
     to_list,
 )
 from visual_servoing.visual_servo_protocol import (
@@ -79,14 +82,15 @@ class VisualServoService:
                 min_depth_m=float(metadata.get("min_depth_m", 0.05)),
                 max_depth_m=float(metadata.get("max_depth_m", 2.0)),
             )
-            step = plan_visual_servo_action(
+            target_offset_t5 = require_vector3(
+                metadata.get("target_offset_t5_m", metadata.get("target_offset_t5", [0.0, 0.0, 0.0])),
+                "target_offset_t5",
+            )
+            step = plan_t5_position_servo_action(
                 current_t5_T_ee=request.current_t5_T_ee,
-                t5_T_object=observation.t5_T_object,
-                object_T_offset=request.object_T_offset,
+                object_centroid_t5=observation.t5_T_object[:3, 3],
+                target_offset_t5=target_offset_t5,
                 limits=limits,
-                object_grasp_axis_t5=observation.object_grasp_axis_t5,
-                ee_align_axis=str(metadata.get("ee_align_axis", "y")),
-                wrist_axis=str(metadata.get("wrist_axis", "z")),
             )
             timing_ms["planning_ms"] = (time.perf_counter() - plan_start) * 1000.0
             server_completed_ns = time.monotonic_ns()
@@ -98,12 +102,17 @@ class VisualServoService:
                 "server_received_monotonic_ns": server_received_ns,
                 "server_completed_monotonic_ns": server_completed_ns,
                 "server_timing_ms": timing_ms,
+                "offset_frame": REMOTE_OFFSET_FRAME,
+                "orientation_policy": POSITION_ONLY_ORIENTATION_POLICY,
+                "target_offset_t5_m": to_list(target_offset_t5),
                 "action": {
                     "root_link": RIGHT_ARM_CONTROL_ROOT_LINK,
                     "ee_link": ee_link,
                     "control_mode": REMOTE_ACTION_CONTROL_MODE,
                     "target_t5_T_ee": matrix_list(step.target_t5_T_ee),
                     "command_recommended": bool(step.command_recommended),
+                    "offset_frame": REMOTE_OFFSET_FRAME,
+                    "orientation_policy": POSITION_ONLY_ORIENTATION_POLICY,
                 },
                 "observation": {
                     "masked_points": observation.masked_points,
@@ -120,6 +129,9 @@ class VisualServoService:
                     "wrist_error_rad": step.wrist_error_rad,
                     "wrist_step_rad": step.wrist_step_rad,
                     "ignored_offset_rpy_deg": list(step.ignored_offset_rpy_deg),
+                    "target_offset_t5_m": to_list(target_offset_t5),
+                    "offset_frame": REMOTE_OFFSET_FRAME,
+                    "orientation_policy": POSITION_ONLY_ORIENTATION_POLICY,
                     "current_t5_T_ee": matrix_list(step.current_t5_T_ee),
                     "target_t5_T_ee": matrix_list(step.target_t5_T_ee),
                 },

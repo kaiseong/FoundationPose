@@ -10,6 +10,7 @@ from urllib import request as urllib_request
 import numpy as np
 
 from visual_servoing.point_pose.sam3_phone_segmenter import MaskSelection
+from visual_servoing.visual_servo_core import POSITION_ONLY_ORIENTATION_POLICY, make_transform_from_xyz_rpy
 from visual_servoing.visual_servo_protocol import (
     REQUEST_CONTENT_TYPE,
     decode_visual_servo_request,
@@ -39,7 +40,7 @@ def _request_body_with_metadata(metadata):
     return _encode_request(rgb, depth, metadata=metadata)
 
 
-def _encode_request(rgb, depth, *, metadata):
+def _encode_request(rgb, depth, *, metadata, current_t5_T_ee=None):
     return encode_visual_servo_request(
         rgb=rgb,
         depth_m=depth,
@@ -48,7 +49,7 @@ def _encode_request(rgb, depth, *, metadata):
         frame_index=4,
         capture_monotonic_ns=123,
         t5_T_camera=np.eye(4),
-        current_t5_T_ee=np.eye(4),
+        current_t5_T_ee=np.eye(4) if current_t5_T_ee is None else current_t5_T_ee,
         object_T_offset=np.eye(4),
         metadata=metadata,
     )
@@ -76,6 +77,34 @@ def test_server_handles_one_valid_request_without_robot_sdk():
     assert "address" not in payload["action"]
     assert "power" not in payload["action"]
     assert "servo" not in payload["action"]
+
+
+def test_server_returns_t5_position_only_action_with_current_rotation_preserved():
+    current = make_transform_from_xyz_rpy([0.0, 0.0, 0.0, 0.0, 0.0, 45.0])
+    metadata = {
+        "ee_link": "link_right_arm_6",
+        "max_translation_step_m": 2.0,
+        "target_offset_t5_m": [0.1, -0.2, 0.3],
+    }
+    rgb = np.zeros((10, 10, 3), dtype=np.uint8)
+    depth = np.full((10, 10), 0.5, dtype=np.float32)
+    request = decode_visual_servo_request(_encode_request(rgb, depth, metadata=metadata, current_t5_T_ee=current))
+    payload = VisualServoService(segmenter_factory=FakeSegmenter).handle(request)
+
+    assert payload["ok"] is True
+    assert payload["offset_frame"] == "link_torso_5"
+    assert payload["orientation_policy"] == POSITION_ONLY_ORIENTATION_POLICY
+    assert payload["target_offset_t5_m"] == [0.1, -0.2, 0.3]
+    assert payload["action"]["orientation_policy"] == POSITION_ONLY_ORIENTATION_POLICY
+    target = np.asarray(payload["action"]["target_t5_T_ee"], dtype=np.float64)
+    np.testing.assert_allclose(target[:3, :3], current[:3, :3], atol=1e-12)
+    object_centroid = np.asarray(payload["observation"]["t5_T_object"], dtype=np.float64)[:3, 3]
+    np.testing.assert_allclose(
+        payload["servo_step"]["desired_position_t5_m"],
+        object_centroid + np.array([0.1, -0.2, 0.3]),
+        atol=1e-12,
+    )
+    assert payload["servo_step"]["wrist_step_rad"] == 0.0
 
 
 def test_server_module_import_does_not_require_robot_sdk():

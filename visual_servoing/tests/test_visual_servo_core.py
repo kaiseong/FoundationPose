@@ -5,11 +5,14 @@ import math
 import numpy as np
 
 from visual_servoing.visual_servo_core import (
+    POSITION_ONLY_ORIENTATION_POLICY,
     REMOTE_ACTION_CONTROL_MODE,
+    REMOTE_OFFSET_FRAME,
     RIGHT_ARM_CONTROL_ROOT_LINK,
     ServoLimits,
     apply_object_offset,
     make_transform_from_xyz_rpy,
+    plan_t5_position_servo_action,
     plan_visual_servo_action,
     validate_remote_action,
 )
@@ -56,6 +59,40 @@ def test_plan_visual_servo_action_applies_object_offset_not_current_ee_frame():
     )
 
     np.testing.assert_allclose(step.desired_position_t5_m, [1.0, 1.1, 0.0], atol=1e-12)
+
+
+def test_plan_t5_position_servo_action_uses_t5_offset_and_preserves_rotation():
+    current = make_transform_from_xyz_rpy([0.0, 0.0, 0.0, 0.0, 0.0, 90.0])
+
+    step = plan_t5_position_servo_action(
+        current_t5_T_ee=current,
+        object_centroid_t5=np.array([1.0, 1.0, 0.0]),
+        target_offset_t5=np.array([0.1, -0.2, 0.3]),
+        limits=ServoLimits(max_translation_step_m=2.0),
+    )
+
+    assert REMOTE_OFFSET_FRAME == RIGHT_ARM_CONTROL_ROOT_LINK
+    assert POSITION_ONLY_ORIENTATION_POLICY == "preserve_current_ee_rotation"
+    np.testing.assert_allclose(step.desired_position_t5_m, [1.1, 0.8, 0.3], atol=1e-12)
+    np.testing.assert_allclose(step.target_t5_T_ee[:3, 3], [1.1, 0.8, 0.3], atol=1e-12)
+    np.testing.assert_allclose(step.target_t5_T_ee[:3, :3], current[:3, :3], atol=1e-12)
+    assert step.wrist_error_rad == 0.0
+    assert step.wrist_step_rad == 0.0
+
+
+def test_plan_t5_position_servo_action_converges_on_position_only():
+    current = make_transform_from_xyz_rpy([1.001, 1.0, 1.0, 0.0, 0.0, 180.0])
+
+    step = plan_t5_position_servo_action(
+        current_t5_T_ee=current,
+        object_centroid_t5=np.array([1.0, 1.0, 1.0]),
+        target_offset_t5=np.zeros(3),
+        limits=ServoLimits(position_tolerance_m=0.005),
+    )
+
+    assert step.status == "converged"
+    assert step.command_recommended is False
+    np.testing.assert_allclose(step.target_t5_T_ee[:3, :3], current[:3, :3], atol=1e-12)
 
 
 def test_validate_remote_action_accepts_tracking_with_bounded_target():

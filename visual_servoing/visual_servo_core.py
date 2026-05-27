@@ -19,6 +19,8 @@ from visual_servoing.point_pose.rgbd_geometry import (
 RIGHT_ARM_CONTROL_ROOT_LINK = "link_torso_5"
 RIGHT_ARM_EE_LINKS = frozenset({"link_right_arm_6", "ee_right"})
 REMOTE_ACTION_CONTROL_MODE = "right_arm_cartesian"
+REMOTE_OFFSET_FRAME = RIGHT_ARM_CONTROL_ROOT_LINK
+POSITION_ONLY_ORIENTATION_POLICY = "preserve_current_ee_rotation"
 EXECUTABLE_REMOTE_STATUS = "tracking"
 NO_COMMAND_REMOTE_STATUSES = frozenset({"converged", "skipped", "error"})
 
@@ -101,6 +103,45 @@ def estimate_visual_observation(
 
 def apply_object_offset(t5_T_object: np.ndarray, object_T_offset: np.ndarray) -> np.ndarray:
     return require_transform(t5_T_object, "t5_T_object") @ require_transform(object_T_offset, "object_T_offset")
+
+
+def plan_t5_position_servo_action(
+    *,
+    current_t5_T_ee: np.ndarray,
+    object_centroid_t5: np.ndarray,
+    target_offset_t5: np.ndarray,
+    limits: ServoLimits,
+) -> ServoStep:
+    current_t5_T_ee = require_transform(current_t5_T_ee, "current_t5_T_ee")
+    object_centroid_t5 = require_vector3(object_centroid_t5, "object_centroid_t5")
+    target_offset_t5 = require_vector3(target_offset_t5, "target_offset_t5")
+
+    desired_position_t5_m = object_centroid_t5 + target_offset_t5
+    position_error_m = desired_position_t5_m - current_t5_T_ee[:3, 3]
+    translation_step_m = clamp_translation_step(
+        position_error_m,
+        max_step_m=limits.max_translation_step_m,
+    )
+
+    target_t5_T_ee = current_t5_T_ee.copy()
+    target_t5_T_ee[:3, 3] = current_t5_T_ee[:3, 3] + translation_step_m
+    target_t5_T_ee[:3, :3] = current_t5_T_ee[:3, :3]
+
+    converged = float(np.linalg.norm(position_error_m)) <= limits.position_tolerance_m
+    status = "converged" if converged else "tracking"
+    command_recommended = not converged and float(np.linalg.norm(translation_step_m)) > 1e-9
+    return ServoStep(
+        status=status,
+        current_t5_T_ee=current_t5_T_ee,
+        target_t5_T_ee=target_t5_T_ee,
+        desired_position_t5_m=desired_position_t5_m,
+        position_error_m=position_error_m,
+        translation_step_m=translation_step_m,
+        wrist_error_rad=0.0,
+        wrist_step_rad=0.0,
+        command_recommended=command_recommended,
+        ignored_offset_rpy_deg=(0.0, 0.0),
+    )
 
 
 def plan_visual_servo_action(
@@ -273,6 +314,13 @@ def require_transform(transform: Any, name: str) -> np.ndarray:
     if not np.all(np.isfinite(transform)):
         raise ValueError(f"{name} contains non-finite values")
     return transform
+
+
+def require_vector3(value: Any, name: str) -> np.ndarray:
+    vector = np.asarray(value, dtype=np.float64).reshape(3)
+    if not np.all(np.isfinite(vector)):
+        raise ValueError(f"{name} contains non-finite values")
+    return vector
 
 
 def make_transform_from_xyz_rpy(values: Any) -> np.ndarray:

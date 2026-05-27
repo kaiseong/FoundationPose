@@ -18,6 +18,7 @@ from visual_servoing.visual_servo_client import (
     plan_visual_servo_step,
     process_remote_servo_iteration,
     parse_args,
+    remote_request_metadata,
     run_remote_fixture,
     signed_angle_about_axis,
     synthetic_rgbd_fixture,
@@ -269,6 +270,47 @@ def test_validate_execute_accepts_right_arm_safe_defaults():
     validate_args(args)
 
 
+def test_remote_target_offset_t5_metadata_is_explicit_t5_frame():
+    args = parse_args(
+        [
+            "--live",
+            "--remote-server",
+            "127.0.0.1:8080",
+            "--target-offset-t5",
+            "0.1",
+            "-0.2",
+            "0.3",
+        ]
+    )
+
+    metadata = remote_request_metadata(args)
+
+    assert metadata["target_offset_t5_m"] == [0.1, -0.2, 0.3]
+    assert metadata["offset_frame"] == "link_torso_5"
+    assert metadata["orientation_policy"] == "preserve_current_ee_rotation"
+    assert metadata["servo_dofs"] == "xyz_position_only"
+
+
+def test_remote_rejects_object_frame_offset_to_avoid_axis_spin():
+    args = parse_args(
+        [
+            "--live",
+            "--remote-server",
+            "127.0.0.1:8080",
+            "--object-offset",
+            "0.1",
+            "0.0",
+            "0.0",
+            "0.0",
+            "0.0",
+            "0.0",
+        ]
+    )
+
+    with pytest.raises(SystemExit, match="--target-offset-t5"):
+        validate_args(args)
+
+
 def test_validate_remote_fixture_request_requires_remote_server():
     args = parse_args(["--remote-fixture-request"])
 
@@ -294,12 +336,17 @@ def test_validate_remote_fixture_request_rejects_execute():
 
 def test_remote_iteration_executes_only_valid_tracking_action(monkeypatch):
     args = _remote_args(execute=True)
+    args.target_offset_t5 = (0.1, -0.2, 0.3)
     robot_context = FakeRobotContext(execute=True)
     target = make_transform_from_xyz_rpy([0.01, 0.0, 0.0, 0.0, 0.0, 2.0])
 
     def fake_send(server, body, *, timeout_s):
         assert server == "127.0.0.1:8080"
         assert timeout_s == args.remote_timeout_s
+        request = decode_visual_servo_request(body)
+        np.testing.assert_allclose(request.object_T_offset, np.eye(4), atol=1e-12)
+        assert request.metadata["target_offset_t5_m"] == [0.1, -0.2, 0.3]
+        assert request.metadata["offset_frame"] == "link_torso_5"
         return _tracking_response(body, target=target)
 
     monkeypatch.setattr("visual_servoing.visual_servo_client.send_remote_visual_servo_request", fake_send)
