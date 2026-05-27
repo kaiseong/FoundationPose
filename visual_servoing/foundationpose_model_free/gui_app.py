@@ -366,6 +366,22 @@ class BackgroundCommandRunner:
             self.on_event(CommandEvent("stop", "terminating running command"))
             self._process.terminate()
 
+    def stop_and_wait(self, *, timeout_s: float = 6.0) -> bool:
+        if not self.running or self._process is None:
+            return True
+        process = self._process
+        self.stop()
+        try:
+            process.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            self.on_event(CommandEvent("stop", "killing unresponsive running command"))
+            process.kill()
+            try:
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                return False
+        return process.poll() is not None
+
     def _read_output(self) -> None:
         assert self._process is not None
         process = self._process
@@ -612,7 +628,10 @@ class FoundationPoseWorkflowGui:
         if not name:
             self.status.set("Select a profile first")
             return
-        if not messagebox.askyesno("Delete profile", f"Delete object profile '{name}'?"):
+        if not messagebox.askyesno(
+            "Delete profile",
+            f"Delete object profile '{name}' including recordings, references, assets, logs, and processing caches?",
+        ):
             return
         self.registry.delete(name, confirm=True)
         self.status.set(f"Deleted {name}")
@@ -645,6 +664,8 @@ class FoundationPoseWorkflowGui:
             return
         try:
             profile = self._current_profile()
+            if not self._stop_running_command_for_recording():
+                return
             if not self._release_live_sessions_for_gpu():
                 return
             config = ReferenceRecordingConfig(
@@ -923,7 +944,8 @@ class FoundationPoseWorkflowGui:
         if event.kind == "start":
             self.status.set("Command running")
         elif event.kind == "done":
-            self.status.set(event.text)
+            if self.recording_session is None:
+                self.status.set(event.text)
             if self._pending_axis_preview_path is not None:
                 self._show_axis_preview(self._pending_axis_preview_path)
                 self._pending_axis_preview_path = None
@@ -966,6 +988,15 @@ class FoundationPoseWorkflowGui:
             self.recording_busy = False
         self._update_capture_status()
         return True
+
+    def _stop_running_command_for_recording(self) -> bool:
+        if not self.runner.running:
+            return True
+        self.status.set("Stopping running command before recording")
+        if self.runner.stop_and_wait(timeout_s=6.0):
+            return True
+        self.status.set("Running command is still stopping; try Start Recording again")
+        return False
 
     def _current_board_spec(self) -> CharucoBoardSpec:
         return CharucoBoardSpec(

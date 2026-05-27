@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import inspect
 from pathlib import Path
+import sys
 
 from visual_servoing.foundationpose_model_free.gui_app import (
+    BackgroundCommandRunner,
     FoundationPoseWorkflowGui,
     GuiCommandBuilder,
     GuiConfig,
@@ -281,3 +283,15 @@ def test_gui_resolves_and_passes_default_data_root(tmp_path, monkeypatch):
 
     assert config.data_root == str(expected_root)
     assert command[-2:] == ["--data-root", str(expected_root)]
+
+
+def test_background_command_runner_can_stop_and_wait(tmp_path):
+    events = []
+    runner = BackgroundCommandRunner(on_event=events.append, cwd=tmp_path)
+
+    runner.start([sys.executable, "-c", "import time; time.sleep(30)"])
+
+    assert runner.running is True
+    assert runner.stop_and_wait(timeout_s=2.0) is True
+    assert runner.running is False
+    assert any(event.kind == "stop" for event in events)

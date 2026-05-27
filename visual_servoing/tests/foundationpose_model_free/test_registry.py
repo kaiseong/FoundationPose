@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from visual_servoing.foundationpose_model_free.profile_schema import ProfileStatus
@@ -49,3 +51,34 @@ def test_registry_prompt_update_marks_existing_assets_stale(tmp_path):
     assert updated.prompt == "wireless mouse"
     assert updated.asset_status == "stale"
     assert updated.metadata["asset_stale_reason"] == "profile prompt changed"
+
+
+def test_registry_delete_removes_legacy_processing_cache_references(tmp_path):
+    registry = ObjectProfileRegistry(tmp_path / "current")
+    profile = registry.create("multimeter", prompt="multimeter")
+    legacy_cache = tmp_path / "legacy" / "visual_servoing_data" / "object_profiles" / "multimeter" / "processing_cache"
+    legacy_run = legacy_cache / "process-old"
+    legacy_run.mkdir(parents=True)
+    (legacy_run / "records.json").write_text("{}", encoding="utf-8")
+    unrelated_cache = tmp_path / "legacy" / "visual_servoing_data" / "object_profiles" / "other" / "processing_cache"
+    unrelated_cache.mkdir(parents=True)
+
+    profile.metadata["reference_processing"] = {
+        "processing_cache_path": str(legacy_run),
+        "processing_summary": {
+            "source_processing_cache_path": str(unrelated_cache),
+        },
+    }
+    profile.save()
+    report_dir = profile.logs_dir
+    report_dir.mkdir(parents=True, exist_ok=True)
+    (report_dir / "reference_processing_latest.json").write_text(
+        json.dumps({"processing_cache_path": str(legacy_run)}, indent=2),
+        encoding="utf-8",
+    )
+
+    registry.delete("multimeter", confirm=True)
+
+    assert not profile.root.exists()
+    assert not legacy_cache.exists()
+    assert unrelated_cache.exists()
