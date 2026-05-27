@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import math
 import subprocess
@@ -16,6 +17,7 @@ from visual_servoing.visual_servo_client import (
     RobotContext,
     ServoLimits,
     clamp_translation_step,
+    decode_mask_preview,
     make_transform_from_xyz_rpy,
     plan_visual_servo_step,
     process_remote_servo_iteration,
@@ -24,6 +26,7 @@ from visual_servoing.visual_servo_client import (
     remote_request_metadata,
     run_remote_fixture,
     signed_angle_about_axis,
+    strip_mask_preview_for_logging,
     synthetic_rgbd_fixture,
     validate_args,
 )
@@ -277,6 +280,94 @@ def test_no_window_disables_camera_preview_even_when_requested(monkeypatch):
 
     with LiveCameraPreview(args) as preview:
         assert preview.show(np.zeros((2, 2, 3), dtype=np.uint8)) is True
+
+
+def test_show_mask_window_requests_remote_mask_preview():
+    args = parse_args(["--live", "--remote-server", "127.0.0.1:8080", "--show-mask-window"])
+
+    assert LiveCameraPreview(args).enabled is True
+    assert remote_request_metadata(args)["return_mask_preview"] is True
+
+
+def test_no_window_disables_remote_mask_preview_request():
+    args = parse_args(["--live", "--remote-server", "127.0.0.1:8080", "--show-mask-window", "--no-window"])
+
+    assert LiveCameraPreview(args).enabled is False
+    assert remote_request_metadata(args)["return_mask_preview"] is False
+
+
+def test_camera_preview_overlays_mask_preview(monkeypatch):
+    class FakeCv2:
+        COLOR_RGB2BGR = 1
+        WINDOW_NORMAL = 2
+        INTER_NEAREST = 3
+
+        def __init__(self):
+            self.images = []
+
+        def namedWindow(self, name, flag):
+            del name, flag
+
+        def cvtColor(self, image, code):
+            assert code == self.COLOR_RGB2BGR
+            return image[..., ::-1]
+
+        def resize(self, image, *args, **kwargs):
+            del args, kwargs
+            return image
+
+        def imshow(self, name, image):
+            self.images.append((name, image.copy()))
+
+        def waitKey(self, delay_ms):
+            assert delay_ms == 1
+            return -1
+
+        def destroyWindow(self, name):
+            del name
+
+    fake_cv2 = FakeCv2()
+    import visual_servoing.visual_servo_client as client
+
+    monkeypatch.setattr(client, "require_cv2", lambda: fake_cv2)
+    args = parse_args(["--live", "--show-mask-window", "--mask-overlay-alpha", "1.0"])
+    mask = np.array([[True, False], [False, False]], dtype=bool)
+    preview_payload = {
+        "encoding": "packbits-b64-v1",
+        "shape": [2, 2],
+        "data": base64.b64encode(np.packbits(mask.reshape(-1).astype(np.uint8)).tobytes()).decode("ascii"),
+    }
+
+    with LiveCameraPreview(args) as preview:
+        keep_running = preview.show_result(
+            np.zeros((2, 2, 3), dtype=np.uint8),
+            {"mask": {"preview": preview_payload}},
+        )
+
+    assert keep_running is True
+    assert fake_cv2.images[0][0] == "visual_servo_client"
+    np.testing.assert_array_equal(fake_cv2.images[0][1][0, 0], [0, 255, 0])
+    np.testing.assert_array_equal(fake_cv2.images[0][1][0, 1], [0, 0, 0])
+
+
+def test_decode_mask_preview_round_trip():
+    mask = np.array([[False, True, False], [True, True, False]], dtype=bool)
+    preview = {
+        "encoding": "packbits-b64-v1",
+        "shape": [2, 3],
+        "data": base64.b64encode(np.packbits(mask.reshape(-1).astype(np.uint8)).tobytes()).decode("ascii"),
+    }
+
+    np.testing.assert_array_equal(decode_mask_preview(preview), mask)
+
+
+def test_strip_mask_preview_for_logging_keeps_mask_metadata_without_blob():
+    payload = {"mask": {"score": 0.9, "preview": {"data": "large"}}}
+
+    sanitized = strip_mask_preview_for_logging(payload)
+
+    assert sanitized == {"mask": {"score": 0.9}}
+    assert payload["mask"]["preview"] == {"data": "large"}
 
 
 def test_clamp_translation_step_limits_norm():

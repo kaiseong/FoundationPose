@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
@@ -33,6 +34,20 @@ from visual_servoing.visual_servo_protocol import (
     decode_visual_servo_request,
     encode_visual_servo_response,
 )
+
+
+MASK_PREVIEW_ENCODING = "packbits-b64-v1"
+
+
+def encode_mask_preview(mask: np.ndarray) -> dict[str, Any]:
+    mask_bool = np.asarray(mask, dtype=bool)
+    flat = mask_bool.reshape(-1).astype(np.uint8)
+    packed = np.packbits(flat)
+    return {
+        "encoding": MASK_PREVIEW_ENCODING,
+        "shape": [int(mask_bool.shape[0]), int(mask_bool.shape[1])],
+        "data": base64.b64encode(packed.tobytes()).decode("ascii"),
+    }
 
 
 class VisualServoService:
@@ -94,6 +109,14 @@ class VisualServoService:
             )
             timing_ms["planning_ms"] = (time.perf_counter() - plan_start) * 1000.0
             server_completed_ns = time.monotonic_ns()
+            mask_payload: dict[str, Any] = {
+                "index": int(selection.index),
+                "score": float(selection.score),
+                "area": int(selection.area),
+                "box_xyxy": selection.box_xyxy,
+            }
+            if bool(metadata.get("return_mask_preview", False)):
+                mask_payload["preview"] = encode_mask_preview(selection.mask)
             return {
                 "ok": True,
                 "status": step.status,
@@ -135,12 +158,7 @@ class VisualServoService:
                     "current_t5_T_ee": matrix_list(step.current_t5_T_ee),
                     "target_t5_T_ee": matrix_list(step.target_t5_T_ee),
                 },
-                "mask": {
-                    "index": int(selection.index),
-                    "score": float(selection.score),
-                    "area": int(selection.area),
-                    "box_xyxy": selection.box_xyxy,
-                },
+                "mask": mask_payload,
             }
         except Exception as exc:
             return {

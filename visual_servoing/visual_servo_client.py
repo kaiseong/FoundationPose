@@ -8,6 +8,7 @@ only when --execute is provided.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
 import math
@@ -116,6 +117,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--camera-window-name", default="visual_servo_client")
     parser.add_argument("--camera-window-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--show-mask-window",
+        action="store_true",
+        help="Request the selected remote SAM mask and overlay it in the OpenCV preview window.",
+    )
+    parser.add_argument("--mask-overlay-alpha", type=float, default=0.45)
 
     parser.add_argument(
         "--ee-offset",
@@ -226,6 +233,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--object-offset is object-frame SE(3); use --target-offset-t5 X Y Z for remote position-only servo")
     if args.camera_window_scale <= 0.0:
         raise SystemExit("--camera-window-scale must be > 0")
+    if not 0.0 <= float(args.mask_overlay_alpha) <= 1.0:
+        raise SystemExit("--mask-overlay-alpha must be between 0 and 1")
     if args.execute:
         validate_execute_safety(args)
     if not is_live_mode(args) and not args.remote_fixture_request:
@@ -349,6 +358,12 @@ def run_live(args: argparse.Namespace) -> int:
                         "area": selection.area,
                         "box_xyxy": selection.box_xyxy,
                     }
+                    if args.show_mask_window and not preview.show(
+                        frame.rgb,
+                        mask=selection.mask,
+                        box_xyxy=selection.box_xyxy,
+                    ):
+                        break
                 except Exception as exc:
                     result = skipped_result(args, frame_index, str(exc))
                     if args.execute:
@@ -392,7 +407,9 @@ def run_remote_live(args: argparse.Namespace) -> int:
                     robot_context=robot_context,
                     frame_index=frame_index,
                 )
-                print(json.dumps(result, separators=(",", ":")))
+                if args.show_mask_window and not preview.show_result(frame.rgb, result):
+                    break
+                print(json.dumps(strip_mask_preview_for_logging(result), separators=(",", ":")))
                 if result.get("ok") is True and result.get("status") == "converged":
                     break
                 if args.loop_sleep_s > 0.0:
@@ -550,6 +567,7 @@ def remote_request_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "ee_align_axis": args.ee_align_axis,
         "wrist_axis": args.wrist_axis,
         "control_root_link": args.control_root_link,
+        "return_mask_preview": bool(args.show_mask_window and not args.no_window),
     }
 
 
@@ -740,6 +758,32 @@ def skipped_result(args: argparse.Namespace, frame_index: int, reason: str) -> d
         "command_sent": False,
         "reason": reason,
     }
+
+
+def strip_mask_preview_for_logging(payload: dict[str, Any]) -> dict[str, Any]:
+    mask = payload.get("mask")
+    if not isinstance(mask, dict) or "preview" not in mask:
+        return payload
+    sanitized = dict(payload)
+    sanitized_mask = dict(mask)
+    sanitized_mask.pop("preview", None)
+    sanitized["mask"] = sanitized_mask
+    return sanitized
+
+
+def decode_mask_preview(preview: dict[str, Any]) -> np.ndarray:
+    if preview.get("encoding") != "packbits-b64-v1":
+        raise ValueError(f"unsupported mask preview encoding: {preview.get('encoding')!r}")
+    shape = preview.get("shape")
+    if not isinstance(shape, list) or len(shape) != 2:
+        raise ValueError("mask preview shape must be [height, width]")
+    height, width = (int(shape[0]), int(shape[1]))
+    if height <= 0 or width <= 0:
+        raise ValueError("mask preview shape must be positive")
+    raw = base64.b64decode(str(preview.get("data", "")).encode("ascii"))
+    packed = np.frombuffer(raw, dtype=np.uint8)
+    bits = np.unpackbits(packed, count=height * width)
+    return bits.reshape((height, width)).astype(bool)
 
 
 class RobotContext:
@@ -942,7 +986,7 @@ class RobotContext:
 class LiveCameraPreview:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
-        self.enabled = bool(args.show_camera_window and not args.no_window)
+        self.enabled = bool((args.show_camera_window or args.show_mask_window) and not args.no_window)
         self.cv2 = None
         self.window_name = str(args.camera_window_name)
 
@@ -957,18 +1001,85 @@ class LiveCameraPreview:
         if self.enabled and self.cv2 is not None:
             self.cv2.destroyWindow(self.window_name)
 
-    def show(self, rgb: np.ndarray) -> bool:
+    def show(
+        self,
+        rgb: np.ndarray,
+        *,
+        mask: np.ndarray | None = None,
+        mask_preview: dict[str, Any] | None = None,
+        box_xyxy: list[float] | tuple[float, float, float, float] | None = None,
+    ) -> bool:
         if not self.enabled:
             return True
         if self.cv2 is None:
             self.cv2 = require_cv2()
-        image = self.cv2.cvtColor(np.asarray(rgb), self.cv2.COLOR_RGB2BGR)
+        image_rgb = np.asarray(rgb, dtype=np.uint8).copy()
+        if mask_preview is not None:
+            try:
+                mask = decode_mask_preview(mask_preview)
+            except Exception:
+                mask = None
+        if mask is not None:
+            image_rgb = self._overlay_mask(image_rgb, mask)
+        if box_xyxy is not None:
+            image_rgb = self._draw_box(image_rgb, box_xyxy)
+        image = self.cv2.cvtColor(image_rgb, self.cv2.COLOR_RGB2BGR)
         scale = float(self.args.camera_window_scale)
         if abs(scale - 1.0) > 1e-12:
             image = self.cv2.resize(image, None, fx=scale, fy=scale, interpolation=self.cv2.INTER_NEAREST)
         self.cv2.imshow(self.window_name, image)
         key = self.cv2.waitKey(1) & 0xFF
         return key not in (ord("q"), 27)
+
+    def show_result(self, rgb: np.ndarray, result: dict[str, Any]) -> bool:
+        mask_payload = result.get("mask")
+        if not isinstance(mask_payload, dict):
+            return self.show(rgb)
+        return self.show(
+            rgb,
+            mask_preview=mask_payload.get("preview"),
+            box_xyxy=mask_payload.get("box_xyxy"),
+        )
+
+    def _overlay_mask(self, image_rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        mask_bool = self._mask_for_image(mask, image_rgb.shape[:2])
+        if not np.any(mask_bool):
+            return image_rgb
+        alpha = float(self.args.mask_overlay_alpha)
+        color = np.array([0, 255, 0], dtype=np.float32)
+        overlay = image_rgb.astype(np.float32)
+        overlay[mask_bool] = overlay[mask_bool] * (1.0 - alpha) + color * alpha
+        return np.clip(overlay, 0, 255).astype(np.uint8)
+
+    def _mask_for_image(self, mask: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+        mask_u8 = np.asarray(mask, dtype=np.uint8)
+        if mask_u8.shape[:2] == shape:
+            return mask_u8.astype(bool)
+        if self.cv2 is None:
+            self.cv2 = require_cv2()
+        resized = self.cv2.resize(mask_u8, (int(shape[1]), int(shape[0])), interpolation=self.cv2.INTER_NEAREST)
+        return np.asarray(resized, dtype=np.uint8).astype(bool)
+
+    @staticmethod
+    def _draw_box(
+        image_rgb: np.ndarray,
+        box_xyxy: list[float] | tuple[float, float, float, float],
+    ) -> np.ndarray:
+        if len(box_xyxy) != 4:
+            return image_rgb
+        height, width = image_rgb.shape[:2]
+        x0, y0, x1, y1 = [int(round(float(value))) for value in box_xyxy]
+        x0 = max(0, min(width - 1, x0))
+        x1 = max(0, min(width - 1, x1))
+        y0 = max(0, min(height - 1, y0))
+        y1 = max(0, min(height - 1, y1))
+        if x1 < x0 or y1 < y0:
+            return image_rgb
+        image_rgb[y0 : y1 + 1, x0] = [255, 0, 0]
+        image_rgb[y0 : y1 + 1, x1] = [255, 0, 0]
+        image_rgb[y0, x0 : x1 + 1] = [255, 0, 0]
+        image_rgb[y1, x0 : x1 + 1] = [255, 0, 0]
+        return image_rgb
 
 
 def compute_fk(robot, ee_link: str, base_link: str) -> np.ndarray:

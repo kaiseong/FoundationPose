@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from http.server import ThreadingHTTPServer
 import subprocess
 import sys
@@ -19,6 +20,13 @@ from visual_servoing.visual_servo_protocol import (
 )
 from visual_servoing.visual_servo_server import VisualServoService, make_handler
 from visual_servoing.point_pose.rgbd_geometry import CameraIntrinsics
+
+
+def _decode_mask_preview(preview):
+    assert preview["encoding"] == "packbits-b64-v1"
+    height, width = preview["shape"]
+    packed = np.frombuffer(base64.b64decode(preview["data"].encode("ascii")), dtype=np.uint8)
+    return np.unpackbits(packed, count=height * width).reshape((height, width)).astype(bool)
 
 
 class FakeSegmenter:
@@ -105,6 +113,31 @@ def test_server_returns_t5_position_only_action_with_current_rotation_preserved(
         atol=1e-12,
     )
     assert payload["servo_step"]["wrist_step_rad"] == 0.0
+
+
+def test_server_omits_mask_preview_by_default():
+    request = decode_visual_servo_request(_request_body())
+    payload = VisualServoService(segmenter_factory=FakeSegmenter).handle(request)
+
+    assert payload["ok"] is True
+    assert "preview" not in payload["mask"]
+
+
+def test_server_returns_optional_packbits_mask_preview():
+    metadata = {
+        "ee_link": "link_right_arm_6",
+        "max_translation_step_m": 0.02,
+        "return_mask_preview": True,
+    }
+    request = decode_visual_servo_request(_request_body_with_metadata(metadata))
+
+    payload = VisualServoService(segmenter_factory=FakeSegmenter).handle(request)
+
+    assert payload["ok"] is True
+    decoded = _decode_mask_preview(payload["mask"]["preview"])
+    expected = np.zeros((10, 10), dtype=bool)
+    expected[2:8, 2:8] = True
+    np.testing.assert_array_equal(decoded, expected)
 
 
 def test_server_module_import_does_not_require_robot_sdk():
