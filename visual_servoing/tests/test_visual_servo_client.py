@@ -60,13 +60,31 @@ class FakeCommandHandler:
 class FakeCommandRobot:
     def __init__(self):
         self.send_args = None
+        self.cancel_calls = 0
+        self.wait_calls: list[int] = []
+        self.control_state = FakeRby.ControlManagerState.ControlState.Idle
 
     def send_command(self, *args):
         self.send_args = args
         return FakeCommandHandler()
 
+    def get_control_manager_state(self):
+        return SimpleNamespace(control_state=self.control_state)
+
+    def cancel_control(self):
+        self.cancel_calls += 1
+
+    def wait_for_control_ready(self, timeout_ms):
+        self.wait_calls.append(int(timeout_ms))
+        return True
+
 
 class FakeRby:
+    class ControlManagerState:
+        class ControlState:
+            Idle = "idle"
+            Running = "running"
+
     CartesianImpedanceControlCommandBuilder = FakeBuilder
     CommandHeaderBuilder = FakeBuilder
     RobotCommandBuilder = FakeBuilder
@@ -256,6 +274,19 @@ def test_send_right_arm_cartesian_uses_sdk_send_command_without_timeout_argument
     assert feedback == {"finish_code": "ok"}
     assert robot.send_args is not None
     assert len(robot.send_args) == 1
+    assert robot.wait_calls == [1000]
+
+
+def test_send_right_arm_cartesian_cancels_active_control_before_waiting():
+    args = parse_args(["--live", "--control-ready-timeout-ms", "2500"])
+    robot = FakeCommandRobot()
+    robot.control_state = FakeRby.ControlManagerState.ControlState.Running
+    context = RobotContext(args, robot=robot, rby=FakeRby)
+
+    context.send_right_arm_cartesian(np.eye(4))
+
+    assert robot.cancel_calls == 1
+    assert robot.wait_calls == [2500]
 
 
 def test_validate_execute_rejects_non_right_arm_ee_link():

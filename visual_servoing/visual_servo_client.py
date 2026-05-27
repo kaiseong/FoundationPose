@@ -172,6 +172,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ee-link", default="link_right_arm_6")
     parser.add_argument("--command-min-time-s", type=float, default=0.25)
     parser.add_argument("--command-timeout-s", type=float, default=2.0)
+    parser.add_argument("--control-ready-timeout-ms", type=int, default=1000)
     parser.add_argument("--linear-limit", type=float, default=1.0)
     parser.add_argument("--angular-limit", type=float, default=math.pi / 2.0)
     parser.add_argument("--linear-gain", type=float, default=50.0)
@@ -724,7 +725,9 @@ class RobotContext:
                 raise RuntimeError("Failed to reset control manager")
         if not robot.enable_control_manager():
             raise RuntimeError("Failed to enable control manager")
-        return cls(args, robot=robot, rby=rby)
+        context = cls(args, robot=robot, rby=rby)
+        context.wait_for_control_ready()
+        return context
 
     @property
     def execute(self) -> bool:
@@ -738,6 +741,7 @@ class RobotContext:
     def send_right_arm_cartesian(self, target_t5_T_ee: np.ndarray) -> dict[str, Any]:
         if self.robot is None or self.rby is None:
             raise RuntimeError("Robot is not connected.")
+        self.wait_for_control_ready()
         rby = self.rby
         builder = (
             rby.CartesianImpedanceControlCommandBuilder()
@@ -767,6 +771,19 @@ class RobotContext:
         feedback = self.robot.send_command(command).get()
         finish_code = getattr(feedback, "finish_code", None)
         return {"finish_code": str(finish_code)}
+
+    def wait_for_control_ready(self) -> None:
+        if self.robot is None or self.rby is None:
+            return
+        state = self.robot.get_control_manager_state()
+        control_state = getattr(state, "control_state", None)
+        idle_state = getattr(self.rby.ControlManagerState.ControlState, "Idle", None)
+        if idle_state is not None and control_state != idle_state and hasattr(self.robot, "cancel_control"):
+            self.robot.cancel_control()
+        if hasattr(self.robot, "wait_for_control_ready"):
+            ready = self.robot.wait_for_control_ready(int(self.args.control_ready_timeout_ms))
+            if not ready:
+                raise RuntimeError("wait_for_control_ready timed out before Cartesian command")
 
     def close(self) -> None:
         if self.robot is not None:
