@@ -10,6 +10,8 @@ import numpy as np
 import pytest
 
 from visual_servoing.visual_servo_client import (
+    DEFAULT_T5_HEAD_XYZ_RPY,
+    LiveCameraPreview,
     RIGHT_ARM_CONTROL_ROOT_LINK,
     RobotContext,
     ServoLimits,
@@ -18,6 +20,7 @@ from visual_servoing.visual_servo_client import (
     plan_visual_servo_step,
     process_remote_servo_iteration,
     parse_args,
+    fixed_t5_T_camera,
     remote_request_metadata,
     run_remote_fixture,
     signed_angle_about_axis,
@@ -32,6 +35,7 @@ class FakeRobotContext:
     def __init__(self, *, execute: bool = True):
         self.execute = execute
         self.sent_targets: list[np.ndarray] = []
+        self.cancel_reasons: list[str] = []
 
     def current_ee_pose(self):
         return np.eye(4)
@@ -39,6 +43,10 @@ class FakeRobotContext:
     def send_right_arm_cartesian(self, target_t5_T_ee):
         self.sent_targets.append(np.asarray(target_t5_T_ee, dtype=np.float64).copy())
         return {"finish_code": "ok"}
+
+    def cancel_command_stream(self, reason: str):
+        self.cancel_reasons.append(str(reason))
+        return {"transport": "command_stream", "cancelled": True, "control_cancelled": True, "reason": str(reason)}
 
 
 class FakeBuilder:
@@ -57,19 +65,57 @@ class FakeCommandHandler:
         return SimpleNamespace(finish_code="ok")
 
 
+class FakeCommandStream:
+    def __init__(self):
+        self.send_args = None
+        self.cancel_calls = 0
+        self.done = False
+
+    def send_command(self, *args):
+        self.send_args = args
+        return SimpleNamespace(finish_code="stream-ok", status="streaming", valid=True)
+
+    def is_done(self):
+        return self.done
+
+    def cancel(self):
+        self.cancel_calls += 1
+        self.done = True
+
+
 class FakeCommandRobot:
     def __init__(self):
         self.send_args = None
         self.cancel_calls = 0
         self.wait_calls: list[int] = []
+        self.manager_state = FakeRby.ControlManagerState.State.Enabled
         self.control_state = FakeRby.ControlManagerState.ControlState.Idle
+        self.streams: list[FakeCommandStream] = []
+        self.reset_fault_calls = 0
+        self.enable_calls = 0
 
     def send_command(self, *args):
         self.send_args = args
         return FakeCommandHandler()
 
+    def create_command_stream(self, *args, **kwargs):
+        del args, kwargs
+        stream = FakeCommandStream()
+        self.streams.append(stream)
+        return stream
+
     def get_control_manager_state(self):
-        return SimpleNamespace(control_state=self.control_state)
+        return SimpleNamespace(state=self.manager_state, control_state=self.control_state)
+
+    def reset_fault_control_manager(self):
+        self.reset_fault_calls += 1
+        self.manager_state = FakeRby.ControlManagerState.State.Enabled
+        return True
+
+    def enable_control_manager(self):
+        self.enable_calls += 1
+        self.manager_state = FakeRby.ControlManagerState.State.Enabled
+        return True
 
     def cancel_control(self):
         self.cancel_calls += 1
@@ -81,11 +127,17 @@ class FakeCommandRobot:
 
 class FakeRby:
     class ControlManagerState:
+        class State:
+            Enabled = "enabled"
+            MajorFault = "major_fault"
+            MinorFault = "minor_fault"
+
         class ControlState:
             Idle = "idle"
             Running = "running"
 
     CartesianImpedanceControlCommandBuilder = FakeBuilder
+    JointPositionCommandBuilder = FakeBuilder
     CommandHeaderBuilder = FakeBuilder
     RobotCommandBuilder = FakeBuilder
     ComponentBasedCommandBuilder = FakeBuilder
@@ -150,6 +202,81 @@ def test_make_transform_from_xyz_rpy_translation_and_rotation():
 
     np.testing.assert_allclose(transform[:3, 3], [0.1, 0.2, 0.3])
     np.testing.assert_allclose(transform[:3, :3] @ [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], atol=1e-12)
+
+
+def test_default_fixed_camera_pose_uses_head_1_45_degree_basis():
+    args = parse_args(["--live"])
+
+    assert tuple(args.t5_head_pose) == DEFAULT_T5_HEAD_XYZ_RPY
+    expected = make_transform_from_xyz_rpy(DEFAULT_T5_HEAD_XYZ_RPY) @ make_transform_from_xyz_rpy(
+        args.head_camera_pose
+    )
+    np.testing.assert_allclose(fixed_t5_T_camera(args), expected, atol=1e-12)
+
+
+def test_camera_preview_disabled_by_default():
+    args = parse_args(["--live"])
+
+    assert LiveCameraPreview(args).show(np.zeros((2, 2, 3), dtype=np.uint8)) is True
+
+
+def test_camera_preview_shows_rgb_frame_and_allows_q_to_stop(monkeypatch):
+    class FakeCv2:
+        COLOR_RGB2BGR = 1
+        WINDOW_NORMAL = 2
+        INTER_NEAREST = 3
+
+        def __init__(self):
+            self.windows = []
+            self.images = []
+            self.destroyed = []
+
+        def namedWindow(self, name, flag):
+            self.windows.append((name, flag))
+
+        def cvtColor(self, image, code):
+            assert code == self.COLOR_RGB2BGR
+            return image[..., ::-1]
+
+        def resize(self, image, *args, **kwargs):
+            del args, kwargs
+            return image
+
+        def imshow(self, name, image):
+            self.images.append((name, image.copy()))
+
+        def waitKey(self, delay_ms):
+            assert delay_ms == 1
+            return ord("q")
+
+        def destroyWindow(self, name):
+            self.destroyed.append(name)
+
+    fake_cv2 = FakeCv2()
+    import visual_servoing.visual_servo_client as client
+
+    monkeypatch.setattr(client, "require_cv2", lambda: fake_cv2)
+    args = parse_args(["--live", "--show-camera-window", "--camera-window-scale", "2.0"])
+    rgb = np.array([[[1, 2, 3]]], dtype=np.uint8)
+
+    with LiveCameraPreview(args) as preview:
+        keep_running = preview.show(rgb)
+
+    assert keep_running is False
+    assert fake_cv2.windows == [("visual_servo_client", fake_cv2.WINDOW_NORMAL)]
+    assert fake_cv2.destroyed == ["visual_servo_client"]
+    assert fake_cv2.images[0][0] == "visual_servo_client"
+    np.testing.assert_array_equal(fake_cv2.images[0][1], np.array([[[3, 2, 1]]], dtype=np.uint8))
+
+
+def test_no_window_disables_camera_preview_even_when_requested(monkeypatch):
+    import visual_servoing.visual_servo_client as client
+
+    monkeypatch.setattr(client, "require_cv2", lambda: pytest.fail("cv2 should not be loaded"))
+    args = parse_args(["--live", "--show-camera-window", "--no-window"])
+
+    with LiveCameraPreview(args) as preview:
+        assert preview.show(np.zeros((2, 2, 3), dtype=np.uint8)) is True
 
 
 def test_clamp_translation_step_limits_norm():
@@ -264,17 +391,26 @@ def test_dry_run_context_does_not_import_robot_sdk(monkeypatch):
     np.testing.assert_allclose(pose, np.eye(4))
 
 
-def test_send_right_arm_cartesian_uses_sdk_send_command_without_timeout_argument():
-    args = parse_args(["--live"])
+def test_send_right_arm_cartesian_uses_command_stream_with_timeout():
+    args = parse_args(["--live", "--command-priority", "7", "--command-timeout-s", "1.25"])
     robot = FakeCommandRobot()
     context = RobotContext(args, robot=robot, rby=FakeRby)
 
     feedback = context.send_right_arm_cartesian(np.eye(4))
 
-    assert feedback == {"finish_code": "ok"}
-    assert robot.send_args is not None
-    assert len(robot.send_args) == 1
-    assert robot.wait_calls == [1000]
+    assert feedback == {
+        "finish_code": "stream-ok",
+        "status": "streaming",
+        "valid": "True",
+        "transport": "command_stream",
+        "stream_done": False,
+    }
+    assert robot.send_args is None
+    assert len(robot.streams) == 1
+    assert robot.streams[0].send_args is not None
+    assert len(robot.streams[0].send_args) == 2
+    assert robot.streams[0].send_args[1] == 1250
+    assert robot.wait_calls == []
 
 
 def test_send_right_arm_cartesian_cancels_active_control_before_waiting():
@@ -285,8 +421,115 @@ def test_send_right_arm_cartesian_cancels_active_control_before_waiting():
 
     context.send_right_arm_cartesian(np.eye(4))
 
-    assert robot.cancel_calls == 1
+    assert robot.cancel_calls == 0
+    assert robot.wait_calls == []
+
+
+def test_send_right_arm_cartesian_reopens_done_stream_after_waiting():
+    args = parse_args(["--live", "--control-ready-timeout-ms", "2500"])
+    robot = FakeCommandRobot()
+    context = RobotContext(args, robot=robot, rby=FakeRby)
+    context.open_command_stream()
+    robot.streams[0].done = True
+
+    context.send_right_arm_cartesian(np.eye(4))
+
+    assert len(robot.streams) == 2
     assert robot.wait_calls == [2500]
+
+
+def test_wait_for_control_ready_recovers_control_manager_fault():
+    args = parse_args(["--live", "--control-ready-timeout-ms", "2500"])
+    robot = FakeCommandRobot()
+    robot.manager_state = FakeRby.ControlManagerState.State.MinorFault
+    context = RobotContext(args, robot=robot, rby=FakeRby)
+
+    context.wait_for_control_ready()
+
+    assert robot.reset_fault_calls == 1
+    assert robot.enable_calls == 1
+    assert robot.wait_calls == [2500]
+
+
+def test_done_stream_reopen_recovers_control_manager_fault_before_waiting():
+    args = parse_args(["--live", "--control-ready-timeout-ms", "2500"])
+    robot = FakeCommandRobot()
+    context = RobotContext(args, robot=robot, rby=FakeRby)
+    context.open_command_stream()
+    robot.streams[0].done = True
+    robot.manager_state = FakeRby.ControlManagerState.State.MajorFault
+
+    context.send_right_arm_cartesian(np.eye(4))
+
+    assert robot.reset_fault_calls == 1
+    assert robot.enable_calls == 1
+    assert robot.wait_calls == [2500]
+    assert len(robot.streams) == 2
+
+
+def test_cancel_command_stream_stops_stream_and_control_until_next_valid_command():
+    args = parse_args(["--live", "--control-ready-timeout-ms", "2500"])
+    robot = FakeCommandRobot()
+    context = RobotContext(args, robot=robot, rby=FakeRby)
+    context.open_command_stream()
+
+    feedback = context.cancel_command_stream("lost target")
+
+    assert feedback["cancelled"] is True
+    assert feedback["control_cancelled"] is True
+    assert feedback["reason"] == "lost target"
+    assert robot.streams[0].cancel_calls == 1
+    assert robot.cancel_calls == 1
+    assert context.command_stream is None
+
+    robot.control_state = FakeRby.ControlManagerState.ControlState.Running
+    context.send_right_arm_cartesian(np.eye(4))
+
+    assert len(robot.streams) == 2
+    assert robot.wait_calls == [2500]
+    assert robot.cancel_calls == 2
+
+
+def test_move_right_arm_to_ready_pose_sends_joint_command_and_waits():
+    args = parse_args(
+        [
+            "--live",
+            "--command-priority",
+            "9",
+            "--ready-min-time-s",
+            "2.5",
+            "--ready-hold-time-s",
+            "3.5",
+        ]
+    )
+    robot = FakeCommandRobot()
+    context = RobotContext(args, robot=robot, rby=FakeRby)
+
+    feedback = context.move_right_arm_to_ready_pose()
+
+    assert feedback == {"finish_code": "ok"}
+    assert robot.send_args is not None
+    assert len(robot.send_args) == 2
+    assert robot.send_args[1] == 9
+    assert robot.wait_calls == [1000, 1000]
+
+
+def test_close_cancels_command_stream_before_disconnect():
+    args = parse_args(["--live"])
+    robot = FakeCommandRobot()
+    robot.disconnect_calls = 0
+
+    def disconnect():
+        robot.disconnect_calls += 1
+
+    robot.disconnect = disconnect
+    context = RobotContext(args, robot=robot, rby=FakeRby)
+    context.open_command_stream()
+
+    context.close()
+
+    assert robot.streams[0].cancel_calls == 1
+    assert robot.disconnect_calls == 1
 
 
 def test_validate_execute_rejects_non_right_arm_ee_link():
@@ -302,6 +545,7 @@ def test_validate_execute_defaults_to_m_model_and_all_power_servo():
     assert args.model == "m"
     assert args.power == ".*"
     assert args.servo == ".*"
+    assert args.move_to_ready_on_connect is False
     validate_args(args)
 
 
@@ -321,6 +565,26 @@ def test_validate_execute_rejects_empty_power_or_servo_pattern():
     args = parse_args(["--live", "--execute", "--address", "127.0.0.1:50051", "--servo", ""])
 
     with pytest.raises(SystemExit, match="--servo cannot be empty"):
+        validate_args(args)
+
+
+def test_validate_execute_rejects_invalid_ready_or_priority_values():
+    for flag, value in [
+        ("--command-priority", "-1"),
+        ("--command-hold-time-s", "0"),
+        ("--command-timeout-s", "0"),
+        ("--ready-min-time-s", "0"),
+        ("--ready-hold-time-s", "0"),
+    ]:
+        args = parse_args(["--live", "--execute", "--address", "127.0.0.1:50051", flag, value])
+        with pytest.raises(SystemExit):
+            validate_args(args)
+
+
+def test_validate_rejects_invalid_camera_window_scale():
+    args = parse_args(["--live", "--show-camera-window", "--camera-window-scale", "0"])
+
+    with pytest.raises(SystemExit):
         validate_args(args)
 
 
@@ -457,6 +721,9 @@ def test_remote_iteration_rejects_stale_before_command_path(monkeypatch):
     assert result["remote"]["action_executable"] is False
     assert "stale" in result["reason"]
     assert robot_context.sent_targets == []
+    assert len(robot_context.cancel_reasons) == 1
+    assert "stale" in robot_context.cancel_reasons[0]
+    assert result["command_feedback"]["cancelled"] is True
     np.testing.assert_allclose(next_pose, np.eye(4))
 
 
@@ -476,6 +743,8 @@ def test_remote_iteration_no_command_statuses_never_execute(monkeypatch, status)
     assert result["command_sent"] is False
     assert result["remote"]["action_executable"] is False
     assert robot_context.sent_targets == []
+    assert len(robot_context.cancel_reasons) == 1
+    assert result["command_feedback"]["cancelled"] is True
     np.testing.assert_allclose(next_pose, np.eye(4))
 
 
@@ -495,6 +764,8 @@ def test_remote_iteration_wrong_root_never_executes(monkeypatch):
     assert result["remote"]["action_executable"] is False
     assert "root_link" in result["reason"]
     assert robot_context.sent_targets == []
+    assert len(robot_context.cancel_reasons) == 1
+    assert "root_link" in robot_context.cancel_reasons[0]
 
 
 def test_remote_iteration_ok_false_never_executes(monkeypatch):
@@ -512,6 +783,8 @@ def test_remote_iteration_ok_false_never_executes(monkeypatch):
     assert result["ok"] is False
     assert result["command_sent"] is False
     assert robot_context.sent_targets == []
+    assert len(robot_context.cancel_reasons) == 1
+    assert "segmentation failed" in robot_context.cancel_reasons[0]
 
 
 def test_remote_fixture_does_not_stop_on_invalid_converged_status(monkeypatch, capsys):

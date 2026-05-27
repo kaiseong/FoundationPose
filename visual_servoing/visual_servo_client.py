@@ -42,9 +42,11 @@ if _ADDED_PACKAGE_PARENT is not None:
     sys.path.remove(_ADDED_PACKAGE_PARENT)
 
 
+DEFAULT_T5_HEAD_XYZ_RPY = (0.0, 0.0, 0.0, 0.0, 45.0, 0.0)
 HEAD_TO_CAMERA_XYZ_RPY = (0.047, 0.009, 0.057, -90.0, 0.0, -90.0)
 DEFAULT_RIGHT_ARM_STIFFNESS = (90.0, 90.0, 90.0, 70.0, 70.0, 70.0, 70.0)
 DEFAULT_RIGHT_ARM_TORQUE_LIMIT = (40.0, 40.0, 40.0, 30.0, 30.0, 30.0, 30.0)
+RIGHT_ARM_CARTESIAN_READY_POSE_DEG = (0.0, -5.0, 0.0, -120.0, 0.0, 40.0, 0.0)
 RIGHT_ARM_CONTROL_ROOT_LINK = servo_core.RIGHT_ARM_CONTROL_ROOT_LINK
 RIGHT_ARM_EE_LINKS = servo_core.RIGHT_ARM_EE_LINKS
 REMOTE_OFFSET_FRAME = servo_core.REMOTE_OFFSET_FRAME
@@ -106,7 +108,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-iterations", type=int, default=1, help="0 means run until interrupted.")
     parser.add_argument("--loop-sleep-s", type=float, default=0.0)
     parser.add_argument("--print-json", action="store_true", help="Accepted for compatibility; JSON is always printed.")
-    parser.add_argument("--no-window", action="store_true", help="Accepted for compatibility; this client prints diagnostics.")
+    parser.add_argument("--no-window", action="store_true", help="Disable any local OpenCV preview window.")
+    parser.add_argument(
+        "--show-camera-window",
+        action="store_true",
+        help="Show the current UPC-side live RGB frame in an OpenCV window. Press q or Esc to stop.",
+    )
+    parser.add_argument("--camera-window-name", default="visual_servo_client")
+    parser.add_argument("--camera-window-scale", type=float, default=1.0)
 
     parser.add_argument(
         "--ee-offset",
@@ -144,9 +153,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--t5-head-pose",
         type=float,
         nargs=6,
-        default=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        default=DEFAULT_T5_HEAD_XYZ_RPY,
         metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"),
-        help="Fixed T5-to-head pose for dry-run/live geometry. Defaults to identity.",
+        help="Fixed T5-to-head pose for dry-run/live geometry. Defaults to head_1=45 deg.",
     )
     parser.add_argument(
         "--head-camera-pose",
@@ -171,8 +180,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--control-root-link", default=RIGHT_ARM_CONTROL_ROOT_LINK)
     parser.add_argument("--ee-link", default="link_right_arm_6")
     parser.add_argument("--command-min-time-s", type=float, default=0.25)
+    parser.add_argument("--command-hold-time-s", type=float, default=0.5)
     parser.add_argument("--command-timeout-s", type=float, default=2.0)
+    parser.add_argument("--command-priority", type=int, default=10)
     parser.add_argument("--control-ready-timeout-ms", type=int, default=1000)
+    parser.add_argument(
+        "--move-to-ready-on-connect",
+        action="store_true",
+        help="Move only the right arm to a Cartesian-ready bent pose before visual servo commands.",
+    )
+    parser.add_argument("--ready-min-time-s", type=float, default=3.0)
+    parser.add_argument("--ready-hold-time-s", type=float, default=4.0)
     parser.add_argument("--linear-limit", type=float, default=1.0)
     parser.add_argument("--angular-limit", type=float, default=math.pi / 2.0)
     parser.add_argument("--linear-gain", type=float, default=50.0)
@@ -206,6 +224,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--remote-server requires a live camera mode or --remote-fixture-request")
     if args.remote_server and any(abs(float(value)) > 1e-12 for value in args.object_offset):
         raise SystemExit("--object-offset is object-frame SE(3); use --target-offset-t5 X Y Z for remote position-only servo")
+    if args.camera_window_scale <= 0.0:
+        raise SystemExit("--camera-window-scale must be > 0")
     if args.execute:
         validate_execute_safety(args)
     if not is_live_mode(args) and not args.remote_fixture_request:
@@ -229,6 +249,16 @@ def validate_execute_safety(args: argparse.Namespace) -> None:
         raise SystemExit(f"--execute is restricted to right-arm EE links: {allowed}")
     validate_component_pattern("--power", args.power)
     validate_component_pattern("--servo", args.servo)
+    if args.command_priority < 0:
+        raise SystemExit("--command-priority must be >= 0")
+    if args.command_hold_time_s <= 0.0:
+        raise SystemExit("--command-hold-time-s must be > 0")
+    if args.command_timeout_s <= 0.0:
+        raise SystemExit("--command-timeout-s must be > 0")
+    if args.ready_min_time_s <= 0.0:
+        raise SystemExit("--ready-min-time-s must be > 0")
+    if args.ready_hold_time_s <= 0.0:
+        raise SystemExit("--ready-hold-time-s must be > 0")
 
 
 def validate_component_pattern(flag: str, value: str) -> None:
@@ -289,7 +319,7 @@ def run_live(args: argparse.Namespace) -> int:
         previous_object_transform = None
         current_t5_T_ee = robot_context.current_ee_pose()
         t5_T_camera = fixed_t5_T_camera(args)
-        with LiveRgbdCamera(
+        with LiveCameraPreview(args) as preview, LiveRgbdCamera(
             model=camera_model,
             serial=args.serial,
             width=args.width,
@@ -298,6 +328,8 @@ def run_live(args: argparse.Namespace) -> int:
         ) as camera:
             for frame_index in iteration_range(args.max_iterations):
                 frame = camera.read(timeout_ms=args.frame_timeout_ms)
+                if not preview.show(frame.rgb):
+                    break
                 try:
                     selection = segmenter.segment(frame.rgb)
                     result, previous_object_transform, current_t5_T_ee = process_servo_iteration(
@@ -319,6 +351,10 @@ def run_live(args: argparse.Namespace) -> int:
                     }
                 except Exception as exc:
                     result = skipped_result(args, frame_index, str(exc))
+                    if args.execute:
+                        result["command_feedback"] = robot_context.cancel_command_stream(
+                            f"local segmentation skipped: {exc}"
+                        )
                 print(json.dumps(result, separators=(",", ":")))
                 if result.get("ok") is True and result.get("status") == "converged":
                     break
@@ -335,7 +371,7 @@ def run_remote_live(args: argparse.Namespace) -> int:
     try:
         current_t5_T_ee = robot_context.current_ee_pose()
         t5_T_camera = fixed_t5_T_camera(args)
-        with LiveRgbdCamera(
+        with LiveCameraPreview(args) as preview, LiveRgbdCamera(
             model=camera_model,
             serial=args.serial,
             width=args.width,
@@ -344,6 +380,8 @@ def run_remote_live(args: argparse.Namespace) -> int:
         ) as camera:
             for frame_index in iteration_range(args.max_iterations):
                 frame = camera.read(timeout_ms=args.frame_timeout_ms)
+                if not preview.show(frame.rgb):
+                    break
                 result, current_t5_T_ee = process_remote_servo_iteration(
                     args,
                     rgb=frame.rgb,
@@ -448,6 +486,8 @@ def process_remote_servo_iteration(
         if args.execute:
             command_feedback = robot_context.send_right_arm_cartesian(validation.target_t5_T_ee)
             command_sent = True
+    elif args.execute:
+        command_feedback = robot_context.cancel_command_stream(validation.reason)
     result = remote_diagnostic_payload(
         args,
         frame_index=frame_index,
@@ -614,6 +654,8 @@ def process_servo_iteration(
             command_feedback = robot_context.send_right_arm_cartesian(step.target_t5_T_ee)
             command_sent = True
             reason = "right-arm Cartesian command sent"
+        elif args.execute:
+            command_feedback = robot_context.cancel_command_stream(reason)
         result = diagnostic_payload(
             args,
             frame_index=frame_index,
@@ -625,7 +667,10 @@ def process_servo_iteration(
         )
         return result, observation.camera_T_object, step.target_t5_T_ee
     except Exception as exc:
-        return skipped_result(args, frame_index, str(exc)), previous_object_transform, current_t5_T_ee
+        result = skipped_result(args, frame_index, str(exc))
+        if args.execute:
+            result["command_feedback"] = robot_context.cancel_command_stream(f"local servo skipped: {exc}")
+        return result, previous_object_transform, current_t5_T_ee
 
 
 def command_reason(args: argparse.Namespace, step: ServoStep) -> str:
@@ -702,6 +747,8 @@ class RobotContext:
         self.args = args
         self.robot = robot
         self.rby = rby
+        self.command_stream = None
+        self.command_stream_cancelled_for_safety = False
 
     @classmethod
     def dry_run(cls, args: argparse.Namespace) -> "RobotContext":
@@ -717,16 +764,14 @@ class RobotContext:
             raise RuntimeError(f"Failed to turn power ({args.power}) on")
         if not robot.is_servo_on(args.servo) and not robot.servo_on(args.servo):
             raise RuntimeError(f"Failed to servo ({args.servo}) on")
-        if robot.get_control_manager_state().state in [
-            rby.ControlManagerState.State.MajorFault,
-            rby.ControlManagerState.State.MinorFault,
-        ]:
-            if not robot.reset_fault_control_manager():
-                raise RuntimeError("Failed to reset control manager")
-        if not robot.enable_control_manager():
-            raise RuntimeError("Failed to enable control manager")
         context = cls(args, robot=robot, rby=rby)
+        recovered_fault = context.reset_fault_control_manager_if_needed()
+        if not recovered_fault and not robot.enable_control_manager():
+            raise RuntimeError("Failed to enable control manager")
         context.wait_for_control_ready()
+        if args.move_to_ready_on_connect:
+            context.move_right_arm_to_ready_pose()
+        context.open_command_stream()
         return context
 
     @property
@@ -741,15 +786,15 @@ class RobotContext:
     def send_right_arm_cartesian(self, target_t5_T_ee: np.ndarray) -> dict[str, Any]:
         if self.robot is None or self.rby is None:
             raise RuntimeError("Robot is not connected.")
-        self.wait_for_control_ready()
         rby = self.rby
         builder = (
             rby.CartesianImpedanceControlCommandBuilder()
-            .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(30))
+            .set_command_header(
+                rby.CommandHeaderBuilder().set_control_hold_time(float(self.args.command_hold_time_s))
+            )
             .set_minimum_time(float(self.args.command_min_time_s))
-            .set_joint_stiffness(list(DEFAULT_RIGHT_ARM_STIFFNESS))
-            .set_joint_torque_limit(list(DEFAULT_RIGHT_ARM_TORQUE_LIMIT))
-            .add_joint_limit("right_arm_3", -2.6, -0.5)
+            .set_joint_stiffness(np.asarray(DEFAULT_RIGHT_ARM_STIFFNESS, dtype=np.float64))
+            .set_joint_torque_limit(np.asarray(DEFAULT_RIGHT_ARM_TORQUE_LIMIT, dtype=np.float64))
             .set_stop_joint_position_tracking_error(0)
             .set_stop_orientation_tracking_error(0)
             .set_joint_damping_ratio(0.6)
@@ -768,13 +813,113 @@ class RobotContext:
                 rby.BodyComponentBasedCommandBuilder().set_right_arm_command(builder)
             )
         )
-        feedback = self.robot.send_command(command).get()
-        finish_code = getattr(feedback, "finish_code", None)
-        return {"finish_code": str(finish_code)}
+        stream = self.ensure_command_stream()
+        feedback = stream.send_command(command, self.command_timeout_ms())
+        payload = self._feedback_payload(feedback)
+        payload["transport"] = "command_stream"
+        payload["stream_done"] = bool(stream.is_done()) if hasattr(stream, "is_done") else False
+        return payload
+
+    def open_command_stream(self):
+        if self.robot is None:
+            raise RuntimeError("Robot is not connected.")
+        self.command_stream = self.robot.create_command_stream(priority=int(self.args.command_priority))
+        return self.command_stream
+
+    def ensure_command_stream(self):
+        if self.command_stream is None:
+            if self.command_stream_cancelled_for_safety:
+                self.wait_for_control_ready()
+                self.command_stream_cancelled_for_safety = False
+            return self.open_command_stream()
+        if hasattr(self.command_stream, "is_done") and self.command_stream.is_done():
+            self.command_stream = None
+            self.wait_for_control_ready()
+            self.command_stream_cancelled_for_safety = False
+            return self.open_command_stream()
+        return self.command_stream
+
+    def cancel_command_stream(self, reason: str) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "transport": "command_stream",
+            "cancelled": False,
+            "control_cancelled": False,
+            "reason": str(reason),
+        }
+        if self.command_stream is not None and hasattr(self.command_stream, "cancel"):
+            self.command_stream.cancel()
+            payload["cancelled"] = True
+            if hasattr(self.command_stream, "is_done"):
+                payload["stream_done"] = bool(self.command_stream.is_done())
+        self.command_stream = None
+        self.command_stream_cancelled_for_safety = True
+        if self.robot is not None and hasattr(self.robot, "cancel_control"):
+            self.robot.cancel_control()
+            payload["control_cancelled"] = True
+        return payload
+
+    def reset_fault_control_manager_if_needed(self) -> bool:
+        if self.robot is None or self.rby is None:
+            return False
+        state = self.robot.get_control_manager_state()
+        manager_state = getattr(state, "state", None)
+        state_enum = getattr(self.rby.ControlManagerState, "State", None)
+        if state_enum is None:
+            return False
+        fault_states = tuple(
+            getattr(state_enum, name)
+            for name in ("MajorFault", "MinorFault")
+            if hasattr(state_enum, name)
+        )
+        if manager_state not in fault_states:
+            return False
+        if not self.robot.reset_fault_control_manager():
+            raise RuntimeError("Failed to reset control manager")
+        if not self.robot.enable_control_manager():
+            raise RuntimeError("Failed to enable control manager")
+        return True
+
+    def command_timeout_ms(self) -> int:
+        return max(1, int(round(float(self.args.command_timeout_s) * 1000.0)))
+
+    def move_right_arm_to_ready_pose(self) -> dict[str, Any]:
+        if self.robot is None or self.rby is None:
+            raise RuntimeError("Robot is not connected.")
+        self.wait_for_control_ready()
+        rby = self.rby
+        ready_q = np.deg2rad(np.asarray(RIGHT_ARM_CARTESIAN_READY_POSE_DEG, dtype=np.float64))
+        command = rby.RobotCommandBuilder().set_command(
+            rby.ComponentBasedCommandBuilder().set_body_command(
+                rby.BodyComponentBasedCommandBuilder().set_right_arm_command(
+                    rby.JointPositionCommandBuilder()
+                    .set_command_header(
+                        rby.CommandHeaderBuilder().set_control_hold_time(float(self.args.ready_hold_time_s))
+                    )
+                    .set_minimum_time(float(self.args.ready_min_time_s))
+                    .set_position(ready_q)
+                )
+            )
+        )
+        feedback = self.robot.send_command(command, int(self.args.command_priority)).get()
+        payload = self._feedback_payload(feedback)
+        finish_code = payload.get("finish_code")
+        if finish_code not in {"FinishCode.Ok", "ok"}:
+            raise RuntimeError(f"right-arm ready pose command failed: {payload}")
+        self.wait_for_control_ready()
+        return payload
+
+    @staticmethod
+    def _feedback_payload(feedback) -> dict[str, Any]:
+        payload = {"finish_code": str(getattr(feedback, "finish_code", None))}
+        for name in ("status", "valid"):
+            if hasattr(feedback, name):
+                payload[name] = str(getattr(feedback, name))
+        return payload
 
     def wait_for_control_ready(self) -> None:
         if self.robot is None or self.rby is None:
             return
+        self.reset_fault_control_manager_if_needed()
         state = self.robot.get_control_manager_state()
         control_state = getattr(state, "control_state", None)
         idle_state = getattr(self.rby.ControlManagerState.ControlState, "Idle", None)
@@ -786,8 +931,44 @@ class RobotContext:
                 raise RuntimeError("wait_for_control_ready timed out before Cartesian command")
 
     def close(self) -> None:
+        if self.command_stream is not None and hasattr(self.command_stream, "cancel"):
+            self.command_stream.cancel()
+            self.command_stream = None
+        self.command_stream_cancelled_for_safety = False
         if self.robot is not None:
             self.robot.disconnect()
+
+
+class LiveCameraPreview:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.enabled = bool(args.show_camera_window and not args.no_window)
+        self.cv2 = None
+        self.window_name = str(args.camera_window_name)
+
+    def __enter__(self) -> "LiveCameraPreview":
+        if not self.enabled:
+            return self
+        self.cv2 = require_cv2()
+        self.cv2.namedWindow(self.window_name, self.cv2.WINDOW_NORMAL)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.enabled and self.cv2 is not None:
+            self.cv2.destroyWindow(self.window_name)
+
+    def show(self, rgb: np.ndarray) -> bool:
+        if not self.enabled:
+            return True
+        if self.cv2 is None:
+            self.cv2 = require_cv2()
+        image = self.cv2.cvtColor(np.asarray(rgb), self.cv2.COLOR_RGB2BGR)
+        scale = float(self.args.camera_window_scale)
+        if abs(scale - 1.0) > 1e-12:
+            image = self.cv2.resize(image, None, fx=scale, fy=scale, interpolation=self.cv2.INTER_NEAREST)
+        self.cv2.imshow(self.window_name, image)
+        key = self.cv2.waitKey(1) & 0xFF
+        return key not in (ord("q"), 27)
 
 
 def compute_fk(robot, ee_link: str, base_link: str) -> np.ndarray:
