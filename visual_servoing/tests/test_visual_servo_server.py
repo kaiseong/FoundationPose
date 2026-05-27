@@ -216,6 +216,26 @@ def test_server_rejects_invalid_ee_link_before_action_payload():
     assert "action" not in payload
 
 
+def test_server_ignores_broken_pipe_while_sending_response():
+    handler_cls = make_handler(VisualServoService(segmenter_factory=FakeSegmenter))
+    handler = object.__new__(handler_cls)
+    calls = []
+
+    class BrokenPipeWriter:
+        def write(self, data):
+            del data
+            raise BrokenPipeError()
+
+    handler.send_response = lambda status_code: calls.append(("response", status_code))
+    handler.send_header = lambda name, value: calls.append(("header", name, value))
+    handler.end_headers = lambda: calls.append(("end",))
+    handler.wfile = BrokenPipeWriter()
+
+    handler._send_json(200, {"ok": True})
+
+    assert calls[0] == ("response", 200)
+
+
 def test_server_rejects_bad_content_type():
     service = VisualServoService(segmenter_factory=FakeSegmenter)
     server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(service))

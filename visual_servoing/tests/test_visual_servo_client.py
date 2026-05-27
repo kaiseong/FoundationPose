@@ -32,6 +32,7 @@ from visual_servoing.visual_servo_client import (
     live_should_stop_after_result,
     remote_request_metadata,
     run_remote_fixture,
+    send_remote_visual_servo_request,
     signed_angle_about_axis,
     strip_mask_preview_for_logging,
     synthetic_rgbd_fixture,
@@ -619,6 +620,17 @@ def test_dry_run_context_does_not_import_robot_sdk(monkeypatch):
     pose = RobotContext.dry_run(args).current_ee_pose()
 
     np.testing.assert_allclose(pose, np.eye(4))
+
+
+def test_remote_request_timeout_has_actionable_message(monkeypatch):
+    def fake_urlopen(*args, **kwargs):
+        del args, kwargs
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr("visual_servoing.visual_servo_client.urllib_request.urlopen", fake_urlopen)
+
+    with pytest.raises(RuntimeError, match="timed out after 2.0s"):
+        send_remote_visual_servo_request("127.0.0.1:8080", b"body", timeout_s=2.0)
 
 
 def test_send_right_arm_cartesian_uses_command_stream_with_timeout():

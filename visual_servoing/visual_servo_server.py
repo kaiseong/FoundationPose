@@ -253,11 +253,14 @@ def make_handler(service: VisualServoService, *, max_content_length: int = DEFAU
 
         def _send_json(self, status_code: int, payload: dict[str, Any]) -> None:
             data = encode_visual_servo_response(payload)
-            self.send_response(status_code)
-            self.send_header("Content-Type", RESPONSE_CONTENT_TYPE)
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.send_response(status_code)
+                self.send_header("Content-Type", RESPONSE_CONTENT_TYPE)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                return
 
     return VisualServoHandler
 

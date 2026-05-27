@@ -13,6 +13,7 @@ import json
 import logging
 import math
 from pathlib import Path
+import socket
 import sys
 import time
 from typing import Any
@@ -574,7 +575,20 @@ def send_remote_visual_servo_request(server: str, body: bytes, *, timeout_s: flo
         except Exception:
             raise RuntimeError(f"remote visual servo server returned HTTP {exc.code}") from exc
         raise RuntimeError(payload.get("reason") or payload.get("error") or f"HTTP {exc.code}") from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise RuntimeError(remote_timeout_error(timeout_s)) from exc
+    except urllib_error.URLError as exc:
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            raise RuntimeError(remote_timeout_error(timeout_s)) from exc
+        raise RuntimeError(f"remote visual servo request failed: {exc.reason}") from exc
     return decode_visual_servo_response(data)
+
+
+def remote_timeout_error(timeout_s: float) -> str:
+    return (
+        f"remote visual servo request timed out after {float(timeout_s):.1f}s; "
+        "increase --remote-timeout-s for SAM3/ZED warmup"
+    )
 
 
 def coerce_remote_target_rotation(response: dict[str, Any], reference_t5_R_ee: np.ndarray) -> dict[str, Any]:

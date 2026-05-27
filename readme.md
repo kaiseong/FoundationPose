@@ -190,6 +190,10 @@ PY
   encode latency, command result, and reason. Use `--debug` for full JSON.
 - `--show-mask-window` requests the selected server mask preview and overlays it
   on the client camera window.
+- If the server logs `BrokenPipeError`, the client disconnected before the
+  server finished writing the response, usually because `--remote-timeout-s` was
+  shorter than SAM3/ZED warmup. Warm the server once with a long timeout, or run
+  the first live test with `--remote-timeout-s 10`.
 - If the server returns `No usable object mask was produced`, robot motion is
   cancelled for that frame.
 - If `remote action wrist step exceeds limit` appears, make sure the server is
