@@ -112,6 +112,9 @@ Important defaults:
 - `--camera-pose-preset auto` selects `zed` for `--live-zed` and `realsense`
   for D405/D435. Use `--camera-pose-preset realsense` to force the old
   RealSense pose, or `--head-camera-pose X Y Z R P Y` for manual calibration.
+- `--no-execute` does not connect to the robot or read live head FK. If the
+  physical head is at 0 deg during a dry-run ZED axis check, add
+  `--t5-head-pose 0 0 0 0 0 0`.
 - ZED uses `--zed-depth-mode NEURAL` by default. If the Jetson/ZED SDK reports
   missing TensorRT or `NEURAL TRT NOT FOUND`, either fix the ZED TensorRT
   installation or retry with `--zed-depth-mode ULTRA`.

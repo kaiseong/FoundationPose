@@ -250,12 +250,15 @@ def test_live_zed_uses_zed_camera_pose_preset_by_default():
     assert tuple(args.head_camera_pose) == ZED_HEAD_TO_CAMERA_XYZ_RPY
     assert args.camera_pose_preset_resolved == "zed"
     t5_T_camera = fixed_t5_T_camera(args)
+    camera_x_axis_t5 = t5_T_camera[:3, :3] @ np.array([1.0, 0.0, 0.0])
     camera_y_axis_t5 = t5_T_camera[:3, :3] @ np.array([0.0, 1.0, 0.0])
     camera_z_axis_t5 = t5_T_camera[:3, :3] @ np.array([0.0, 0.0, 1.0])
 
+    assert camera_x_axis_t5[1] > 0.0
+    np.testing.assert_allclose(camera_x_axis_t5, [0.0, 1.0, 0.0], atol=1e-8)
     assert camera_y_axis_t5[2] < 0.0
-    np.testing.assert_allclose(camera_y_axis_t5, [0.70710678, 0.0, -0.70710678], atol=1e-8)
-    np.testing.assert_allclose(camera_z_axis_t5, [0.70710678, 0.0, 0.70710678], atol=1e-8)
+    np.testing.assert_allclose(camera_y_axis_t5, [-0.70710678, 0.0, -0.70710678], atol=1e-8)
+    np.testing.assert_allclose(camera_z_axis_t5, [-0.70710678, 0.0, 0.70710678], atol=1e-8)
 
 
 def test_camera_pose_preset_and_explicit_pose_override_zed_default():
