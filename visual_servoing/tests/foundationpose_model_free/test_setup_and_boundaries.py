@@ -32,6 +32,26 @@ def test_setup_check_is_camera_aware(monkeypatch, tmp_path):
     assert "zed_sdk" not in d435_checks
 
 
+def test_pyopengl_check_allows_legacy_wrapper_on_python_311(monkeypatch):
+    monkeypatch.setattr(setup_check.importlib.metadata, "version", lambda name: "3.1.0")
+    monkeypatch.setattr(setup_check.sys, "version_info", (3, 11, 15))
+
+    result = setup_check._pyopengl_version_check(required=True)
+
+    assert result.ok is True
+    assert "only required for Python 3.12" in result.detail
+
+
+def test_pyopengl_check_requires_newer_wrapper_on_python_312(monkeypatch):
+    monkeypatch.setattr(setup_check.importlib.metadata, "version", lambda name: "3.1.0")
+    monkeypatch.setattr(setup_check.sys, "version_info", (3, 12, 0))
+
+    result = setup_check._pyopengl_version_check(required=True)
+
+    assert result.ok is False
+    assert "Python 3.12" in result.detail
+
+
 def test_foundationpose_folder_does_not_import_forbidden_runtime_dependencies():
     root = Path(__file__).resolve().parents[2]
     files = list((root / "foundationpose_model_free").glob("*.py"))

@@ -117,8 +117,12 @@ def _pyopengl_version_check(*, required: bool) -> CheckResult:
     except importlib.metadata.PackageNotFoundError:
         return CheckResult(name, False, "missing; install PyOpenGL>=3.1.10", required=required)
     parts = tuple(int(part) for part in version.split(".")[:3] if part.isdigit())
-    ok = parts >= (3, 1, 10)
-    detail = f"{version}; Python 3.12/EGL textured rendering needs PyOpenGL>=3.1.10"
+    needs_new_pyopengl = sys.version_info >= (3, 12)
+    ok = (not needs_new_pyopengl) or parts >= (3, 1, 10)
+    if needs_new_pyopengl:
+        detail = f"{version}; Python 3.12/EGL textured rendering needs PyOpenGL>=3.1.10"
+    else:
+        detail = f"{version}; PyOpenGL>=3.1.10 is only required for Python 3.12/EGL textured rendering"
     return CheckResult(name, ok, detail, required=required)
 
 
