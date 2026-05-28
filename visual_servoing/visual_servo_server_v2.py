@@ -15,6 +15,7 @@ import threading
 import time
 import traceback
 from typing import Any, Callable
+from urllib import parse as urllib_parse
 import uuid
 import zipfile
 
@@ -65,6 +66,7 @@ from visual_servoing.visual_servo_protocol_v2 import (
 HEALTH_PATH = "/foundationpose/v2/health"
 BUILD_PATH = "/foundationpose/v2/assets/build"
 BUILD_STATUS_PREFIX = "/foundationpose/v2/assets/build/"
+MODEL_ASSET_PREFIX = "/foundationpose/v2/assets/model/"
 PROCESS_RECORDINGS_PATH = "/foundationpose/v2/recordings/process"
 PROCESS_RECORDINGS_STATUS_PREFIX = "/foundationpose/v2/recordings/process/"
 SEGMENTATION_PATH = "/foundationpose/v2/segmentation"
@@ -378,6 +380,27 @@ class FoundationPoseV2Service:
             return 404, {"ok": False, "status": "error", "reason": f"unknown build job: {job_id}"}
         return 200, job.payload()
 
+    def model_asset(self, profile_name: str) -> tuple[int, bytes | None, dict[str, Any]]:
+        try:
+            profile = self._profile(profile_name)
+        except UnknownProfileError as exc:
+            return 404, None, {"ok": False, "status": "error", "reason": str(exc)}
+        mesh_path = find_generated_mesh(profile)
+        if mesh_path is None:
+            return 409, None, {
+                "ok": False,
+                "status": "missing",
+                "profile": profile.name,
+                "reason": f"profile {profile.name} has no fresh generated mesh/model.obj; run asset build first",
+            }
+        return 200, mesh_path.read_bytes(), {
+            "ok": True,
+            "status": "ready",
+            "profile": profile.name,
+            "filename": "model.obj",
+            "mesh_identity": mesh_identity(mesh_path),
+        }
+
     def process_recordings_archive(
         self,
         *,
@@ -639,19 +662,39 @@ def make_handler(
 ):
     class FoundationPoseV2Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
-            if self.path == HEALTH_PATH:
+            path = urllib_parse.urlparse(self.path).path
+            if path == HEALTH_PATH:
                 self._send_json(200, service.health())
                 return
-            if self.path.startswith(BUILD_STATUS_PREFIX):
-                job_id = self.path[len(BUILD_STATUS_PREFIX) :].strip("/")
+            if path.startswith(BUILD_STATUS_PREFIX):
+                job_id = path[len(BUILD_STATUS_PREFIX) :].strip("/")
                 if not job_id:
                     self._send_json(404, {"ok": False, "status": "error", "reason": "missing job_id"})
                     return
                 status_code, payload = service.build_status(job_id)
                 self._send_json(status_code, payload)
                 return
-            if self.path.startswith(PROCESS_RECORDINGS_STATUS_PREFIX):
-                job_id = self.path[len(PROCESS_RECORDINGS_STATUS_PREFIX) :].strip("/")
+            if path.startswith(MODEL_ASSET_PREFIX):
+                profile_name = urllib_parse.unquote(path[len(MODEL_ASSET_PREFIX) :].strip("/"))
+                if not profile_name:
+                    self._send_json(404, {"ok": False, "status": "error", "reason": "missing profile"})
+                    return
+                status_code, data, payload = service.model_asset(profile_name)
+                if data is None:
+                    self._send_json(status_code, payload)
+                    return
+                identity = payload.get("mesh_identity") if isinstance(payload.get("mesh_identity"), dict) else {}
+                headers = {
+                    "Content-Disposition": 'attachment; filename="model.obj"',
+                    "X-FoundationPose-Profile": str(payload.get("profile", profile_name)),
+                    "X-FoundationPose-Mesh-Size": str(identity.get("size", len(data))),
+                }
+                if identity.get("sha256"):
+                    headers["X-FoundationPose-Mesh-Sha256"] = str(identity["sha256"])
+                self._send_bytes(status_code, data, content_type="application/octet-stream", headers=headers)
+                return
+            if path.startswith(PROCESS_RECORDINGS_STATUS_PREFIX):
+                job_id = path[len(PROCESS_RECORDINGS_STATUS_PREFIX) :].strip("/")
                 if not job_id:
                     self._send_json(404, {"ok": False, "status": "error", "reason": "missing job_id"})
                     return
@@ -756,6 +799,25 @@ def make_handler(
                 self.send_response(status_code)
                 self.send_header("Content-Type", RESPONSE_CONTENT_TYPE)
                 self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                return
+
+        def _send_bytes(
+            self,
+            status_code: int,
+            data: bytes,
+            *,
+            content_type: str,
+            headers: dict[str, str] | None = None,
+        ) -> None:
+            try:
+                self.send_response(status_code)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(data)))
+                for key, value in (headers or {}).items():
+                    self.send_header(key, value)
                 self.end_headers()
                 self.wfile.write(data)
             except (BrokenPipeError, ConnectionResetError):

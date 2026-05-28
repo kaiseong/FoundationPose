@@ -18,6 +18,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import Callable
 from urllib import error as urllib_error
+from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 import zipfile
 
@@ -34,6 +35,7 @@ from visual_servoing.visual_servo_protocol_v2 import (
     encode_foundationpose_segmentation_request,
 )
 
+from .asset_builder import find_generated_mesh, profile_model_path
 from .charuco_reference import (
     CHARUCO_DETECTOR_PRESET_CONSERVATIVE,
     BoardObjectTransform,
@@ -43,6 +45,7 @@ from .reference_dataset import count_reference_frames
 from .reference_processing import latest_processing_report
 from .reference_recording import ReferenceRecordingConfig, ReferenceRecordingSession, list_recording_sessions
 from .registry import ObjectProfileRegistry
+from .profile_manifest import record_asset_ready
 
 
 @dataclass(frozen=True)
@@ -88,6 +91,7 @@ REMOTE_PROCESS_POLL_INTERVAL_S = 2.0
 REMOTE_PROCESS_UPLOAD_TIMEOUT_S = 120.0
 REMOTE_PROCESS_TIMEOUT_S = 60.0 * 60.0
 REMOTE_PROCESS_UPLOAD_FRAME_CAP = 192
+REMOTE_MODEL_DOWNLOAD_TIMEOUT_S = 60.0
 REMOTE_SEGMENTATION_WARMUP_FRAMES = 10
 RECORDINGS_ZIP_CONTENT_TYPE = "application/x-foundationpose-recordings+zip"
 PROCESSING_REQUEST_JSON = "foundationpose_processing_request.json"
@@ -1003,6 +1007,9 @@ class FoundationPoseWorkflowGui:
         profile = self._current_profile()
         if not self._release_live_sessions_for_gpu():
             return
+        if find_generated_mesh(profile) is None:
+            if not self._download_remote_model_for_local_tracking(profile):
+                return
         self._last_tracking_mode = "local"
         self._start_command(
             self.command_builder.track_live(
@@ -1047,6 +1054,41 @@ class FoundationPoseWorkflowGui:
             ),
             remote=True,
         )
+
+    def _download_remote_model_for_local_tracking(self, profile) -> bool:
+        host = self.server_host.get().strip()
+        port = int(self.server_port.get())
+        self.status.set(f"Downloading remote model.obj for {profile.name}")
+        try:
+            target_path = profile_model_path(profile)
+            metadata = remote_download_model_asset(
+                host=host,
+                port=port,
+                profile=profile.name,
+                target_path=target_path,
+                timeout_s=REMOTE_MODEL_DOWNLOAD_TIMEOUT_S,
+            )
+            record_asset_ready(
+                profile,
+                generated_assets=[target_path],
+                deterministic_validation_report={
+                    "ok": True,
+                    "source": "remote_model_download",
+                    "remote": metadata,
+                },
+            )
+        except Exception as exc:
+            message = (
+                f"Track Local skipped: profile {profile.name} has no local model.obj and remote download failed: {exc}. "
+                "Use Track Remote or run local Build Assets first."
+            )
+            self.status.set(message)
+            self._append_log(message)
+            return False
+        message = f"Downloaded remote model.obj for local tracking: {metadata.get('bytes', 0)} bytes"
+        self.status.set(message)
+        self._append_log(message)
+        return True
 
     def _start_remote_processing(self, *, profile, reselect: bool) -> None:
         host = self.server_host.get().strip()
@@ -1569,6 +1611,50 @@ def remote_build_assets(
         if time.monotonic() >= deadline:
             raise RuntimeError(f"remote build timed out: job_id={job_id}")
         time.sleep(float(poll_interval_s))
+
+
+def remote_download_model_asset(
+    *,
+    host: str,
+    port: int,
+    profile: str,
+    target_path: str | Path,
+    timeout_s: float = REMOTE_MODEL_DOWNLOAD_TIMEOUT_S,
+) -> dict:
+    encoded_profile = urllib_parse.quote(profile, safe="")
+    url = f"http://{host}:{int(port)}/foundationpose/v2/assets/model/{encoded_profile}"
+    try:
+        with urllib_request.urlopen(url, timeout=float(timeout_s)) as response:
+            data = response.read()
+            headers = response.headers
+    except urllib_error.HTTPError as exc:
+        detail = exc.reason
+        try:
+            decoded = json.loads(exc.read().decode("utf-8"))
+            if isinstance(decoded, dict):
+                detail = decoded.get("reason") or decoded.get("status") or detail
+        except Exception:
+            pass
+        raise RuntimeError(f"remote model download failed: HTTP {exc.code}: {detail}") from exc
+    except urllib_error.URLError as exc:
+        raise RuntimeError(str(exc)) from exc
+    if not data:
+        raise RuntimeError("remote model download returned an empty response")
+    target = Path(target_path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    with tmp_path.open("wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_path, target)
+    return {
+        "profile": profile,
+        "path": str(target),
+        "bytes": len(data),
+        "sha256": headers.get("X-FoundationPose-Mesh-Sha256"),
+        "remote_size": headers.get("X-FoundationPose-Mesh-Size"),
+    }
 
 
 def create_recordings_archive(profile_root: str | Path, *, request_payload: dict) -> tuple[bytes, dict]:

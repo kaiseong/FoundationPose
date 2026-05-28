@@ -17,6 +17,7 @@ from visual_servoing.foundationpose_model_free.gui_app import (
     GuiConfig,
     create_recordings_archive,
     remote_build_assets,
+    remote_download_model_asset,
     remote_process_recordings,
     remote_segmentation_sanity,
     resolve_gui_config,
@@ -336,6 +337,7 @@ def test_gui_source_contains_remote_connect_state_flow():
     assert "remote_events" in poll_source
     assert "_start_remote_segmentation_check" in segmentation_source
     assert "track_live" in local_tracking_source
+    assert "_download_remote_model_for_local_tracking" in local_tracking_source
     assert "track_remote_live" in remote_tracking_source
     assert "_last_tracking_mode" in reinit_source
     assert "_start_remote_build" in build_command_source
@@ -414,6 +416,53 @@ def test_remote_build_assets_posts_to_server_and_polls_job(monkeypatch):
     assert posted["execute"] is True
     assert calls[1][0] == "http://192.168.0.3:8081/foundationpose/v2/assets/build/job-1"
     assert calls[2][0] == "http://192.168.0.3:8081/foundationpose/v2/assets/build/job-1"
+
+
+def test_remote_download_model_asset_saves_model_obj(tmp_path, monkeypatch):
+    calls = []
+
+    class FakeHeaders(dict):
+        def get(self, key, default=None):
+            return super().get(key, default)
+
+    class FakeResponse:
+        headers = FakeHeaders(
+            {
+                "X-FoundationPose-Mesh-Sha256": "abc123",
+                "X-FoundationPose-Mesh-Size": "7",
+            }
+        )
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b"# obj\n"
+
+    def fake_urlopen(request, timeout):
+        calls.append((request, timeout))
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        "visual_servoing.foundationpose_model_free.gui_app.urllib_request.urlopen",
+        fake_urlopen,
+    )
+
+    target = tmp_path / "assets" / "model" / "model.obj"
+    result = remote_download_model_asset(
+        host="192.168.0.3",
+        port=8081,
+        profile="multimeter zed",
+        target_path=target,
+    )
+
+    assert calls == [("http://192.168.0.3:8081/foundationpose/v2/assets/model/multimeter%20zed", 60.0)]
+    assert target.read_bytes() == b"# obj\n"
+    assert result["bytes"] == 6
+    assert result["sha256"] == "abc123"
 
 
 def test_create_recordings_archive_includes_request_and_sessions(tmp_path):

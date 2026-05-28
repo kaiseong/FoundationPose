@@ -271,6 +271,23 @@ def test_build_dry_run_and_async_status(tmp_path):
     assert status_payload["stderr_tail"].endswith("e")
 
 
+def test_model_asset_endpoint_downloads_generated_mesh(tmp_path):
+    _profile_with_mesh(tmp_path)
+    service = FoundationPoseV2Service(registry=ObjectProfileRegistry(tmp_path), builder_factory=FakeBuilder)
+    server, thread, base_url = _serve(service)
+    try:
+        with urllib_request.urlopen(f"{base_url}/foundationpose/v2/assets/model/phone", timeout=2.0) as response:
+            data = response.read()
+            headers = response.headers
+    finally:
+        _stop(server, thread)
+
+    assert data == b"# obj\n"
+    assert headers.get("Content-Type") == "application/octet-stream"
+    assert headers.get("X-FoundationPose-Profile") == "phone"
+    assert headers.get("X-FoundationPose-Mesh-Size") == "6"
+
+
 def test_build_uses_server_foundationpose_root_when_client_path_is_invalid(tmp_path, monkeypatch):
     server_root = _foundationpose_root_with_bundlesdf(tmp_path)
     monkeypatch.setenv("FOUNDATIONPOSE_ROOT", str(server_root))
