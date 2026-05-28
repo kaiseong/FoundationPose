@@ -24,6 +24,7 @@ opencv-python
 imageio
 open3d
 trimesh
+xatlas
 transformations
 matplotlib
 pandas

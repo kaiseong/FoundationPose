@@ -46,6 +46,8 @@ def run_checks(*, foundationpose_path: str | Path | None = None, camera: str = "
         _module_check("sam3", required=False),
         _import_check("nvdiffrast.torch", required=True, package_hint="nvdiffrast"),
         _import_check("pytorch3d", required=True),
+        _module_check("trimesh", required=True),
+        _module_check("xatlas", required=True),
         _module_check("kaolin", required=False),
     ]
     if check_realsense:
@@ -69,10 +71,10 @@ def summarize(results: Iterable[CheckResult]) -> dict[str, object]:
 
 def _python_check() -> CheckResult:
     version = sys.version_info
-    ok = (version.major, version.minor) == (3, 11)
+    ok = (version.major, version.minor) in {(3, 11), (3, 12)}
     detail = (
-        f"{version.major}.{version.minor}.{version.micro}; cloned FoundationPose "
-        "environment.yml pins python=3.11"
+        f"{version.major}.{version.minor}.{version.micro}; FoundationPose environment.yml "
+        "pins python=3.11, unified SAM3/FoundationPose envs may use python=3.12"
     )
     return CheckResult("python_version", ok, detail, required=True)
 

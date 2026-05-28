@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -127,6 +128,29 @@ def test_asset_builder_fingerprints_deterministic_build_inputs(tmp_path):
     build_inputs = result.validation_report["deterministic_build_inputs"]
     assert build_inputs["run_nerf"]["sha256"]
     assert build_inputs["config_ycbv"]["sha256"]
+
+
+def test_asset_builder_execute_uses_egl_for_headless_rendering(monkeypatch, tmp_path):
+    foundationpose = tmp_path / "FoundationPose"
+    (foundationpose / "bundlesdf").mkdir(parents=True)
+    (foundationpose / "bundlesdf" / "run_nerf.py").write_text("print('runner')\n", encoding="utf-8")
+    (foundationpose / "bundlesdf" / "config_ycbv.yml").write_text("v: 1\n", encoding="utf-8")
+    profile = _profile_with_reference(tmp_path)
+    captured_env = {}
+
+    def fake_run(command, *, cwd, env, text, capture_output, check):
+        del command, cwd, text, capture_output, check
+        captured_env.update(env)
+        return SimpleNamespace(returncode=1, stdout="", stderr="simulated failure")
+
+    monkeypatch.delenv("PYOPENGL_PLATFORM", raising=False)
+    monkeypatch.setattr("visual_servoing.foundationpose_model_free.asset_builder.subprocess.run", fake_run)
+
+    builder = FoundationPoseAssetBuilder(foundationpose_root=foundationpose, python_executable="python")
+    result = builder.build(profile, execute=True)
+
+    assert result.returncode == 1
+    assert captured_env["PYOPENGL_PLATFORM"] == "egl"
 
 
 def _profile_with_reference(tmp_path):

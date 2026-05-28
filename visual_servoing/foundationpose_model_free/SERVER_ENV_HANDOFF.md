@@ -124,7 +124,7 @@ Then install the normal runtime packages that BundleSDF and processing need:
 
 ```bash
 python -m pip install \
-  joblib matplotlib opencv-python trimesh imageio PyYAML scipy scikit-learn \
+  joblib matplotlib opencv-python trimesh xatlas imageio PyYAML scipy scikit-learn \
   h5py ruamel.yaml transformations pandas Pillow pyrender \
   pyOpenGL pyOpenGL_accelerate kornia omegaconf psutil tqdm \
   warp-lang scikit-image open3d
@@ -160,6 +160,7 @@ for name in [
     "matplotlib",
     "cv2",
     "trimesh",
+    "xatlas",
     "yaml",
     "imageio",
     "sam3",
@@ -186,6 +187,7 @@ import kaolin.render.spc
 import joblib
 import matplotlib.pyplot as plt
 import trimesh
+import xatlas
 import cv2
 import sam3
 print("FoundationPose/BundleSDF/SAM3 import smoke test OK")
@@ -219,6 +221,7 @@ conda activate visual
 cd /home/rby1/FoundationPose
 export FOUNDATIONPOSE_ROOT=/home/rby1/FoundationPose
 unset FOUNDATIONPOSE_BUILD_PYTHON
+export PYOPENGL_PLATFORM=egl
 
 # Only needed if sam3 was not installed editable into visual:
 export PYTHONPATH=/home/rby1/sam3:${PYTHONPATH:-}
@@ -323,6 +326,8 @@ matplotlib   -> python -m pip install matplotlib
 pytorch3d    -> install source or wheel compatible with the env torch
 nvdiffrast   -> python -m pip install --no-build-isolation git+https://github.com/NVlabs/nvdiffrast.git
 kaolin       -> torch/CUDA-matched Kaolin wheel, currently torch 2.8.0 cu128 + kaolin 0.18.0
+xatlas       -> python -m pip install xatlas
+No display   -> export PYOPENGL_PLATFORM=egl before starting the server/build subprocess
 ```
 
 ## Split Env Fallback
@@ -334,6 +339,7 @@ conda activate sam
 cd /home/rby1/FoundationPose
 export FOUNDATIONPOSE_ROOT=/home/rby1/FoundationPose
 export FOUNDATIONPOSE_BUILD_PYTHON=/home/rby1/miniforge3/envs/visual/bin/python
+export PYOPENGL_PLATFORM=egl
 python -m visual_servoing.visual_servo_server_v2 --host 0.0.0.0 --port 8081
 ```
 

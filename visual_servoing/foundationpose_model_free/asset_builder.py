@@ -184,6 +184,7 @@ class FoundationPoseAssetBuilder:
         env = os.environ.copy()
         conda_lib = str(Path(sys.prefix) / "lib")
         env["LD_LIBRARY_PATH"] = f"{conda_lib}:{env.get('LD_LIBRARY_PATH', '')}"
+        env.setdefault("PYOPENGL_PLATFORM", "egl")
         env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
         completed = subprocess.run(
             command,
