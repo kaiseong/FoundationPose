@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 import base64
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
+import os
 from pathlib import Path
 import threading
 import time
@@ -269,9 +270,11 @@ class TrackerSessionManager:
         mesh_path: Path,
         request: FoundationPoseTrackRequest,
     ) -> tuple[TrackerSession, bool, dict[str, Any]]:
+        foundationpose_root = _resolve_server_foundationpose_root(request.foundationpose_root)
+        request = replace(request, foundationpose_root=foundationpose_root)
         key = TrackerCacheKey(
             profile=profile.name,
-            foundationpose_root=request.foundationpose_root,
+            foundationpose_root=foundationpose_root,
             mesh_identity_json=_stable_json(mesh_identity(mesh_path)),
             refine_iterations=int(request.refine_iterations),
             track_iterations=int(request.track_iterations),
@@ -355,7 +358,8 @@ class FoundationPoseV2Service:
             profile = self._profile(str(payload["profile"]))
         except UnknownProfileError as exc:
             return 404, {"ok": False, "status": "error", "reason": str(exc)}
-        builder = self.builder_factory(str(payload["foundationpose_root"]))
+        foundationpose_root = _resolve_server_foundationpose_root(str(payload["foundationpose_root"]))
+        builder = self.builder_factory(str(foundationpose_root))
         if not bool(payload.get("execute")):
             try:
                 result = builder.build(profile, execute=False)
@@ -595,6 +599,31 @@ class FoundationPoseV2Service:
         payload["mode"] = mode
         payload["detector_preset"] = detector_config.preset
         return payload
+
+
+def _resolve_server_foundationpose_root(requested: str | None) -> str | None:
+    requested_value = str(requested).strip() if requested is not None else ""
+    for candidate in _server_foundationpose_root_candidates(requested_value):
+        if _looks_like_foundationpose_root(candidate):
+            return str(candidate.resolve())
+    return requested_value or None
+
+
+def _server_foundationpose_root_candidates(requested: str) -> list[Path]:
+    candidates: list[Path] = []
+    if requested:
+        candidates.append(Path(requested).expanduser())
+    env_root = os.environ.get("FOUNDATIONPOSE_ROOT")
+    if env_root:
+        candidates.append(Path(env_root).expanduser())
+    candidates.append(Path(__file__).resolve().parents[1])
+    return candidates
+
+
+def _looks_like_foundationpose_root(path: Path) -> bool:
+    return (path / "bundlesdf" / "run_nerf.py").exists() and (
+        path / "bundlesdf" / "config_ycbv.yml"
+    ).exists()
 
 
 def make_handler(

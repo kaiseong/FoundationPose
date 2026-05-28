@@ -136,6 +136,15 @@ def _profile_with_mesh(tmp_path, *, name="phone"):
     return profile
 
 
+def _foundationpose_root_with_bundlesdf(tmp_path):
+    server_root = tmp_path / "server-foundationpose"
+    bundlesdf = server_root / "bundlesdf"
+    bundlesdf.mkdir(parents=True)
+    (bundlesdf / "run_nerf.py").write_text("# fake\n", encoding="utf-8")
+    (bundlesdf / "config_ycbv.yml").write_text("fake: true\n", encoding="utf-8")
+    return server_root
+
+
 def _track_body(*, profile="phone", t5_T_camera=None, **metadata):
     transform = np.eye(4, dtype=np.float64) if t5_T_camera is None else t5_T_camera
     return encode_foundationpose_track_request(
@@ -259,6 +268,51 @@ def test_build_dry_run_and_async_status(tmp_path):
     assert len(status_payload["stderr_tail"]) <= 4000
     assert status_payload["stdout_tail"].endswith("o")
     assert status_payload["stderr_tail"].endswith("e")
+
+
+def test_build_uses_server_foundationpose_root_when_client_path_is_invalid(tmp_path, monkeypatch):
+    server_root = _foundationpose_root_with_bundlesdf(tmp_path)
+    monkeypatch.setenv("FOUNDATIONPOSE_ROOT", str(server_root))
+
+    _profile_with_mesh(tmp_path)
+    service = FoundationPoseV2Service(registry=ObjectProfileRegistry(tmp_path), builder_factory=FakeBuilder)
+
+    status, payload = service.build_assets(
+        {
+            "request_id": "build-1",
+            "profile": "phone",
+            "foundationpose_root": "/client-only/FoundationPose",
+            "execute": False,
+        }
+    )
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["command"] == ["fake-build", "phone", str(server_root.resolve())]
+
+
+def test_tracking_uses_server_foundationpose_root_when_client_path_is_invalid(tmp_path, monkeypatch):
+    server_root = _foundationpose_root_with_bundlesdf(tmp_path)
+    monkeypatch.setenv("FOUNDATIONPOSE_ROOT", str(server_root))
+    _profile_with_mesh(tmp_path)
+    seen_roots = []
+
+    def factory(profile, mesh, request):
+        del profile, mesh
+        seen_roots.append(request.foundationpose_root)
+        return FakeTracker()
+
+    service = FoundationPoseV2Service(
+        registry=ObjectProfileRegistry(tmp_path),
+        builder_factory=FakeBuilder,
+        tracker_factory=factory,
+    )
+
+    status, payload = service.track(decode_foundationpose_track_request(_track_body()))
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert seen_roots == [str(server_root.resolve())]
 
 
 def test_build_missing_fields_and_unknown_profile(tmp_path):
