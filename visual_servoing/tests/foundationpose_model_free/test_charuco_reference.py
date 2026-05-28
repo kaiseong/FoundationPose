@@ -5,6 +5,7 @@ import pytest
 
 from visual_servoing.foundationpose_model_free.charuco_reference import (
     BoardObjectTransform,
+    CHARUCO_ORIGIN_CONVENTION_OPENCV_BOARD,
     CharucoBoardSpec,
     CharucoDetectorConfig,
     CHARUCO_DETECTOR_PRESET_CONSERVATIVE,
@@ -15,6 +16,8 @@ from visual_servoing.foundationpose_model_free.charuco_reference import (
     choose_best_dictionary_result,
     detect_charuco_pose,
     draw_charuco_axes_overlay_bgr,
+    effective_board_T_object,
+    normalize_charuco_origin_convention,
     _create_charuco_detector,
 )
 from visual_servoing.point_pose.rgbd_geometry import CameraIntrinsics
@@ -38,6 +41,73 @@ def test_camera_T_object_is_camera_T_board_times_board_T_object():
     camera_T_object = camera_T_object_from_board(camera_T_board, board_T_object)
 
     assert np.allclose(camera_T_object, camera_T_board @ board_T_object)
+
+
+def test_default_charuco_origin_convention_offsets_to_corner_id_zero():
+    spec = CharucoBoardSpec(square_length_m=0.030)
+    user_board_T_object = BoardObjectTransform.from_xyz_rpy_deg((0.01, 0.02, 0.03)).board_T_object
+
+    effective = effective_board_T_object(spec, user_board_T_object)
+
+    expected = np.eye(4, dtype=np.float64)
+    expected[:3, 3] = [0.030, 0.030, 0.0]
+    assert np.allclose(effective, expected @ user_board_T_object)
+
+
+def test_corner_origin_transform_composes_before_user_object_transform():
+    spec = CharucoBoardSpec(square_length_m=0.030)
+    camera_T_board = np.eye(4, dtype=np.float64)
+    camera_T_board[:3, :3] = np.array(
+        [
+            [0.0, -1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    camera_T_board[:3, 3] = [0.10, -0.20, 0.50]
+    user_board_T_object = BoardObjectTransform.from_xyz_rpy_deg((0.01, -0.02, 0.03), (0.0, 0.0, 90.0)).board_T_object
+
+    camera_T_object = camera_T_object_from_board(
+        camera_T_board,
+        effective_board_T_object(spec, user_board_T_object),
+    )
+
+    opencv_board_T_corner0 = np.eye(4, dtype=np.float64)
+    opencv_board_T_corner0[:3, 3] = [0.030, 0.030, 0.0]
+    expected = camera_T_board @ opencv_board_T_corner0 @ user_board_T_object
+    assert np.allclose(camera_T_object, expected)
+
+
+def test_legacy_opencv_board_origin_convention_keeps_user_transform():
+    spec = CharucoBoardSpec(square_length_m=0.030)
+    user_board_T_object = BoardObjectTransform.from_xyz_rpy_deg((0.01, 0.02, 0.03)).board_T_object
+
+    effective = effective_board_T_object(
+        spec,
+        user_board_T_object,
+        charuco_origin_convention=CHARUCO_ORIGIN_CONVENTION_OPENCV_BOARD,
+    )
+
+    assert normalize_charuco_origin_convention("opencv") == CHARUCO_ORIGIN_CONVENTION_OPENCV_BOARD
+    assert np.allclose(effective, user_board_T_object)
+
+
+def test_origin_convention_metadata_is_serialized_for_failed_pose():
+    image = np.zeros((100, 100, 3), dtype=np.uint8)
+    intr = CameraIntrinsics(fx=100.0, fy=100.0, cx=50.0, cy=50.0, width=100, height=100)
+
+    result = detect_charuco_pose(
+        image,
+        intr,
+        board_spec=CharucoBoardSpec(dictionary="DICT_5X5_100", square_length_m=0.030),
+        quality_config=CharucoQualityConfig(min_corners=1, min_markers=1),
+    )
+
+    metadata = result.to_metadata()
+    assert metadata["charuco_origin_convention"] == "charuco_corner_id_0"
+    assert metadata["charuco_origin_offset_board_m"] == [0.030, 0.030, 0.0]
+    assert metadata["effective_board_T_object"] is not None
 
 
 def test_cam_in_ob_is_inverse_of_camera_T_object():

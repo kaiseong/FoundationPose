@@ -8,6 +8,7 @@ import numpy as np
 
 from visual_servoing.foundationpose_model_free.charuco_reference import (
     BoardObjectTransform,
+    CHARUCO_ORIGIN_CONVENTION_OPENCV_BOARD,
     CharucoBoardSpec,
     CharucoDetectorConfig,
     CHARUCO_DETECTOR_PRESET_CONSERVATIVE,
@@ -15,6 +16,9 @@ from visual_servoing.foundationpose_model_free.charuco_reference import (
     CharucoPoseResult,
     CharucoQualityConfig,
     DictionaryCandidateResult,
+    charuco_origin_offset_board_m,
+    effective_board_T_object,
+    normalize_charuco_origin_convention,
 )
 from visual_servoing.foundationpose_model_free.mask_provider import MaskResult
 from visual_servoing.foundationpose_model_free.reference_dataset import count_reference_frames
@@ -27,7 +31,10 @@ from visual_servoing.foundationpose_model_free.reference_processing import (
     RecordedCandidate,
     compute_mask_depth_stats,
     evaluate_recorded_references,
+    index_recorded_frame_records,
     latest_processing_report,
+    normalize_excluded_candidate_ids,
+    profile_excluded_candidate_ids,
     process_recorded_references,
     reselect_recorded_references,
     select_view_diverse_candidates,
@@ -266,6 +273,139 @@ def test_processing_cache_is_partitioned_by_charuco_detector_preset(tmp_path):
     assert reused.processing_summary["reused_cached_records"] == 4
 
 
+def test_processing_cache_is_partitioned_by_charuco_origin_convention(tmp_path):
+    profile = ObjectProfileRegistry(tmp_path).create("mouse", prompt="wireless mouse")
+    board_spec = CharucoBoardSpec()
+    quality_config = CharucoQualityConfig()
+    board_object = BoardObjectTransform.identity()
+    _record_frames(profile, count=4)
+
+    default_provider = FakeMaskProvider()
+    process_recorded_references(
+        profile,
+        mask_provider=default_provider,
+        board_spec=board_spec,
+        quality_config=quality_config,
+        board_object=board_object,
+        config=ReferenceProcessingConfig(required_keyframes=4, max_keyframes=4),
+        pose_detector=_fake_pose_detector,
+    )
+    opencv_provider = FakeMaskProvider()
+    opencv = process_recorded_references(
+        profile,
+        mask_provider=opencv_provider,
+        board_spec=board_spec,
+        quality_config=quality_config,
+        board_object=board_object,
+        config=ReferenceProcessingConfig(required_keyframes=4, max_keyframes=4),
+        charuco_origin_convention=CHARUCO_ORIGIN_CONVENTION_OPENCV_BOARD,
+        pose_detector=_fake_pose_detector,
+    )
+    reused_provider = FakeMaskProvider()
+    reused = process_recorded_references(
+        profile,
+        mask_provider=reused_provider,
+        board_spec=board_spec,
+        quality_config=quality_config,
+        board_object=board_object,
+        config=ReferenceProcessingConfig(required_keyframes=4, max_keyframes=4),
+        charuco_origin_convention=CHARUCO_ORIGIN_CONVENTION_OPENCV_BOARD,
+        pose_detector=_fake_pose_detector,
+    )
+
+    assert default_provider.calls == 4
+    assert opencv_provider.calls == 4
+    assert opencv.processing_summary["charuco_origin_convention"] == CHARUCO_ORIGIN_CONVENTION_OPENCV_BOARD
+    assert reused_provider.calls == 0
+    assert reused.processing_summary["reused_cached_records"] == 4
+
+
+def test_reselect_rejects_changed_charuco_origin_convention(tmp_path):
+    profile = ObjectProfileRegistry(tmp_path).create("mouse", prompt="wireless mouse")
+    _record_frames(profile, count=4)
+
+    process_recorded_references(
+        profile,
+        mask_provider=FakeMaskProvider(),
+        board_spec=CharucoBoardSpec(),
+        quality_config=CharucoQualityConfig(),
+        board_object=BoardObjectTransform.identity(),
+        config=ReferenceProcessingConfig(required_keyframes=4, max_keyframes=4),
+        pose_detector=_fake_pose_detector,
+    )
+
+    with np.testing.assert_raises_regex(ValueError, "different ChArUco origin convention"):
+        reselect_recorded_references(
+            profile,
+            board_spec=CharucoBoardSpec(),
+            quality_config=CharucoQualityConfig(),
+            board_object=BoardObjectTransform.identity(),
+            config=ReferenceProcessingConfig(required_keyframes=2, max_keyframes=2),
+            charuco_origin_convention=CHARUCO_ORIGIN_CONVENTION_OPENCV_BOARD,
+        )
+
+
+def test_reselect_excludes_candidate_ids_and_persists_profile_setting(tmp_path):
+    profile = ObjectProfileRegistry(tmp_path).create("mouse", prompt="wireless mouse")
+    _record_frames(profile, count=6)
+    board_spec = CharucoBoardSpec()
+    quality_config = CharucoQualityConfig()
+    board_object = BoardObjectTransform.identity()
+
+    processed = process_recorded_references(
+        profile,
+        mask_provider=FakeMaskProvider(),
+        board_spec=board_spec,
+        quality_config=quality_config,
+        board_object=board_object,
+        config=ReferenceProcessingConfig(required_keyframes=4, max_keyframes=4),
+        pose_detector=_fake_pose_detector,
+    )
+    excluded_id = next(record["candidate_id"] for record in processed.records if record.get("selected_index") == 0)
+    reselected = reselect_recorded_references(
+        profile,
+        board_spec=board_spec,
+        quality_config=quality_config,
+        board_object=board_object,
+        config=ReferenceProcessingConfig(required_keyframes=4, max_keyframes=4),
+        excluded_candidate_ids=excluded_id,
+    )
+
+    selected_ids = {record["candidate_id"] for record in reselected.records if record.get("accepted")}
+    excluded_records = [record for record in reselected.records if record.get("excluded")]
+    assert excluded_id not in selected_ids
+    assert excluded_records and excluded_records[0]["candidate_id"] == excluded_id
+    assert excluded_records[0]["reasons"] == ["accepted cached candidate excluded by user"]
+    assert profile_excluded_candidate_ids(profile) == (excluded_id,)
+    assert reselected.processing_summary["excluded_count"] == 1
+    assert count_reference_frames(profile) == 4
+
+
+def test_processing_exclusions_can_make_ready_recording_need_more_frames(tmp_path):
+    profile = ObjectProfileRegistry(tmp_path).create("mouse", prompt="wireless mouse")
+    _record_frames(profile, count=4)
+    excluded_ids = sorted(index_recorded_frame_records(profile))[:2]
+
+    report = process_recorded_references(
+        profile,
+        mask_provider=FakeMaskProvider(),
+        board_spec=CharucoBoardSpec(),
+        quality_config=CharucoQualityConfig(),
+        board_object=BoardObjectTransform.identity(),
+        config=ReferenceProcessingConfig(required_keyframes=4, max_keyframes=4),
+        excluded_candidate_ids=excluded_ids,
+        pose_detector=_fake_pose_detector,
+    )
+
+    assert report.readiness == READINESS_NEED_MORE_RECORDING
+    assert report.accepted == 2
+    assert report.force_build_allowed is True
+    assert report.processing_summary["eligible_count"] == 4
+    assert report.processing_summary["excluded_count"] == 2
+    assert report.processing_summary["selected_count"] == 2
+    assert set(report.processing_summary["excluded_candidate_ids"]) == set(excluded_ids)
+
+
 def test_reselect_recorded_references_rejects_changed_object_transform(tmp_path):
     profile = ObjectProfileRegistry(tmp_path).create("mouse", prompt="wireless mouse")
     _record_frames(profile, count=4)
@@ -439,6 +579,30 @@ def test_view_diverse_selection_balances_oversampled_angle_bins():
     assert Counter(item.view_bin for item in selected) == {0: 3, 1: 3, 2: 3}
 
 
+def test_view_diverse_selection_skips_excluded_candidates():
+    candidates = _evaluated_candidates_for_bin(0, count=4, start_index=0, score_start=100.0)
+
+    selected = select_view_diverse_candidates(
+        candidates,
+        config=ReferenceProcessingConfig(required_keyframes=3, max_keyframes=3),
+        excluded_candidate_ids="session:000000",
+    )
+
+    assert [item.candidate.candidate_id for item in selected] == [
+        "session:000001",
+        "session:000002",
+        "session:000003",
+    ]
+
+
+def test_normalize_excluded_candidate_ids_dedupes_common_separators():
+    assert normalize_excluded_candidate_ids("a:000001, b:000002\na:000001; c:000003") == (
+        "a:000001",
+        "b:000002",
+        "c:000003",
+    )
+
+
 def test_mask_depth_stats_handles_empty_mask():
     stats = compute_mask_depth_stats(
         np.ones((3, 4), dtype=np.float32),
@@ -485,14 +649,29 @@ def _record_frames(profile, *, count: int, zero_depth_after: int | None = None) 
             session.record_next_frame()
 
 
-def _fake_pose_detector(image_rgb, intrinsics, *, board_spec, quality_config, board_object, detector_config=None):
+def _fake_pose_detector(
+    image_rgb,
+    intrinsics,
+    *,
+    board_spec,
+    quality_config,
+    board_object,
+    detector_config=None,
+    charuco_origin_convention=None,
+):
     detector_config = detector_config or CharucoDetectorConfig()
+    origin_convention = normalize_charuco_origin_convention(charuco_origin_convention)
     value = int(image_rgb[0, 0, 0])
     yaw_rad = np.deg2rad((value * 22.5) % 360.0)
     cam_in_ob = np.eye(4, dtype=np.float64)
     cam_in_ob[:3, 3] = np.array([np.sin(yaw_rad), 0.0, np.cos(yaw_rad) + 2.0])
     camera_t_board = np.eye(4, dtype=np.float64)
     camera_t_object = np.linalg.inv(cam_in_ob)
+    effective = effective_board_T_object(
+        board_spec,
+        board_object.board_T_object,
+        charuco_origin_convention=origin_convention,
+    )
     candidate = DictionaryCandidateResult(
         dictionary="DICT_5X5_100",
         ok=True,
@@ -508,6 +687,9 @@ def _fake_pose_detector(image_rgb, intrinsics, *, board_spec, quality_config, bo
         distortion_policy="zero_unavailable",
         detector_preset=detector_config.preset,
         detector_parameters=detector_config.parameter_summary(),
+        charuco_origin_convention=origin_convention,
+        charuco_origin_offset_board_m=charuco_origin_offset_board_m(board_spec, origin_convention),
+        effective_board_T_object=effective,
     )
     return CharucoPoseResult(
         ok=True,
@@ -518,9 +700,13 @@ def _fake_pose_detector(image_rgb, intrinsics, *, board_spec, quality_config, bo
         opencv_version="test",
         board_coordinate_convention="opencv_charuco_board",
         legacy_pattern=False,
+        charuco_origin_convention=origin_convention,
+        charuco_origin_offset_board_m=charuco_origin_offset_board_m(board_spec, origin_convention),
         camera_T_board=camera_t_board,
         camera_T_object=camera_t_object,
         cam_in_ob=cam_in_ob,
+        user_board_T_object=board_object.board_T_object,
+        effective_board_T_object=effective,
         detector_preset=detector_config.preset,
         detector_parameters=detector_config.parameter_summary(),
     )

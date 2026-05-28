@@ -29,6 +29,7 @@ from visual_servoing.foundationpose_model_free.asset_builder import (
 from visual_servoing.foundationpose_model_free.charuco_reference import (
     BoardObjectTransform,
     CHARUCO_DETECTOR_PRESET_CONSERVATIVE,
+    DEFAULT_CHARUCO_ORIGIN_CONVENTION,
     CharucoBoardSpec,
     CharucoDetectorConfig,
     CharucoQualityConfig,
@@ -608,6 +609,10 @@ class FoundationPoseV2Service:
         )
         detector_config = CharucoDetectorConfig(str(detector_preset))
         config = _processing_config_from_options(options)
+        charuco_origin_convention = str(
+            options.get("charuco_origin_convention") or DEFAULT_CHARUCO_ORIGIN_CONVENTION
+        )
+        excluded_candidate_ids = options.get("excluded_candidate_ids")
         if bool(options.get("reselect")):
             report = reselect_recorded_references(
                 profile,
@@ -616,6 +621,8 @@ class FoundationPoseV2Service:
                 board_object=board_object,
                 config=config,
                 detector_config=detector_config,
+                charuco_origin_convention=charuco_origin_convention,
+                excluded_candidate_ids=excluded_candidate_ids,
             )
             mode = "reselect_recordings"
         else:
@@ -633,6 +640,8 @@ class FoundationPoseV2Service:
                 board_object=board_object,
                 config=config,
                 detector_config=detector_config,
+                charuco_origin_convention=charuco_origin_convention,
+                excluded_candidate_ids=excluded_candidate_ids,
             )
             mode = "process_recordings"
         payload = report.to_dict()

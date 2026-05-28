@@ -39,11 +39,18 @@ from visual_servoing.visual_servo_protocol_v2 import (
 from .asset_builder import find_generated_mesh, profile_model_path
 from .charuco_reference import (
     CHARUCO_DETECTOR_PRESET_CONSERVATIVE,
+    CHARUCO_ORIGIN_CONVENTION_CORNER_ID_0,
+    CHARUCO_ORIGIN_CONVENTION_OPENCV_BOARD,
     BoardObjectTransform,
     CharucoBoardSpec,
 )
 from .reference_dataset import count_reference_frames
-from .reference_processing import latest_processing_report
+from .reference_processing import (
+    EXCLUDED_CANDIDATE_IDS_KEY,
+    REFERENCE_PROCESSING_SETTINGS_KEY,
+    latest_processing_report,
+    normalize_excluded_candidate_ids,
+)
 from .reference_recording import ReferenceRecordingConfig, ReferenceRecordingSession, list_recording_sessions
 from .registry import ObjectProfileRegistry
 from .profile_manifest import record_asset_ready
@@ -235,6 +242,8 @@ class GuiCommandBuilder:
         required_keyframes: str = "16",
         max_keyframes: str = "32",
         charuco_detector_preset: str = CHARUCO_DETECTOR_PRESET_CONSERVATIVE,
+        charuco_origin_convention: str = CHARUCO_ORIGIN_CONVENTION_CORNER_ID_0,
+        excluded_candidate_ids: str | None = None,
         data_root: str | None = None,
     ) -> list[str]:
         if mode not in {
@@ -274,6 +283,8 @@ class GuiCommandBuilder:
             dictionary,
             "--charuco-detector-preset",
             charuco_detector_preset,
+            "--charuco-origin-convention",
+            charuco_origin_convention,
             "--object-xyz-m",
             *[str(value) for value in object_xyz_m],
             "--object-rpy-deg",
@@ -295,6 +306,8 @@ class GuiCommandBuilder:
             command.append("--capture-once")
         if preview_output:
             command.extend(["--preview-output", preview_output])
+        if excluded_candidate_ids and excluded_candidate_ids.strip():
+            command.extend(["--excluded-candidate-ids", excluded_candidate_ids.strip()])
         self._append_serial(command, serial)
         self._append_data_root(command, data_root)
         return command
@@ -530,6 +543,8 @@ class FoundationPoseWorkflowGui:
         self.charuco_object_roll_deg = tk.StringVar(value="0.0")
         self.charuco_object_pitch_deg = tk.StringVar(value="0.0")
         self.charuco_object_yaw_deg = tk.StringVar(value="0.0")
+        self.charuco_corner_origin_enabled = tk.BooleanVar(value=True)
+        self.excluded_candidate_ids = tk.StringVar(value="")
         self.sam_device = tk.StringVar(value="auto")
         self.sam_resolution = tk.IntVar(value=1008)
         self.camera_model = tk.StringVar(value="d405")
@@ -629,8 +644,10 @@ class FoundationPoseWorkflowGui:
         ttk.Button(capture, text="Build Assets", command=lambda: self.run_build_assets(True)).grid(row=1, column=7)
         ttk.Button(capture, text="Force Build", command=self.run_force_build_assets).grid(row=1, column=8)
         ttk.Button(capture, text="Debug", command=self.run_debug_download).grid(row=1, column=9)
+        ttk.Label(capture, text="Exclude IDs").grid(row=2, column=0, sticky="w")
+        ttk.Entry(capture, textvariable=self.excluded_candidate_ids).grid(row=2, column=1, columnspan=9, sticky="ew")
         preview = ttk.Frame(capture)
-        preview.grid(row=2, column=0, columnspan=10, sticky="ew", pady=(8, 0))
+        preview.grid(row=3, column=0, columnspan=10, sticky="ew", pady=(8, 0))
         preview.columnconfigure(0, weight=1)
         preview.columnconfigure(1, weight=1)
         ttk.Label(preview, text="RGB").grid(row=0, column=0, sticky="w")
@@ -680,6 +697,9 @@ class FoundationPoseWorkflowGui:
         ).grid(row=2, column=1)
         ttk.Label(pose, text="SAM Res").grid(row=2, column=2)
         ttk.Entry(pose, textvariable=self.sam_resolution, width=7, state="readonly").grid(row=2, column=3)
+        ttk.Checkbutton(pose, text="Corner id 0 origin", variable=self.charuco_corner_origin_enabled).grid(
+            row=2, column=4, columnspan=3, sticky="w"
+        )
 
         build = ttk.LabelFrame(stages, text="5. Tracking", padding=6)
         build.grid(row=3, column=0, sticky="ew", pady=(8, 0))
@@ -715,6 +735,7 @@ class FoundationPoseWorkflowGui:
     def create_profile(self) -> None:
         profile = self.registry.create(self.profile_name.get(), prompt=self.prompt.get(), exist_ok=True)
         self.registry.select(profile.name)
+        self._load_reference_processing_settings(profile)
         self.status.set(f"Selected {profile.name}")
         self.refresh()
         self._update_capture_status()
@@ -727,6 +748,7 @@ class FoundationPoseWorkflowGui:
         profile = self.registry.select(name)
         self.profile_name.set(profile.name)
         self.prompt.set(profile.prompt)
+        self._load_reference_processing_settings(profile)
         self.status.set(f"Selected {profile.name}")
         self.refresh()
         self._update_capture_status()
@@ -915,6 +937,7 @@ class FoundationPoseWorkflowGui:
             self.status.set("Stopping recording first; press Processing again after it stops")
             return
         profile = self._current_profile()
+        self._persist_reference_processing_settings(profile)
         if not self._release_live_sessions_for_gpu():
             return
         if self.remote_state.get() == "Remote":
@@ -928,6 +951,7 @@ class FoundationPoseWorkflowGui:
             self.status.set("Stopping recording first; press Reselect again after it stops")
             return
         profile = self._current_profile()
+        self._persist_reference_processing_settings(profile)
         if not self._release_live_sessions_for_gpu():
             return
         if self.remote_state.get() == "Remote":
@@ -1295,6 +1319,8 @@ class FoundationPoseWorkflowGui:
             sam_resolution=str(self.sam_resolution.get()),
             required_keyframes=str(self.reference_target.get()),
             max_keyframes=str(self.max_keyframes.get()),
+            charuco_origin_convention=self._current_charuco_origin_convention(),
+            excluded_candidate_ids=self.excluded_candidate_ids.get(),
             data_root=self.config.data_root,
         )
 
@@ -1481,6 +1507,31 @@ class FoundationPoseWorkflowGui:
             ),
         )
 
+    def _current_charuco_origin_convention(self) -> str:
+        if bool(self.charuco_corner_origin_enabled.get()):
+            return CHARUCO_ORIGIN_CONVENTION_CORNER_ID_0
+        return CHARUCO_ORIGIN_CONVENTION_OPENCV_BOARD
+
+    def _load_reference_processing_settings(self, profile) -> None:
+        settings = profile.metadata.get(REFERENCE_PROCESSING_SETTINGS_KEY)
+        if not isinstance(settings, dict):
+            self.charuco_corner_origin_enabled.set(True)
+            self.excluded_candidate_ids.set("")
+            return
+        convention = str(settings.get("charuco_origin_convention") or CHARUCO_ORIGIN_CONVENTION_CORNER_ID_0)
+        self.charuco_corner_origin_enabled.set(convention != CHARUCO_ORIGIN_CONVENTION_OPENCV_BOARD)
+        excluded = normalize_excluded_candidate_ids(settings.get(EXCLUDED_CANDIDATE_IDS_KEY))
+        self.excluded_candidate_ids.set(" ".join(excluded))
+
+    def _persist_reference_processing_settings(self, profile) -> None:
+        settings = profile.metadata.get(REFERENCE_PROCESSING_SETTINGS_KEY)
+        settings = dict(settings) if isinstance(settings, dict) else {}
+        settings["charuco_origin_convention"] = self._current_charuco_origin_convention()
+        settings[EXCLUDED_CANDIDATE_IDS_KEY] = list(normalize_excluded_candidate_ids(self.excluded_candidate_ids.get()))
+        profile.metadata[REFERENCE_PROCESSING_SETTINGS_KEY] = settings
+        profile.touch()
+        profile.save()
+
     def _remote_processing_options(self, *, profile_name: str, reselect: bool) -> dict:
         return {
             "profile": profile_name,
@@ -1489,6 +1540,8 @@ class FoundationPoseWorkflowGui:
             "board_spec": self._current_board_spec().to_dict(),
             "board_object": self._current_board_object().to_dict(),
             "charuco_detector_preset": CHARUCO_DETECTOR_PRESET_CONSERVATIVE,
+            "charuco_origin_convention": self._current_charuco_origin_convention(),
+            "excluded_candidate_ids": list(normalize_excluded_candidate_ids(self.excluded_candidate_ids.get())),
             "sam_device": self.sam_device.get(),
             "sam_resolution": int(self.sam_resolution.get()),
             "sam_threshold": 0.3,

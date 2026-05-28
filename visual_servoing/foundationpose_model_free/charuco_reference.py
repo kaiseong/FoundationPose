@@ -17,6 +17,13 @@ from .reference_pose import reference_indices, write_reference_poses
 
 DICT_5X5_CANDIDATES = ("DICT_5X5_50", "DICT_5X5_100", "DICT_5X5_250", "DICT_5X5_1000")
 POSE_SOURCE = "charuco_board_jig"
+CHARUCO_ORIGIN_CONVENTION_CORNER_ID_0 = "charuco_corner_id_0"
+CHARUCO_ORIGIN_CONVENTION_OPENCV_BOARD = "opencv_board_origin"
+DEFAULT_CHARUCO_ORIGIN_CONVENTION = CHARUCO_ORIGIN_CONVENTION_CORNER_ID_0
+CHARUCO_ORIGIN_CONVENTIONS = (
+    CHARUCO_ORIGIN_CONVENTION_CORNER_ID_0,
+    CHARUCO_ORIGIN_CONVENTION_OPENCV_BOARD,
+)
 CHARUCO_DETECTOR_PRESET_OPENCV_DEFAULT = "opencv-default"
 CHARUCO_DETECTOR_PRESET_CONSERVATIVE = "conservative-charuco"
 CHARUCO_DETECTOR_PRESETS = (
@@ -192,6 +199,9 @@ class DictionaryCandidateResult:
     distortion_policy: str = "unknown"
     detector_preset: str = CHARUCO_DETECTOR_PRESET_OPENCV_DEFAULT
     detector_parameters: dict[str, Any] = field(default_factory=dict)
+    charuco_origin_convention: str = DEFAULT_CHARUCO_ORIGIN_CONVENTION
+    charuco_origin_offset_board_m: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    effective_board_T_object: np.ndarray | None = None
 
     def to_dict(self, *, include_matrices: bool = False) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -208,11 +218,14 @@ class DictionaryCandidateResult:
             "distortion_policy": self.distortion_policy,
             "detector_preset": self.detector_preset,
             "detector_parameters": dict(self.detector_parameters),
+            "charuco_origin_convention": self.charuco_origin_convention,
+            "charuco_origin_offset_board_m": list(self.charuco_origin_offset_board_m),
         }
         if include_matrices:
             data["camera_T_board"] = _matrix_to_list(self.camera_T_board)
             data["camera_T_object"] = _matrix_to_list(self.camera_T_object)
             data["cam_in_ob"] = _matrix_to_list(self.cam_in_ob)
+            data["effective_board_T_object"] = _matrix_to_list(self.effective_board_T_object)
         return data
 
 
@@ -226,9 +239,13 @@ class CharucoPoseResult:
     opencv_version: str
     board_coordinate_convention: str
     legacy_pattern: bool
+    charuco_origin_convention: str = DEFAULT_CHARUCO_ORIGIN_CONVENTION
+    charuco_origin_offset_board_m: tuple[float, float, float] = (0.0, 0.0, 0.0)
     camera_T_board: np.ndarray | None = None
     camera_T_object: np.ndarray | None = None
     cam_in_ob: np.ndarray | None = None
+    user_board_T_object: np.ndarray | None = None
+    effective_board_T_object: np.ndarray | None = None
     reject_reasons: list[str] = field(default_factory=list)
     detector_preset: str = CHARUCO_DETECTOR_PRESET_OPENCV_DEFAULT
     detector_parameters: dict[str, Any] = field(default_factory=dict)
@@ -246,11 +263,15 @@ class CharucoPoseResult:
             "opencv_version": self.opencv_version,
             "board_coordinate_convention": self.board_coordinate_convention,
             "legacy_pattern": bool(self.legacy_pattern),
+            "charuco_origin_convention": self.charuco_origin_convention,
+            "charuco_origin_offset_board_m": list(self.charuco_origin_offset_board_m),
             "detector_preset": self.detector_preset,
             "detector_parameters": dict(self.detector_parameters),
             "camera_T_board": _matrix_to_list(self.camera_T_board),
             "camera_T_object": _matrix_to_list(self.camera_T_object),
             "cam_in_ob": _matrix_to_list(self.cam_in_ob),
+            "user_board_T_object": _matrix_to_list(self.user_board_T_object),
+            "effective_board_T_object": _matrix_to_list(self.effective_board_T_object),
             "reject_reasons": list(self.reject_reasons),
             "candidates": [candidate.to_dict(include_matrices=False) for candidate in self.candidates],
         }
@@ -260,6 +281,52 @@ def camera_T_object_from_board(camera_T_board: np.ndarray, board_T_object: np.nd
     camera_T_board = _require_transform(camera_T_board, "camera_T_board")
     board_T_object = _require_transform(board_T_object, "board_T_object")
     return camera_T_board @ board_T_object
+
+
+def normalize_charuco_origin_convention(value: str | None = None) -> str:
+    convention = str(value or DEFAULT_CHARUCO_ORIGIN_CONVENTION).strip().lower().replace("-", "_")
+    aliases = {
+        "corner_id_0": CHARUCO_ORIGIN_CONVENTION_CORNER_ID_0,
+        "charuco_corner0": CHARUCO_ORIGIN_CONVENTION_CORNER_ID_0,
+        "charuco_corner_id0": CHARUCO_ORIGIN_CONVENTION_CORNER_ID_0,
+        "charuco_corner_id_0": CHARUCO_ORIGIN_CONVENTION_CORNER_ID_0,
+        "opencv": CHARUCO_ORIGIN_CONVENTION_OPENCV_BOARD,
+        "opencv_board": CHARUCO_ORIGIN_CONVENTION_OPENCV_BOARD,
+        "opencv_board_origin": CHARUCO_ORIGIN_CONVENTION_OPENCV_BOARD,
+    }
+    convention = aliases.get(convention, convention)
+    if convention not in CHARUCO_ORIGIN_CONVENTIONS:
+        raise ValueError(
+            "unsupported ChArUco origin convention: "
+            f"{value}; expected one of {', '.join(CHARUCO_ORIGIN_CONVENTIONS)}"
+        )
+    return convention
+
+
+def charuco_origin_offset_board_m(
+    board_spec: CharucoBoardSpec,
+    charuco_origin_convention: str | None = None,
+) -> tuple[float, float, float]:
+    convention = normalize_charuco_origin_convention(charuco_origin_convention)
+    if convention == CHARUCO_ORIGIN_CONVENTION_OPENCV_BOARD:
+        return (0.0, 0.0, 0.0)
+    square = float(board_spec.square_length_m)
+    return (square, square, 0.0)
+
+
+def effective_board_T_object(
+    board_spec: CharucoBoardSpec,
+    user_board_T_object: np.ndarray,
+    *,
+    charuco_origin_convention: str | None = None,
+) -> np.ndarray:
+    user_transform = _require_transform(user_board_T_object, "user_board_T_object")
+    offset = np.eye(4, dtype=np.float64)
+    offset[:3, 3] = np.asarray(
+        charuco_origin_offset_board_m(board_spec, charuco_origin_convention),
+        dtype=np.float64,
+    )
+    return offset @ user_transform
 
 
 def cam_in_ob_from_camera_T_object(camera_T_object: np.ndarray) -> np.ndarray:
@@ -292,12 +359,14 @@ def detect_charuco_pose(
     board_object: BoardObjectTransform | None = None,
     detector_config: CharucoDetectorConfig | None = None,
     detector_preset: str | None = None,
+    charuco_origin_convention: str | None = None,
 ) -> CharucoPoseResult:
     cv2 = _require_cv2()
     board_spec = board_spec or CharucoBoardSpec()
     quality_config = quality_config or CharucoQualityConfig()
     board_object = board_object or BoardObjectTransform.identity()
     detector_config = _resolve_detector_config(detector_config, detector_preset)
+    origin_convention = normalize_charuco_origin_convention(charuco_origin_convention)
     image = np.asarray(image_rgb)
     if image.ndim != 3 or image.shape[2] != 3:
         raise ValueError(f"image_rgb must have shape (H, W, 3), got {image.shape}")
@@ -318,11 +387,18 @@ def detect_charuco_pose(
                         legacy_pattern=legacy_pattern,
                         board_T_object=board_object.board_T_object,
                         detector_config=detector_config,
+                        charuco_origin_convention=origin_convention,
                     )
                 )
     best = choose_best_dictionary_result(candidates)
     ok = bool(best and best.ok)
     selected_board_spec = _selected_board_spec(board_spec, best)
+    user_board_T_object = board_object.board_T_object
+    effective_transform = effective_board_T_object(
+        selected_board_spec,
+        user_board_T_object,
+        charuco_origin_convention=origin_convention,
+    )
     return CharucoPoseResult(
         ok=ok,
         selected_dictionary=best.dictionary if best and best.ok else None,
@@ -332,9 +408,13 @@ def detect_charuco_pose(
         opencv_version=str(cv2.__version__),
         board_coordinate_convention="opencv_charuco_board",
         legacy_pattern=bool(best.legacy_pattern) if best else bool(board_spec.legacy_pattern),
+        charuco_origin_convention=origin_convention,
+        charuco_origin_offset_board_m=charuco_origin_offset_board_m(selected_board_spec, origin_convention),
         camera_T_board=best.camera_T_board if best and best.ok else None,
         camera_T_object=best.camera_T_object if best and best.ok else None,
         cam_in_ob=best.cam_in_ob if best and best.ok else None,
+        user_board_T_object=user_board_T_object,
+        effective_board_T_object=best.effective_board_T_object if best and best.ok else effective_transform,
         reject_reasons=[] if ok else (best.reject_reasons if best else ["no dictionary candidates"]),
         detector_preset=detector_config.preset,
         detector_parameters=detector_config.parameter_summary(),
@@ -348,6 +428,7 @@ def generate_charuco_reference_poses(
     quality_config: CharucoQualityConfig,
     board_object: BoardObjectTransform,
     detector_config: CharucoDetectorConfig | None = None,
+    charuco_origin_convention: str | None = None,
 ) -> list[CharucoPoseResult]:
     intrinsics = load_reference_intrinsics(profile)
     indices = reference_indices(profile)
@@ -361,6 +442,7 @@ def generate_charuco_reference_poses(
             quality_config=quality_config,
             board_object=board_object,
             detector_config=detector_config,
+            charuco_origin_convention=charuco_origin_convention,
         )
         results.append(result)
     failures = [(index, result.reject_reasons) for index, result in zip(indices, results) if not result.ok]
@@ -431,6 +513,8 @@ def build_charuco_pose_provenance(
         "selected_dictionaries": [result.selected_dictionary for result in results],
         "opencv_version": first.opencv_version if first else None,
         "board_coordinate_convention": first.board_coordinate_convention if first else None,
+        "charuco_origin_convention": first.charuco_origin_convention if first else None,
+        "charuco_origin_offset_board_m": list(first.charuco_origin_offset_board_m) if first else None,
         "legacy_pattern": first.legacy_pattern if first else None,
         "detector_preset": first.detector_preset if first else None,
         "detector_parameters": dict(first.detector_parameters) if first else {},
@@ -472,6 +556,8 @@ def provenance_summary(profile: ObjectProfile) -> dict[str, Any] | None:
         "selected_dictionaries": provenance.get("selected_dictionaries"),
         "opencv_version": provenance.get("opencv_version"),
         "board_coordinate_convention": provenance.get("board_coordinate_convention"),
+        "charuco_origin_convention": provenance.get("charuco_origin_convention"),
+        "charuco_origin_offset_board_m": provenance.get("charuco_origin_offset_board_m"),
         "legacy_pattern": provenance.get("legacy_pattern"),
         "detector_preset": provenance.get("detector_preset"),
         "detector_parameters": provenance.get("detector_parameters"),
@@ -487,35 +573,63 @@ def draw_charuco_axes_overlay_bgr(
     *,
     axis_length_m: float = 0.05,
 ) -> np.ndarray:
-    """Draw the OpenCV board origin and +X/+Y/+Z axes on an RGB frame."""
+    """Draw the raw board outline and corrected object-origin +X/+Y/+Z axes."""
 
-    if not result.ok or result.camera_T_board is None:
-        raise ValueError("valid ChArUco board pose is required to draw axes")
+    if not result.ok or result.camera_T_board is None or result.camera_T_object is None:
+        raise ValueError("valid ChArUco board and object poses are required to draw axes")
     cv2 = _require_cv2()
     image_bgr = cv2.cvtColor(np.asarray(image_rgb, dtype=np.uint8), cv2.COLOR_RGB2BGR)
     camera_T_board = np.asarray(result.camera_T_board, dtype=np.float64)
-    rvec, _ = cv2.Rodrigues(camera_T_board[:3, :3])
-    tvec = camera_T_board[:3, 3].reshape(3, 1)
+    camera_T_object = np.asarray(result.camera_T_object, dtype=np.float64)
+    board_rvec, _ = cv2.Rodrigues(camera_T_board[:3, :3])
+    board_tvec = camera_T_board[:3, 3].reshape(3, 1)
+    object_rvec, _ = cv2.Rodrigues(camera_T_object[:3, :3])
+    object_tvec = camera_T_object[:3, 3].reshape(3, 1)
     dist_coeffs = intrinsics.as_distortion_coeffs(fallback_zeros=True)
     length = float(axis_length_m)
     board_width_m = float(result.board_spec.squares_x) * float(result.board_spec.square_length_m)
     board_height_m = float(result.board_spec.squares_y) * float(result.board_spec.square_length_m)
 
-    points = np.array(
+    board_points = np.array(
         [
             [0.0, 0.0, 0.0],
-            [length, 0.0, 0.0],
-            [0.0, length, 0.0],
-            [0.0, 0.0, length],
             [board_width_m, 0.0, 0.0],
             [board_width_m, board_height_m, 0.0],
             [0.0, board_height_m, 0.0],
         ],
         dtype=np.float32,
     )
-    projected, _ = cv2.projectPoints(points, rvec, tvec, intrinsics.as_matrix(), dist_coeffs)
-    origin, x_end, y_end, z_end, board_x, board_xy, board_y = projected.reshape(-1, 2).astype(int)
-    _draw_polyline_with_shadow(image_bgr, [origin, board_x, board_xy, board_y, origin], (255, 255, 255), thickness=2)
+    object_axis_points = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [length, 0.0, 0.0],
+            [0.0, length, 0.0],
+            [0.0, 0.0, length],
+        ],
+        dtype=np.float32,
+    )
+    board_projected, _ = cv2.projectPoints(
+        board_points,
+        board_rvec,
+        board_tvec,
+        intrinsics.as_matrix(),
+        dist_coeffs,
+    )
+    object_projected, _ = cv2.projectPoints(
+        object_axis_points,
+        object_rvec,
+        object_tvec,
+        intrinsics.as_matrix(),
+        dist_coeffs,
+    )
+    board_origin, board_x, board_xy, board_y = board_projected.reshape(-1, 2).astype(int)
+    origin, x_end, y_end, z_end = object_projected.reshape(-1, 2).astype(int)
+    _draw_polyline_with_shadow(
+        image_bgr,
+        [board_origin, board_x, board_xy, board_y, board_origin],
+        (255, 255, 255),
+        thickness=2,
+    )
     _draw_axis_arrow(image_bgr, origin, x_end, (0, 0, 255), "+X")
     _draw_axis_arrow(image_bgr, origin, y_end, (0, 255, 0), "+Y")
     _draw_axis_arrow(image_bgr, origin, z_end, (255, 0, 0), "+Z")
@@ -600,9 +714,17 @@ def _detect_candidate(
     legacy_pattern: bool,
     board_T_object: np.ndarray,
     detector_config: CharucoDetectorConfig,
+    charuco_origin_convention: str,
 ) -> DictionaryCandidateResult:
     reject_reasons: list[str] = []
     detector_parameters = detector_config.parameter_summary()
+    origin_convention = normalize_charuco_origin_convention(charuco_origin_convention)
+    origin_offset = charuco_origin_offset_board_m(board_spec, origin_convention)
+    effective_transform = effective_board_T_object(
+        board_spec,
+        board_T_object,
+        charuco_origin_convention=origin_convention,
+    )
 
     def candidate_result(**overrides) -> DictionaryCandidateResult:
         data: dict[str, Any] = {
@@ -613,6 +735,8 @@ def _detect_candidate(
             "squares_y": board_spec.squares_y,
             "detector_preset": detector_config.preset,
             "detector_parameters": detector_parameters,
+            "charuco_origin_convention": origin_convention,
+            "charuco_origin_offset_board_m": origin_offset,
         }
         data.update(overrides)
         return DictionaryCandidateResult(**data)
@@ -751,7 +875,7 @@ def _detect_candidate(
             f"reprojection error {reprojection_error:.3f}px above maximum {quality_config.max_reprojection_error_px:.3f}px"
         )
 
-    camera_T_object = camera_T_object_from_board(camera_T_board, board_T_object)
+    camera_T_object = camera_T_object_from_board(camera_T_board, effective_transform)
     cam_in_ob = cam_in_ob_from_camera_T_object(camera_T_object)
     ok = not reject_reasons
     return candidate_result(
@@ -764,6 +888,7 @@ def _detect_candidate(
         camera_T_board=camera_T_board,
         camera_T_object=camera_T_object,
         cam_in_ob=cam_in_ob,
+        effective_board_T_object=effective_transform,
         distortion_policy=distortion_policy,
     )
 

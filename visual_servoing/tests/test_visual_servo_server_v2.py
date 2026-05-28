@@ -85,6 +85,8 @@ class FakeTracker:
 def fake_processing_runner(profile, options):
     assert options["profile"] == profile.name
     assert (profile.root / "recordings" / "session-1" / "session.json").exists()
+    assert options["charuco_origin_convention"] == "charuco_corner_id_0"
+    assert options["excluded_candidate_ids"] == ["session-1:000003"]
     return {
         "ok": True,
         "returncode": 0,
@@ -191,6 +193,8 @@ def _recordings_archive(*, profile="phone"):
                     "required_keyframes": 3,
                     "max_keyframes": 8,
                     "charuco_detector_preset": "conservative-charuco",
+                    "charuco_origin_convention": "charuco_corner_id_0",
+                    "excluded_candidate_ids": ["session-1:000003"],
                 }
             ),
         )
@@ -247,6 +251,14 @@ def _write_processing_debug_fixture(profile) -> None:
         "required_keyframes": 1,
         "thresholds": {"min_depth_m": 0.05, "max_depth_m": 1.0},
         "processing_cache_path": str(cache_dir),
+        "processing_summary": {
+            "eligible_count": 2,
+            "excluded_count": 1,
+            "selected_count": 1,
+            "excluded_candidate_ids": ["session-1:000001"],
+            "charuco_origin_convention": "charuco_corner_id_0",
+            "charuco_origin_offset_board_m": [0.03, 0.03, 0.0],
+        },
         "records": [
             {
                 "candidate_id": "session-1:000000",
@@ -314,6 +326,13 @@ def test_debug_artifacts_endpoint_returns_selected_processing_candidates_only(tm
     assert manifest["profile"] == "phone"
     assert manifest["run_id"] == "process-test"
     assert manifest["candidate_count"] == 1
+    assert manifest["accepted_count"] == 2
+    assert manifest["eligible_count"] == 2
+    assert manifest["excluded_count"] == 1
+    assert manifest["selected_count"] == 1
+    assert manifest["excluded_candidate_ids"] == ["session-1:000001"]
+    assert manifest["charuco_origin_convention"] == "charuco_corner_id_0"
+    assert manifest["charuco_origin_offset_board_m"] == [0.03, 0.03, 0.0]
     assert candidate["candidate_id"] == "session-1:000000"
     assert candidate["charuco_axes"] in names
     assert candidate["mask"] in names

@@ -34,6 +34,8 @@ def test_fp_charuco_reference_help_exits_successfully():
     assert "--required-keyframes" in completed.stdout
     assert "--max-keyframes" in completed.stdout
     assert "--charuco-detector-preset" in completed.stdout
+    assert "--charuco-origin-convention" in completed.stdout
+    assert "--excluded-candidate-ids" in completed.stdout
     assert "--compare-charuco-detector-presets" in completed.stdout
 
 

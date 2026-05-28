@@ -13,6 +13,8 @@ import numpy as np
 
 from visual_servoing.foundationpose_model_free.charuco_reference import (
     BoardObjectTransform,
+    CHARUCO_ORIGIN_CONVENTIONS,
+    DEFAULT_CHARUCO_ORIGIN_CONVENTION,
     CharucoBoardSpec,
     CharucoDetectorConfig,
     CHARUCO_DETECTOR_PRESET_CONSERVATIVE,
@@ -23,6 +25,7 @@ from visual_servoing.foundationpose_model_free.charuco_reference import (
     draw_charuco_detection_debug_bgr,
     draw_charuco_axes_overlay_bgr,
     generate_charuco_reference_poses,
+    normalize_charuco_origin_convention,
     record_charuco_pose_provenance,
     write_charuco_reference_poses,
 )
@@ -88,6 +91,17 @@ def main() -> int:
         default="opencv-default",
         help="ChArUco detector parameter preset. Default preserves the existing OpenCV behavior.",
     )
+    parser.add_argument(
+        "--charuco-origin-convention",
+        choices=CHARUCO_ORIGIN_CONVENTIONS,
+        default=DEFAULT_CHARUCO_ORIGIN_CONVENTION,
+        help="Origin convention for Obj XYZ/RPY. Default uses ChArUco corner id 0 instead of OpenCV board origin.",
+    )
+    parser.add_argument(
+        "--excluded-candidate-ids",
+        default=None,
+        help="Comma/space separated raw candidate ids to exclude during Processing/Reselect, e.g. session:000123.",
+    )
     parser.add_argument("--board-t-object", help="Path to 4x4 txt or JSON board_T_object.")
     parser.add_argument("--object-xyz-m", nargs=3, type=float, metavar=("X", "Y", "Z"))
     parser.add_argument("--object-rpy-deg", nargs=3, type=float, default=(0.0, 0.0, 0.0), metavar=("R", "P", "Y"))
@@ -133,6 +147,7 @@ def main() -> int:
             min_image_coverage_fraction=args.min_image_coverage_fraction,
         )
         detector_config = CharucoDetectorConfig(args.charuco_detector_preset)
+        args.charuco_origin_convention = normalize_charuco_origin_convention(args.charuco_origin_convention)
         board_object = _board_object_from_args(args, required=not args.detect_only)
         if args.offline_generate:
             payload = _offline_generate(args, board_spec, quality_config, board_object, detector_config)
@@ -177,6 +192,7 @@ def _offline_generate(
         quality_config=quality_config,
         board_object=board_object,
         detector_config=detector_config,
+        charuco_origin_convention=args.charuco_origin_convention,
     )
     write_charuco_reference_poses(profile, results, board_object=board_object)
     return {
@@ -186,6 +202,7 @@ def _offline_generate(
         "object": profile.name,
         "frame_count": len(results),
         "detector_preset": detector_config.preset,
+        "charuco_origin_convention": args.charuco_origin_convention,
         "selected_dictionaries": [result.selected_dictionary for result in results],
         "median_reprojection_error_px": _median_reprojection_error(results),
     }
@@ -208,6 +225,7 @@ def _detect_only(
             quality_config=quality_config,
             board_object=board_object,
             detector_config=detector_config,
+            charuco_origin_convention=args.charuco_origin_convention,
         )
         preview_path = _write_axis_preview_if_requested(args, image, intrinsics, result)
         return {
@@ -215,6 +233,7 @@ def _detect_only(
             "returncode": 0 if result.ok else 1,
             "mode": "detect_only",
             "detector_preset": detector_config.preset,
+            "charuco_origin_convention": args.charuco_origin_convention,
             "preview_path": preview_path,
             "result": result.to_metadata(),
         }
@@ -248,6 +267,7 @@ def _live_detect_only(
                 quality_config=quality_config,
                 board_object=board_object,
                 detector_config=detector_config,
+                charuco_origin_convention=args.charuco_origin_convention,
             )
             preview_path = _write_axis_preview_if_requested(args, frame.rgb, frame.intrinsics, result)
             _print_preview_status(result.to_metadata(), force=True)
@@ -256,6 +276,7 @@ def _live_detect_only(
                 "returncode": 0 if result.ok else 1,
                 "mode": "detect_only_capture_once",
                 "detector_preset": detector_config.preset,
+                "charuco_origin_convention": args.charuco_origin_convention,
                 "preview_path": preview_path,
                 "result": result.to_metadata(),
             }
@@ -268,6 +289,7 @@ def _live_detect_only(
                 quality_config=quality_config,
                 board_object=board_object,
                 detector_config=detector_config,
+                charuco_origin_convention=args.charuco_origin_convention,
             )
             accepted += int(result.ok)
             metadata = result.to_metadata()
@@ -295,6 +317,7 @@ def _live_detect_only(
         "returncode": 0,
         "mode": "detect_only_live",
         "detector_preset": detector_config.preset,
+        "charuco_origin_convention": args.charuco_origin_convention,
         "accepted_preview_frames": accepted,
     }
 
@@ -355,6 +378,7 @@ def _live_capture(
                 quality_config=quality_config,
                 board_object=board_object,
                 detector_config=detector_config,
+                charuco_origin_convention=args.charuco_origin_convention,
             )
             timing_ms = {"charuco_pose_ms": (time.perf_counter() - start) * 1000.0}
             if not result.ok or result.cam_in_ob is None:
@@ -413,6 +437,7 @@ def _live_capture(
         "mode": "live_capture",
         "object": profile.name,
         "detector_preset": detector_config.preset,
+        "charuco_origin_convention": args.charuco_origin_convention,
         "accepted": accepted,
         "rejected": rejected,
         "records": records,
@@ -503,6 +528,8 @@ def _process_recordings(
             board_object=board_object,
             config=config,
             detector_config=detector_config,
+            charuco_origin_convention=args.charuco_origin_convention,
+            excluded_candidate_ids=args.excluded_candidate_ids,
         )
     else:
         report = process_recorded_references(
@@ -513,12 +540,15 @@ def _process_recordings(
             board_object=board_object,
             config=config,
             detector_config=detector_config,
+            charuco_origin_convention=args.charuco_origin_convention,
+            excluded_candidate_ids=args.excluded_candidate_ids,
         )
     payload = report.to_dict()
     payload["ok"] = report.ok
     payload["returncode"] = 0 if report.accepted > 0 else 1
     payload["mode"] = "process_recordings"
     payload["detector_preset"] = detector_config.preset
+    payload["charuco_origin_convention"] = args.charuco_origin_convention
     return payload
 
 
@@ -555,6 +585,8 @@ def _compare_charuco_detector_presets(
             board_object=board_object,
             config=eval_config,
             detector_config=CharucoDetectorConfig(preset),
+            charuco_origin_convention=args.charuco_origin_convention,
+            excluded_candidate_ids=args.excluded_candidate_ids,
         )
     payload = _charuco_detector_ab_payload(profile.name, reports)
     profile.logs_dir.mkdir(parents=True, exist_ok=True)
@@ -564,6 +596,7 @@ def _compare_charuco_detector_presets(
     payload["ok"] = bool(reports[CHARUCO_DETECTOR_PRESET_CONSERVATIVE].accepted > 0)
     payload["returncode"] = 0 if payload["ok"] else 1
     payload["mode"] = "compare_charuco_detector_presets"
+    payload["charuco_origin_convention"] = args.charuco_origin_convention
     return payload
 
 
@@ -658,12 +691,15 @@ def _reselect_recordings(
         board_object=board_object,
         config=config,
         detector_config=detector_config,
+        charuco_origin_convention=args.charuco_origin_convention,
+        excluded_candidate_ids=args.excluded_candidate_ids,
     )
     payload = report.to_dict()
     payload["ok"] = report.ok
     payload["returncode"] = 0 if report.accepted > 0 else 1
     payload["mode"] = "reselect_recordings"
     payload["detector_preset"] = detector_config.preset
+    payload["charuco_origin_convention"] = args.charuco_origin_convention
     return payload
 
 

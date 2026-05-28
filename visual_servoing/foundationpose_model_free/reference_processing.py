@@ -7,6 +7,7 @@ import inspect
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import time
 from typing import Any, Callable
@@ -17,14 +18,17 @@ from visual_servoing.point_pose.rgbd_geometry import CameraIntrinsics
 
 from .charuco_reference import (
     BoardObjectTransform,
+    DEFAULT_CHARUCO_ORIGIN_CONVENTION,
     CharucoBoardSpec,
     CharucoDetectorConfig,
     CharucoPoseResult,
     CharucoQualityConfig,
     CHARUCO_DETECTOR_PRESET_OPENCV_DEFAULT,
     DictionaryCandidateResult,
+    charuco_origin_offset_board_m,
     detect_charuco_pose,
     draw_charuco_axes_overlay_bgr,
+    normalize_charuco_origin_convention,
     record_charuco_pose_provenance,
 )
 from .mask_provider import MaskProvider, MaskResult
@@ -43,6 +47,8 @@ PROCESSING_CACHE_POINTER = "latest.json"
 PROCESSING_CACHE_RECORDS = "records.json"
 PROCESSING_CACHE_VERSION = 1
 CHARUCO_AXES_PREVIEW_DIRNAME = "charuco_axes"
+REFERENCE_PROCESSING_SETTINGS_KEY = "reference_processing_settings"
+EXCLUDED_CANDIDATE_IDS_KEY = "excluded_candidate_ids"
 
 
 @dataclass(frozen=True)
@@ -160,6 +166,56 @@ class ReferenceProcessingReport:
 PoseDetector = Callable[..., CharucoPoseResult]
 
 
+def normalize_excluded_candidate_ids(value: Any | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    raw_items: list[Any]
+    if isinstance(value, str):
+        raw_items = [value]
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = list(value)
+    else:
+        raw_items = [value]
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_items:
+        if raw is None:
+            continue
+        parts = re.split(r"[,;\s]+", raw) if isinstance(raw, str) else [str(raw)]
+        for part in parts:
+            candidate_id = str(part).strip()
+            if not candidate_id or candidate_id in seen:
+                continue
+            seen.add(candidate_id)
+            result.append(candidate_id)
+    return tuple(result)
+
+
+def profile_excluded_candidate_ids(profile: ObjectProfile) -> tuple[str, ...]:
+    settings = profile.metadata.get(REFERENCE_PROCESSING_SETTINGS_KEY)
+    if not isinstance(settings, dict):
+        return ()
+    return normalize_excluded_candidate_ids(settings.get(EXCLUDED_CANDIDATE_IDS_KEY))
+
+
+def set_profile_excluded_candidate_ids(profile: ObjectProfile, value: Any | None) -> tuple[str, ...]:
+    excluded_ids = normalize_excluded_candidate_ids(value)
+    settings = profile.metadata.get(REFERENCE_PROCESSING_SETTINGS_KEY)
+    settings = dict(settings) if isinstance(settings, dict) else {}
+    settings[EXCLUDED_CANDIDATE_IDS_KEY] = list(excluded_ids)
+    profile.metadata[REFERENCE_PROCESSING_SETTINGS_KEY] = settings
+    profile.touch()
+    profile.save()
+    return excluded_ids
+
+
+def _resolve_profile_excluded_candidate_ids(profile: ObjectProfile, value: Any | None) -> tuple[str, ...]:
+    if value is None:
+        return profile_excluded_candidate_ids(profile)
+    return set_profile_excluded_candidate_ids(profile, value)
+
+
 def process_recorded_references(
     profile: ObjectProfile,
     *,
@@ -169,10 +225,14 @@ def process_recorded_references(
     board_object: BoardObjectTransform,
     config: ReferenceProcessingConfig | None = None,
     detector_config: CharucoDetectorConfig | None = None,
+    charuco_origin_convention: str | None = None,
+    excluded_candidate_ids: Any | None = None,
     pose_detector: PoseDetector = detect_charuco_pose,
 ) -> ReferenceProcessingReport:
     config = config or ReferenceProcessingConfig()
     detector_config = detector_config or CharucoDetectorConfig()
+    origin_convention = normalize_charuco_origin_convention(charuco_origin_convention)
+    excluded_ids = _resolve_profile_excluded_candidate_ids(profile, excluded_candidate_ids)
     run_id = _new_processing_run_id()
     try:
         sessions = [session for session in list_recording_sessions(profile)]
@@ -184,6 +244,7 @@ def process_recorded_references(
             board_object=board_object,
             config=config,
             detector_config=detector_config,
+            charuco_origin_convention=origin_convention,
             mask_provider=mask_provider,
         )
         source_cache_path, source_payload = source_cache if source_cache is not None else (None, None)
@@ -207,6 +268,7 @@ def process_recorded_references(
                 board_object=board_object,
                 config=config,
                 detector_config=detector_config,
+                charuco_origin_convention=origin_convention,
                 pose_detector=pose_detector,
             )
             for candidate in candidates
@@ -219,6 +281,7 @@ def process_recorded_references(
             board_object=board_object,
             config=config,
             detector_config=detector_config,
+            charuco_origin_convention=origin_convention,
             run_id=run_id,
             mask_provider=mask_provider,
             reusable_records=reusable_records,
@@ -230,6 +293,8 @@ def process_recorded_references(
                 "newly_processed_candidates": len(evaluated),
                 "total_recorded_frames": len(recorded_frame_index),
                 "detector_preset": detector_config.preset,
+                "charuco_origin_convention": origin_convention,
+                "charuco_origin_offset_board_m": list(charuco_origin_offset_board_m(board_spec, origin_convention)),
             },
         )
         _, cache_payload = load_processing_cache(profile, cache_dir=cache_path)
@@ -237,7 +302,11 @@ def process_recorded_references(
             dict(cache_payload.get("processing_summary")) if isinstance(cache_payload.get("processing_summary"), dict) else {}
         )
         cached_records = list(cache_payload.get("records", []))
-        selected_records = select_view_diverse_records(cached_records, config=config)
+        selected_records = select_view_diverse_records(
+            cached_records,
+            config=config,
+            excluded_candidate_ids=excluded_ids,
+        )
         for index, record in enumerate(selected_records):
             record["selected_index"] = index
         readiness = _readiness_for_cached_selection(selected_records, cached_records, config)
@@ -276,12 +345,15 @@ def process_recorded_references(
                 "total_recorded_frames": len(recorded_frame_index),
                 "detector_preset": detector_config.preset,
                 "detector_config": detector_config.to_dict(),
+                "charuco_origin_convention": origin_convention,
+                "charuco_origin_offset_board_m": list(charuco_origin_offset_board_m(board_spec, origin_convention)),
                 "charuco_axes_preview_count": int(cache_processing_summary.get("charuco_axes_preview_count", 0)),
                 "charuco_axes_preview_dir": cache_processing_summary.get(
                     "charuco_axes_preview_dir",
                     CHARUCO_AXES_PREVIEW_DIRNAME,
                 ),
             },
+            excluded_candidate_ids=excluded_ids,
         )
         return write_processing_report(profile, report)
     finally:
@@ -299,6 +371,8 @@ def evaluate_recorded_references(
     board_object: BoardObjectTransform,
     config: ReferenceProcessingConfig | None = None,
     detector_config: CharucoDetectorConfig | None = None,
+    charuco_origin_convention: str | None = None,
+    excluded_candidate_ids: Any | None = None,
     pose_detector: PoseDetector = detect_charuco_pose,
 ) -> ReferenceProcessingReport:
     config = config or ReferenceProcessingConfig(publish=False)
@@ -320,6 +394,8 @@ def evaluate_recorded_references(
         board_object=board_object,
         config=config,
         detector_config=detector_config,
+        charuco_origin_convention=charuco_origin_convention,
+        excluded_candidate_ids=excluded_candidate_ids,
         pose_detector=pose_detector,
     )
 
@@ -332,12 +408,16 @@ def reselect_recorded_references(
     board_object: BoardObjectTransform,
     config: ReferenceProcessingConfig | None = None,
     detector_config: CharucoDetectorConfig | None = None,
+    charuco_origin_convention: str | None = None,
+    excluded_candidate_ids: Any | None = None,
     cache_dir: str | Path | None = None,
 ) -> ReferenceProcessingReport:
     """Republish references from the latest processing cache without rerunning SAM."""
 
     config = config or ReferenceProcessingConfig()
     detector_config = detector_config or CharucoDetectorConfig()
+    origin_convention = normalize_charuco_origin_convention(charuco_origin_convention)
+    excluded_ids = _resolve_profile_excluded_candidate_ids(profile, excluded_candidate_ids)
     run_id = _new_processing_run_id()
     cache_path, cache_payload = load_processing_cache(profile, cache_dir=cache_dir)
     _validate_processing_cache(
@@ -346,9 +426,14 @@ def reselect_recorded_references(
         quality_config=quality_config,
         board_object=board_object,
         detector_config=detector_config,
+        charuco_origin_convention=origin_convention,
     )
     cached_records = list(cache_payload.get("records", []))
-    selected_records = select_view_diverse_records(cached_records, config=config)
+    selected_records = select_view_diverse_records(
+        cached_records,
+        config=config,
+        excluded_candidate_ids=excluded_ids,
+    )
     for index, record in enumerate(selected_records):
         record["selected_index"] = index
     sessions = [session for session in list_recording_sessions(profile)]
@@ -376,6 +461,14 @@ def reselect_recorded_references(
         force_build_allowed=force_build_allowed,
         published=published,
         processing_cache_path=str(cache_path),
+        processing_summary={
+            "source_processing_run_id": str(cache_payload.get("run_id") or ""),
+            "detector_preset": detector_config.preset,
+            "detector_config": detector_config.to_dict(),
+            "charuco_origin_convention": origin_convention,
+            "charuco_origin_offset_board_m": list(charuco_origin_offset_board_m(board_spec, origin_convention)),
+        },
+        excluded_candidate_ids=excluded_ids,
     )
     return write_processing_report(profile, report)
 
@@ -389,6 +482,7 @@ def write_processing_cache(
     board_object: BoardObjectTransform,
     config: ReferenceProcessingConfig,
     detector_config: CharucoDetectorConfig,
+    charuco_origin_convention: str,
     run_id: str,
     mask_provider: MaskProvider | None = None,
     reusable_records: list[dict[str, Any]] | None = None,
@@ -439,6 +533,7 @@ def write_processing_cache(
             record["charuco_axes_preview_path"] = preview_rel
         records.append(record)
     processing_summary = dict(cache_metadata or {})
+    origin_convention = normalize_charuco_origin_convention(charuco_origin_convention)
     processing_summary["charuco_axes_preview_count"] = len(
         [record for record in records if record.get("charuco_axes_preview_path")]
     )
@@ -451,6 +546,8 @@ def write_processing_cache(
         "board_spec": board_spec.to_dict(),
         "quality_config": quality_config.to_dict(),
         "board_object": board_object.to_dict(),
+        "charuco_origin_convention": origin_convention,
+        "charuco_origin_offset_board_m": list(charuco_origin_offset_board_m(board_spec, origin_convention)),
         "detector_config": detector_config.to_dict(),
         "detector_preset": detector_config.preset,
         "thresholds": config.to_dict(),
@@ -519,6 +616,7 @@ def _load_reusable_processing_cache(
     board_object: BoardObjectTransform,
     config: ReferenceProcessingConfig,
     detector_config: CharucoDetectorConfig,
+    charuco_origin_convention: str,
     mask_provider: MaskProvider | None,
 ) -> tuple[Path, dict[str, Any]] | None:
     try:
@@ -532,6 +630,7 @@ def _load_reusable_processing_cache(
             quality_config=quality_config,
             board_object=board_object,
             detector_config=detector_config,
+            charuco_origin_convention=charuco_origin_convention,
         )
     except ValueError:
         return None
@@ -617,9 +716,11 @@ def evaluate_candidate(
     board_object: BoardObjectTransform,
     config: ReferenceProcessingConfig,
     detector_config: CharucoDetectorConfig | None = None,
+    charuco_origin_convention: str | None = None,
     pose_detector: PoseDetector = detect_charuco_pose,
 ) -> EvaluatedCandidate:
     detector_config = detector_config or CharucoDetectorConfig()
+    origin_convention = normalize_charuco_origin_convention(charuco_origin_convention)
     start = time.perf_counter()
     try:
         pose_kwargs = {
@@ -629,6 +730,8 @@ def evaluate_candidate(
         }
         if _pose_detector_accepts_detector_config(pose_detector):
             pose_kwargs["detector_config"] = detector_config
+        if _pose_detector_accepts_arg(pose_detector, "charuco_origin_convention"):
+            pose_kwargs["charuco_origin_convention"] = origin_convention
         pose = pose_detector(candidate.rgb, candidate.intrinsics, **pose_kwargs)
     except Exception as exc:
         return EvaluatedCandidate(
@@ -724,8 +827,10 @@ def select_view_diverse_candidates(
     evaluated: list[EvaluatedCandidate],
     *,
     config: ReferenceProcessingConfig,
+    excluded_candidate_ids: Any | None = None,
 ) -> list[EvaluatedCandidate]:
-    accepted = [item for item in evaluated if item.accepted]
+    excluded_ids = set(normalize_excluded_candidate_ids(excluded_candidate_ids))
+    accepted = [item for item in evaluated if item.accepted and item.candidate.candidate_id not in excluded_ids]
     if not accepted:
         return []
     max_keyframes = max(int(config.max_keyframes), 0)
@@ -775,13 +880,16 @@ def select_view_diverse_records(
     records: list[dict[str, Any]],
     *,
     config: ReferenceProcessingConfig,
+    excluded_candidate_ids: Any | None = None,
 ) -> list[dict[str, Any]]:
+    excluded_ids = set(normalize_excluded_candidate_ids(excluded_candidate_ids))
     accepted = [
         dict(record)
         for record in records
         if record.get("accepted")
         and record.get("cached_mask_path")
         and _record_cam_in_ob(record) is not None
+        and str(record.get("candidate_id", "")) not in excluded_ids
     ]
     if not accepted:
         return []
@@ -1057,15 +1165,29 @@ def _build_report(
     published: bool,
     processing_cache_path: str | None = None,
     processing_summary: dict[str, Any] | None = None,
+    excluded_candidate_ids: Any | None = None,
 ) -> ReferenceProcessingReport:
+    excluded_ids = set(normalize_excluded_candidate_ids(excluded_candidate_ids))
     selected_ids = {item.candidate.candidate_id for item in selected}
     records = []
     for item in evaluated:
         record = item.to_record()
-        if item.accepted and item.candidate.candidate_id not in selected_ids:
+        if item.accepted and item.candidate.candidate_id in excluded_ids:
             record["accepted"] = False
+            record["excluded"] = True
+            record["selected_index"] = None
+            record["reasons"] = ["accepted candidate excluded by user"]
+        elif item.accepted and item.candidate.candidate_id not in selected_ids:
+            record["accepted"] = False
+            record["excluded"] = False
+            record["selected_index"] = None
             record["reasons"] = ["accepted candidate not selected for publish window"]
+        else:
+            record["excluded"] = False
         records.append(record)
+    summary = dict(processing_summary or {})
+    summary["excluded_candidate_ids"] = sorted(excluded_ids)
+    summary["excluded_count"] = len([item for item in evaluated if item.accepted and item.candidate.candidate_id in excluded_ids])
     return ReferenceProcessingReport(
         object_name=profile.name,
         run_id=run_id,
@@ -1089,7 +1211,7 @@ def _build_report(
         records=records,
         output_reference_count=count_reference_frames(profile),
         processing_cache_path=processing_cache_path,
-        processing_summary=dict(processing_summary or {}),
+        processing_summary=summary,
     )
 
 
@@ -1106,17 +1228,24 @@ def _build_report_from_cached_records(
     published: bool,
     processing_cache_path: str | None,
     processing_summary: dict[str, Any] | None = None,
+    excluded_candidate_ids: Any | None = None,
 ) -> ReferenceProcessingReport:
+    excluded_ids = set(normalize_excluded_candidate_ids(excluded_candidate_ids))
     selected_ids = {str(record.get("candidate_id")) for record in selected_records}
+    eligible_ids = {
+        str(record.get("candidate_id"))
+        for record in cached_records
+        if record.get("accepted") and record.get("cached_mask_path") and _record_cam_in_ob(record) is not None
+    }
+    excluded_eligible_ids = eligible_ids & excluded_ids
     report_records = []
     for source in cached_records:
         record = dict(source)
         candidate_id = str(record.get("candidate_id"))
-        if record.get("accepted") and candidate_id not in selected_ids:
-            record["accepted"] = False
-            record["reasons"] = ["accepted cached candidate not selected for publish window"]
-        elif candidate_id in selected_ids:
+        record["selected_index"] = None
+        if candidate_id in selected_ids:
             record["accepted"] = True
+            record["excluded"] = False
             record["reasons"] = []
             selected_index = next(
                 (
@@ -1127,7 +1256,22 @@ def _build_report_from_cached_records(
                 None,
             )
             record["selected_index"] = selected_index
+        elif record.get("accepted") and candidate_id in excluded_eligible_ids:
+            record["accepted"] = False
+            record["excluded"] = True
+            record["reasons"] = ["accepted cached candidate excluded by user"]
+        elif record.get("accepted"):
+            record["accepted"] = False
+            record["excluded"] = False
+            record["reasons"] = ["accepted cached candidate not selected for publish window"]
+        else:
+            record["excluded"] = False
         report_records.append(record)
+    summary = dict(processing_summary or {})
+    summary["eligible_count"] = len(eligible_ids)
+    summary["excluded_count"] = len(excluded_eligible_ids)
+    summary["excluded_candidate_ids"] = sorted(excluded_ids)
+    summary["selected_count"] = len(selected_records)
     return ReferenceProcessingReport(
         object_name=profile.name,
         run_id=run_id,
@@ -1151,7 +1295,7 @@ def _build_report_from_cached_records(
         records=report_records,
         output_reference_count=count_reference_frames(profile),
         processing_cache_path=processing_cache_path,
-        processing_summary=dict(processing_summary or {}),
+        processing_summary=summary,
     )
 
 
@@ -1245,6 +1389,13 @@ def _cached_pose_result(record: dict[str, Any]) -> CharucoPoseResult:
     quality_data = pose.get("quality_config") if isinstance(pose.get("quality_config"), dict) else {}
     board_spec = CharucoBoardSpec(**_filter_kwargs(board_spec_data, CharucoBoardSpec))
     quality_config = CharucoQualityConfig(**_filter_kwargs(quality_data, CharucoQualityConfig))
+    origin_convention = normalize_charuco_origin_convention(
+        pose.get("charuco_origin_convention") or DEFAULT_CHARUCO_ORIGIN_CONVENTION
+    )
+    origin_offset = _origin_offset_from_metadata(
+        pose.get("charuco_origin_offset_board_m"),
+        fallback=charuco_origin_offset_board_m(board_spec, origin_convention),
+    )
     candidates = [
         DictionaryCandidateResult(
             dictionary=str(candidate.get("dictionary", "")),
@@ -1260,6 +1411,12 @@ def _cached_pose_result(record: dict[str, Any]) -> CharucoPoseResult:
             distortion_policy=str(candidate.get("distortion_policy", "unknown")),
             detector_preset=str(candidate.get("detector_preset", CHARUCO_DETECTOR_PRESET_OPENCV_DEFAULT)),
             detector_parameters=dict(candidate.get("detector_parameters") or {}),
+            charuco_origin_convention=str(candidate.get("charuco_origin_convention") or origin_convention),
+            charuco_origin_offset_board_m=_origin_offset_from_metadata(
+                candidate.get("charuco_origin_offset_board_m"),
+                fallback=origin_offset,
+            ),
+            effective_board_T_object=_matrix_from_metadata(candidate.get("effective_board_T_object")),
         )
         for candidate in pose.get("candidates", [])
         if isinstance(candidate, dict)
@@ -1273,9 +1430,13 @@ def _cached_pose_result(record: dict[str, Any]) -> CharucoPoseResult:
         opencv_version=str(pose.get("opencv_version", "unknown")),
         board_coordinate_convention=str(pose.get("board_coordinate_convention", "opencv_charuco_board")),
         legacy_pattern=bool(pose.get("legacy_pattern", False)),
+        charuco_origin_convention=origin_convention,
+        charuco_origin_offset_board_m=origin_offset,
         camera_T_board=_matrix_from_metadata(pose.get("camera_T_board")),
         camera_T_object=_matrix_from_metadata(pose.get("camera_T_object")),
         cam_in_ob=_matrix_from_metadata(pose.get("cam_in_ob")),
+        user_board_T_object=_matrix_from_metadata(pose.get("user_board_T_object")),
+        effective_board_T_object=_matrix_from_metadata(pose.get("effective_board_T_object")),
         reject_reasons=list(pose.get("reject_reasons", [])),
         detector_preset=str(pose.get("detector_preset", CHARUCO_DETECTOR_PRESET_OPENCV_DEFAULT)),
         detector_parameters=dict(pose.get("detector_parameters") or {}),
@@ -1288,11 +1449,15 @@ def _filter_kwargs(data: dict[str, Any], cls) -> dict[str, Any]:
 
 
 def _pose_detector_accepts_detector_config(pose_detector: PoseDetector) -> bool:
+    return _pose_detector_accepts_arg(pose_detector, "detector_config")
+
+
+def _pose_detector_accepts_arg(pose_detector: PoseDetector, name: str) -> bool:
     try:
         signature = inspect.signature(pose_detector)
     except (TypeError, ValueError):
         return True
-    return "detector_config" in signature.parameters or any(
+    return name in signature.parameters or any(
         parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()
     )
 
@@ -1306,6 +1471,16 @@ def _matrix_from_metadata(value: Any) -> np.ndarray | None:
     return matrix
 
 
+def _origin_offset_from_metadata(
+    value: Any,
+    *,
+    fallback: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    if isinstance(value, (list, tuple)) and len(value) == 3:
+        return tuple(float(item) for item in value)
+    return tuple(float(item) for item in fallback)
+
+
 def _validate_processing_cache(
     payload: dict[str, Any],
     *,
@@ -1313,6 +1488,7 @@ def _validate_processing_cache(
     quality_config: CharucoQualityConfig,
     board_object: BoardObjectTransform,
     detector_config: CharucoDetectorConfig,
+    charuco_origin_convention: str,
 ) -> None:
     if payload.get("object") is None:
         raise ValueError("processing cache is missing object metadata")
@@ -1325,6 +1501,16 @@ def _validate_processing_cache(
         raise ValueError("cached processing used different ChArUco quality settings; run Processing again")
     if _cache_detector_config(payload) != detector_config.to_dict():
         raise ValueError("cached processing used different ChArUco detector settings; run Processing again")
+    expected_origin = normalize_charuco_origin_convention(charuco_origin_convention)
+    cached_origin = payload.get("charuco_origin_convention")
+    if cached_origin is None:
+        raise ValueError("cached processing used no ChArUco origin convention; run Processing again")
+    if normalize_charuco_origin_convention(str(cached_origin)) != expected_origin:
+        raise ValueError("cached processing used different ChArUco origin convention; run Processing again")
+    cached_offset = payload.get("charuco_origin_offset_board_m")
+    expected_offset = np.asarray(charuco_origin_offset_board_m(board_spec, expected_origin), dtype=np.float64)
+    if cached_offset is None or not np.allclose(np.asarray(cached_offset, dtype=np.float64), expected_offset, atol=1e-9):
+        raise ValueError("cached processing used different ChArUco origin offset; run Processing again")
     cached_matrix = None
     if isinstance(cached_object, dict):
         cached_matrix = cached_object.get("board_T_object")

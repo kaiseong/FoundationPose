@@ -28,6 +28,7 @@ def build_processing_debug_artifacts_zip(profile: ObjectProfile) -> tuple[bytes,
     if not selected:
         raise ValueError("latest Processing report has no selected candidates")
     frame_index = index_recorded_frame_records(profile)
+    processing_summary = dict(report.get("processing_summary")) if isinstance(report.get("processing_summary"), dict) else {}
     thresholds = dict(report.get("thresholds")) if isinstance(report.get("thresholds"), dict) else {}
     min_depth_m = float(thresholds.get("min_depth_m", 0.0))
     max_depth_m = float(thresholds.get("max_depth_m", np.inf))
@@ -38,6 +39,13 @@ def build_processing_debug_artifacts_zip(profile: ObjectProfile) -> tuple[bytes,
         "run_id": report.get("run_id"),
         "processing_cache_path": str(cache_path),
         "candidate_count": len(selected),
+        "accepted_count": int(report.get("accepted", len(selected))),
+        "eligible_count": processing_summary.get("eligible_count"),
+        "excluded_count": processing_summary.get("excluded_count"),
+        "selected_count": processing_summary.get("selected_count", len(selected)),
+        "excluded_candidate_ids": list(processing_summary.get("excluded_candidate_ids") or []),
+        "charuco_origin_convention": processing_summary.get("charuco_origin_convention"),
+        "charuco_origin_offset_board_m": processing_summary.get("charuco_origin_offset_board_m"),
         "candidates": [],
     }
     buffer = io.BytesIO()

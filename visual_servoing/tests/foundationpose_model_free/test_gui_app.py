@@ -133,6 +133,7 @@ def test_gui_command_builder_constructs_charuco_offline_command_with_board_defau
     assert command[command.index("--square-length-m") + 1] == "0.030"
     assert command[command.index("--marker-length-m") + 1] == "0.022"
     assert command[command.index("--charuco-detector-preset") + 1] == "conservative-charuco"
+    assert command[command.index("--charuco-origin-convention") + 1] == "charuco_corner_id_0"
     assert command[command.index("--object-xyz-m") + 1 : command.index("--object-xyz-m") + 4] == [
         "0.10",
         "0.02",
@@ -192,6 +193,8 @@ def test_gui_command_builder_constructs_record_and_process_commands(tmp_path):
         object_rpy_deg=("1", "2", "3"),
         required_keyframes="16",
         max_keyframes="48",
+        charuco_origin_convention="opencv_board_origin",
+        excluded_candidate_ids="session-1:000003",
         data_root=str(tmp_path),
     )
     reselect = builder.charuco_reference(
@@ -225,6 +228,8 @@ def test_gui_command_builder_constructs_record_and_process_commands(tmp_path):
     ]
     assert process[process.index("--required-keyframes") + 1] == "16"
     assert process[process.index("--max-keyframes") + 1] == "48"
+    assert process[process.index("--charuco-origin-convention") + 1] == "opencv_board_origin"
+    assert process[process.index("--excluded-candidate-ids") + 1] == "session-1:000003"
     assert reselect[reselect.index("--max-keyframes") + 1] == "24"
     assert process[-2:] == ["--data-root", str(tmp_path)]
 
