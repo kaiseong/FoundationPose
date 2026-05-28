@@ -84,7 +84,9 @@ RECORDING_PREVIEW_WINDOW = "Reference Recording Preview"
 REMOTE_BUILD_POLL_INTERVAL_S = 2.0
 REMOTE_BUILD_TIMEOUT_S = 60.0 * 60.0
 REMOTE_PROCESS_POLL_INTERVAL_S = 2.0
+REMOTE_PROCESS_UPLOAD_TIMEOUT_S = 120.0
 REMOTE_PROCESS_TIMEOUT_S = 60.0 * 60.0
+REMOTE_PROCESS_UPLOAD_FRAME_CAP = 192
 REMOTE_SEGMENTATION_WARMUP_FRAMES = 10
 RECORDINGS_ZIP_CONTENT_TYPE = "application/x-foundationpose-recordings+zip"
 PROCESSING_REQUEST_JSON = "foundationpose_processing_request.json"
@@ -1053,7 +1055,7 @@ class FoundationPoseWorkflowGui:
                 port=port,
                 profile=profile_name,
                 archive=archive,
-                timeout_s=10.0,
+                timeout_s=REMOTE_PROCESS_UPLOAD_TIMEOUT_S,
                 poll_interval_s=REMOTE_PROCESS_POLL_INTERVAL_S,
                 max_wait_s=REMOTE_PROCESS_TIMEOUT_S,
             )
@@ -1558,21 +1560,110 @@ def create_recordings_archive(profile_root: str | Path, *, request_payload: dict
         ]
     if not session_dirs:
         raise RuntimeError("No recording sessions found; run Start Recording first")
+    max_upload_frames = _remote_processing_upload_frame_limit(request_payload)
+    records = []
+    for session_dir in session_dirs:
+        for record in _load_recording_frame_records(session_dir):
+            records.append((session_dir, record))
+    if not records:
+        raise RuntimeError("No recorded frames found; run Start Recording first")
+    selected_records = _sample_evenly(records, max_upload_frames)
+    selected_by_session: dict[Path, list[dict]] = {session_dir: [] for session_dir in session_dirs}
+    for session_dir, record in selected_records:
+        selected_by_session.setdefault(session_dir, []).append(record)
     buffer = io.BytesIO()
     file_count = 0
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr(PROCESSING_REQUEST_JSON, json.dumps(request_payload, sort_keys=True).encode("utf-8"))
         for session_dir in session_dirs:
+            selected = selected_by_session.get(session_dir, [])
+            if not selected:
+                continue
+            session_rel = session_dir.relative_to(profile_root).as_posix()
+            metadata_path = session_dir / "session.json"
+            if metadata_path.exists():
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            else:
+                metadata = {}
+            metadata["frame_count"] = len(selected)
+            zf.writestr(f"{session_rel}/session.json", json.dumps(metadata, indent=2, sort_keys=True).encode("utf-8"))
+            zf.writestr(
+                f"{session_rel}/frames.jsonl",
+                "".join(json.dumps(record, sort_keys=True) + "\n" for record in selected).encode("utf-8"),
+            )
+            file_count += 2
+            for record in selected:
+                for key in ("rgb_path", "depth_path", "depth_mm_path", "intrinsics_path"):
+                    rel = record.get(key)
+                    if not rel:
+                        continue
+                    path = session_dir / str(rel)
+                    if not path.is_file():
+                        raise RuntimeError(f"Recorded frame file is missing: {path}")
+                    archive_name = f"{session_rel}/{Path(str(rel)).as_posix()}"
+                    if archive_name in zf.namelist():
+                        continue
+                    zf.write(path, archive_name)
+                    file_count += 1
             for path in sorted(session_dir.rglob("*")):
-                if not path.is_file():
+                if not path.is_file() or path.name in {"session.json", "frames.jsonl"}:
                     continue
-                zf.write(path, path.relative_to(profile_root).as_posix())
+                rel_parts = path.relative_to(session_dir).parts
+                if rel_parts and rel_parts[0] in {"rgb", "depth", "depth_mm", "intrinsics"}:
+                    continue
+                archive_name = path.relative_to(profile_root).as_posix()
+                if archive_name in zf.namelist():
+                    continue
+                zf.write(path, archive_name)
                 file_count += 1
-    return buffer.getvalue(), {
-        "session_count": len(session_dirs),
-        "session_ids": [path.name for path in session_dirs],
+    archive = buffer.getvalue()
+    return archive, {
+        "session_count": len([session for session, items in selected_by_session.items() if items]),
+        "session_ids": [path.name for path, items in selected_by_session.items() if items],
         "file_count": file_count,
+        "source_frame_count": len(records),
+        "frame_count": len(selected_records),
+        "sampled": len(selected_records) < len(records),
+        "max_upload_frames": max_upload_frames,
+        "archive_bytes": len(archive),
     }
+
+
+def _remote_processing_upload_frame_limit(request_payload: dict) -> int:
+    value = request_payload.get("max_upload_frames")
+    if value is not None:
+        return max(1, int(value))
+    required = int(request_payload.get("required_keyframes", 16))
+    requested_max = int(request_payload.get("max_keyframes", 32))
+    target = max(required * 8, requested_max * 6)
+    return max(required, min(REMOTE_PROCESS_UPLOAD_FRAME_CAP, target))
+
+
+def _load_recording_frame_records(session_dir: Path) -> list[dict]:
+    frames_path = session_dir / "frames.jsonl"
+    if not frames_path.exists():
+        return []
+    records: list[dict] = []
+    for line in frames_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        if not isinstance(record, dict):
+            raise RuntimeError(f"Invalid recorded frame record in {frames_path}")
+        records.append(record)
+    return records
+
+
+def _sample_evenly(items: list, limit: int) -> list:
+    limit = int(limit)
+    if limit <= 0:
+        return []
+    if len(items) <= limit:
+        return list(items)
+    if limit == 1:
+        return [items[-1]]
+    indexes = [round(i * (len(items) - 1) / (limit - 1)) for i in range(limit)]
+    return [items[index] for index in indexes]
 
 
 def remote_process_recordings(

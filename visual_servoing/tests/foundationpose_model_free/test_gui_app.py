@@ -393,9 +393,7 @@ def test_remote_build_assets_posts_to_server_and_polls_job(monkeypatch):
 def test_create_recordings_archive_includes_request_and_sessions(tmp_path):
     profile_root = tmp_path / "object_profiles" / "meter"
     session_dir = profile_root / "recordings" / "session-1"
-    session_dir.mkdir(parents=True)
-    (session_dir / "session.json").write_text("{}", encoding="utf-8")
-    (session_dir / "frames.jsonl").write_text("", encoding="utf-8")
+    _write_fake_recorded_frame(session_dir, 0)
 
     archive, summary = create_recordings_archive(
         profile_root,
@@ -409,6 +407,56 @@ def test_create_recordings_archive_includes_request_and_sessions(tmp_path):
     assert payload["profile"] == "meter"
     assert "recordings/session-1/session.json" in names
     assert "recordings/session-1/frames.jsonl" in names
+    assert "recordings/session-1/rgb/000000.png" in names
+    assert "recordings/session-1/depth/000000.npy" in names
+
+
+def test_create_recordings_archive_samples_large_recordings(tmp_path):
+    profile_root = tmp_path / "object_profiles" / "meter"
+    session_dir = profile_root / "recordings" / "session-1"
+    for index in range(10):
+        _write_fake_recorded_frame(session_dir, index)
+
+    archive, summary = create_recordings_archive(
+        profile_root,
+        request_payload={"profile": "meter", "prompt": "multimeter", "max_upload_frames": 4},
+    )
+
+    assert summary["source_frame_count"] == 10
+    assert summary["frame_count"] == 4
+    assert summary["sampled"] is True
+    with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+        frames = zf.read("recordings/session-1/frames.jsonl").decode("utf-8").splitlines()
+        names = set(zf.namelist())
+    selected = [json.loads(line)["index"] for line in frames]
+    assert selected == [0, 3, 6, 9]
+    assert "recordings/session-1/rgb/000001.png" not in names
+    assert "recordings/session-1/rgb/000009.png" in names
+
+
+def _write_fake_recorded_frame(session_dir: Path, index: int) -> None:
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (session_dir / "session.json").write_text("{}", encoding="utf-8")
+    for dirname in ("rgb", "depth", "depth_mm", "intrinsics"):
+        (session_dir / dirname).mkdir(exist_ok=True)
+    stem = f"{index:06d}"
+    files = {
+        "rgb_path": f"rgb/{stem}.png",
+        "depth_path": f"depth/{stem}.npy",
+        "depth_mm_path": f"depth_mm/{stem}.png",
+        "intrinsics_path": f"intrinsics/{stem}.json",
+    }
+    for relative in files.values():
+        (session_dir / relative).write_bytes(b"x")
+    record = {
+        "session_id": session_dir.name,
+        "index": index,
+        "timestamp_s": float(index),
+        "intrinsics": {"fx": 1.0, "fy": 1.0, "cx": 0.0, "cy": 0.0},
+        **files,
+    }
+    with (session_dir / "frames.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 def test_remote_process_recordings_posts_zip_and_polls_job(monkeypatch):
