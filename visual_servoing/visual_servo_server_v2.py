@@ -33,6 +33,7 @@ from visual_servoing.foundationpose_model_free.charuco_reference import (
     CharucoDetectorConfig,
     CharucoQualityConfig,
 )
+from visual_servoing.foundationpose_model_free.debug_artifacts import build_processing_debug_artifacts_zip
 from visual_servoing.foundationpose_model_free.foundationpose_adapter import (
     FoundationPoseAdapter,
     FoundationPoseConfig,
@@ -67,6 +68,7 @@ HEALTH_PATH = "/foundationpose/v2/health"
 BUILD_PATH = "/foundationpose/v2/assets/build"
 BUILD_STATUS_PREFIX = "/foundationpose/v2/assets/build/"
 MODEL_ASSET_PREFIX = "/foundationpose/v2/assets/model/"
+DEBUG_ARTIFACTS_PREFIX = "/foundationpose/v2/debug/"
 PROCESS_RECORDINGS_PATH = "/foundationpose/v2/recordings/process"
 PROCESS_RECORDINGS_STATUS_PREFIX = "/foundationpose/v2/recordings/process/"
 SEGMENTATION_PATH = "/foundationpose/v2/segmentation"
@@ -401,6 +403,25 @@ class FoundationPoseV2Service:
             "mesh_identity": mesh_identity(mesh_path),
         }
 
+    def debug_artifacts(self, profile_name: str) -> tuple[int, bytes | None, dict[str, Any]]:
+        try:
+            profile = self._profile(profile_name)
+        except UnknownProfileError as exc:
+            return 404, None, {"ok": False, "status": "error", "reason": str(exc)}
+        try:
+            archive, metadata = build_processing_debug_artifacts_zip(profile)
+        except FileNotFoundError as exc:
+            return 404, None, {"ok": False, "status": "missing", "profile": profile.name, "reason": str(exc)}
+        except Exception as exc:
+            return 409, None, {"ok": False, "status": "error", "profile": profile.name, "reason": str(exc)}
+        return 200, archive, {
+            "ok": True,
+            "status": "ready",
+            "profile": profile.name,
+            "filename": "processing_debug_artifacts.zip",
+            **metadata,
+        }
+
     def process_recordings_archive(
         self,
         *,
@@ -692,6 +713,23 @@ def make_handler(
                 if identity.get("sha256"):
                     headers["X-FoundationPose-Mesh-Sha256"] = str(identity["sha256"])
                 self._send_bytes(status_code, data, content_type="application/octet-stream", headers=headers)
+                return
+            if path.startswith(DEBUG_ARTIFACTS_PREFIX):
+                profile_name = urllib_parse.unquote(path[len(DEBUG_ARTIFACTS_PREFIX) :].strip("/"))
+                if not profile_name:
+                    self._send_json(404, {"ok": False, "status": "error", "reason": "missing profile"})
+                    return
+                status_code, data, payload = service.debug_artifacts(profile_name)
+                if data is None:
+                    self._send_json(status_code, payload)
+                    return
+                headers = {
+                    "Content-Disposition": 'attachment; filename="processing_debug_artifacts.zip"',
+                    "X-FoundationPose-Profile": str(payload.get("profile", profile_name)),
+                    "X-FoundationPose-Debug-Candidate-Count": str(payload.get("candidate_count", 0)),
+                    "X-FoundationPose-Debug-Run-Id": str(payload.get("run_id") or ""),
+                }
+                self._send_bytes(status_code, data, content_type="application/zip", headers=headers)
                 return
             if path.startswith(PROCESS_RECORDINGS_STATUS_PREFIX):
                 job_id = path[len(PROCESS_RECORDINGS_STATUS_PREFIX) :].strip("/")

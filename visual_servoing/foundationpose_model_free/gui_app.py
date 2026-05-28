@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -92,6 +93,7 @@ REMOTE_PROCESS_UPLOAD_TIMEOUT_S = 120.0
 REMOTE_PROCESS_TIMEOUT_S = 60.0 * 60.0
 REMOTE_PROCESS_UPLOAD_FRAME_CAP = 192
 REMOTE_MODEL_DOWNLOAD_TIMEOUT_S = 60.0
+REMOTE_DEBUG_DOWNLOAD_TIMEOUT_S = 120.0
 REMOTE_SEGMENTATION_WARMUP_FRAMES = 10
 RECORDINGS_ZIP_CONTENT_TYPE = "application/x-foundationpose-recordings+zip"
 PROCESSING_REQUEST_JSON = "foundationpose_processing_request.json"
@@ -626,6 +628,7 @@ class FoundationPoseWorkflowGui:
         ttk.Button(capture, text="Build Dry Run", command=lambda: self.run_build_assets(False)).grid(row=1, column=6)
         ttk.Button(capture, text="Build Assets", command=lambda: self.run_build_assets(True)).grid(row=1, column=7)
         ttk.Button(capture, text="Force Build", command=self.run_force_build_assets).grid(row=1, column=8)
+        ttk.Button(capture, text="Debug", command=self.run_debug_download).grid(row=1, column=9)
         preview = ttk.Frame(capture)
         preview.grid(row=2, column=0, columnspan=10, sticky="ew", pady=(8, 0))
         preview.columnconfigure(0, weight=1)
@@ -874,6 +877,7 @@ class FoundationPoseWorkflowGui:
                 return
             if not self._release_live_sessions_for_gpu():
                 return
+            self._recording_stop.clear()
             config = ReferenceRecordingConfig(
                 camera_model=self.camera_model.get(),
                 serial=self.camera_serial.get().strip() or None,
@@ -930,6 +934,23 @@ class FoundationPoseWorkflowGui:
             self._start_remote_processing(profile=profile, reselect=True)
             return
         self._start_command(self._charuco_command(profile, mode="reselect-recordings"))
+
+    def run_debug_download(self) -> None:
+        if self.recording_session is not None:
+            self.stop_recording()
+            self.status.set("Stopping recording first; press Debug again after it stops")
+            return
+        profile = self._current_profile()
+        if self.remote_state.get() != "Remote":
+            self.status.set("Debug download requires a connected Remote server")
+            return
+        self.status.set("Downloading remote Processing debug artifacts")
+        thread = threading.Thread(
+            target=self._remote_debug_download_worker,
+            args=(self.server_host.get().strip(), int(self.server_port.get()), profile.name, str(profile.root)),
+            daemon=True,
+        )
+        thread.start()
 
     def run_charuco_detect_preview(self) -> None:
         profile = self._current_profile()
@@ -1143,6 +1164,31 @@ class FoundationPoseWorkflowGui:
             reason = payload.get("error") or payload.get("reason") or payload.get("stderr_tail") or state
             self.remote_events.put(RemoteHealthEvent("Remote", f"Remote processing {state}: {reason}"))
 
+    def _remote_debug_download_worker(
+        self,
+        host: str,
+        port: int,
+        profile_name: str,
+        profile_root: str,
+    ) -> None:
+        try:
+            metadata = remote_download_debug_artifacts(
+                host=host,
+                port=port,
+                profile=profile_name,
+                profile_root=profile_root,
+                timeout_s=REMOTE_DEBUG_DOWNLOAD_TIMEOUT_S,
+            )
+        except Exception as exc:
+            self.remote_events.put(RemoteHealthEvent("Remote", f"Remote debug download failed: {exc}"))
+            return
+        self.remote_events.put(
+            RemoteHealthEvent(
+                "Remote",
+                f"Remote debug artifacts downloaded: {metadata['file_count']} file(s) -> {metadata['output_dir']}",
+            )
+        )
+
     def _start_remote_build(self, *, profile_name: str, execute: bool) -> None:
         host = self.server_host.get().strip()
         port = int(self.server_port.get())
@@ -1256,6 +1302,7 @@ class FoundationPoseWorkflowGui:
         session = self.recording_session
         if session is None:
             return
+        preview_window_name = f"{RECORDING_PREVIEW_WINDOW} - {session.session_id}"
         cv2 = None
         try:
             import cv2 as cv2_module  # type: ignore
@@ -1263,6 +1310,7 @@ class FoundationPoseWorkflowGui:
             cv2 = cv2_module
         except Exception:
             cv2 = None
+        preview_stop_grace_until_s = time.monotonic() + 0.5
         try:
             while not self._recording_stop.is_set():
                 record = session.record_next_frame()
@@ -1283,9 +1331,15 @@ class FoundationPoseWorkflowGui:
                             session_id=session.session_id,
                             frame_count=session.frame_count,
                         )
-                        cv2.imshow(RECORDING_PREVIEW_WINDOW, image)
+                        cv2.imshow(preview_window_name, image)
                         key = cv2.waitKey(1) & 0xFF
-                        if key in {ord("q"), 27} or not _opencv_window_visible(cv2, RECORDING_PREVIEW_WINDOW):
+                        should_stop = _recording_preview_should_stop(
+                            key=key,
+                            window_visible=_opencv_window_visible(cv2, preview_window_name),
+                            now_s=time.monotonic(),
+                            grace_until_s=preview_stop_grace_until_s,
+                        )
+                        if should_stop:
                             self._recording_stop.set()
         except Exception as exc:
             self.recording_events.put(exc)
@@ -1303,7 +1357,7 @@ class FoundationPoseWorkflowGui:
             finally:
                 if cv2 is not None:
                     try:
-                        cv2.destroyWindow(RECORDING_PREVIEW_WINDOW)
+                        cv2.destroyWindow(preview_window_name)
                     except Exception:
                         pass
 
@@ -1657,6 +1711,89 @@ def remote_download_model_asset(
     }
 
 
+def remote_download_debug_artifacts(
+    *,
+    host: str,
+    port: int,
+    profile: str,
+    profile_root: str | Path,
+    timeout_s: float = REMOTE_DEBUG_DOWNLOAD_TIMEOUT_S,
+) -> dict:
+    encoded_profile = urllib_parse.quote(profile, safe="")
+    url = f"http://{host}:{int(port)}/foundationpose/v2/debug/{encoded_profile}"
+    try:
+        with urllib_request.urlopen(url, timeout=float(timeout_s)) as response:
+            data = response.read()
+    except urllib_error.HTTPError as exc:
+        detail = exc.reason
+        try:
+            decoded = json.loads(exc.read().decode("utf-8"))
+            if isinstance(decoded, dict):
+                detail = decoded.get("reason") or decoded.get("status") or detail
+        except Exception:
+            pass
+        raise RuntimeError(f"remote debug artifact download failed: HTTP {exc.code}: {detail}") from exc
+    except urllib_error.URLError as exc:
+        raise RuntimeError(str(exc)) from exc
+    if not data:
+        raise RuntimeError("remote debug artifact download returned an empty response")
+    timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    output_root = Path(profile_root).expanduser() / "debug_downloads"
+    output_dir = output_root / f"debug-{timestamp}-{time.monotonic_ns()}"
+    file_count = _extract_zip_safely(data, output_dir)
+    return {
+        "profile": profile,
+        "output_dir": str(output_dir),
+        "file_count": file_count,
+        "bytes": len(data),
+    }
+
+
+def _extract_zip_safely(data: bytes, output_dir: Path) -> int:
+    output_dir = output_dir.expanduser()
+    tmp_dir = output_dir.with_name(f".{output_dir.name}.{os.getpid()}.tmp")
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=False)
+    file_count = 0
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            for member in zf.infolist():
+                if member.is_dir():
+                    continue
+                parts = Path(member.filename).parts
+                if Path(member.filename).is_absolute() or any(part in {"", ".", ".."} for part in parts):
+                    raise RuntimeError(f"unsafe debug artifact member: {member.filename}")
+                target = tmp_dir.joinpath(*parts)
+                if not _is_relative_to(target.resolve(), tmp_dir.resolve()):
+                    raise RuntimeError(f"unsafe debug artifact member: {member.filename}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(member) as source, target.open("wb") as handle:
+                    while True:
+                        chunk = source.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        handle.write(chunk)
+                file_count += 1
+        output_dir.parent.mkdir(parents=True, exist_ok=True)
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
+        os.replace(tmp_dir, output_dir)
+    except Exception:
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        raise
+    return file_count
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
 def create_recordings_archive(profile_root: str | Path, *, request_payload: dict) -> tuple[bytes, dict]:
     profile_root = Path(profile_root).expanduser()
     recordings_root = profile_root / "recordings"
@@ -1943,6 +2080,14 @@ def _opencv_window_visible(cv2, window_name: str) -> bool:
         return cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) >= 1
     except Exception:
         return False
+
+
+def _recording_preview_should_stop(*, key: int, window_visible: bool, now_s: float, grace_until_s: float) -> bool:
+    stop_requested = key in {ord("q"), 27}
+    window_closed = not window_visible
+    if now_s < grace_until_s and (stop_requested or window_closed):
+        return False
+    return stop_requested or window_closed
 
 
 def _write_single_image_preview(

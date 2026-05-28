@@ -11,6 +11,7 @@ from urllib import request as urllib_request
 import zipfile
 
 import numpy as np
+import pytest
 
 from visual_servoing.foundationpose_model_free.asset_builder import AssetBuildResult, profile_model_path
 from visual_servoing.foundationpose_model_free.foundationpose_adapter import PoseEstimate
@@ -198,6 +199,82 @@ def _recordings_archive(*, profile="phone"):
     return buffer.getvalue()
 
 
+def _write_processing_debug_fixture(profile) -> None:
+    cv2 = pytest.importorskip("cv2")
+    session_dir = profile.root / "recordings" / "session-1"
+    for dirname in ("rgb", "depth", "depth_mm", "intrinsics"):
+        (session_dir / dirname).mkdir(parents=True, exist_ok=True)
+    (session_dir / "session.json").write_text("{}", encoding="utf-8")
+    with (session_dir / "frames.jsonl").open("w", encoding="utf-8") as handle:
+        for index in (0, 1):
+            stem = f"{index:06d}"
+            (session_dir / "rgb" / f"{stem}.png").write_bytes(b"rgb")
+            np.save(
+                session_dir / "depth" / f"{stem}.npy",
+                np.array([[0.0, 0.10 + index], [0.20 + index, np.nan]], dtype=np.float32),
+            )
+            (session_dir / "depth_mm" / f"{stem}.png").write_bytes(b"depth-mm")
+            (session_dir / "intrinsics" / f"{stem}.json").write_text("{}", encoding="utf-8")
+            record = {
+                "session_id": "session-1",
+                "index": index,
+                "timestamp_s": float(index),
+                "rgb_path": f"rgb/{stem}.png",
+                "depth_path": f"depth/{stem}.npy",
+                "depth_mm_path": f"depth_mm/{stem}.png",
+                "intrinsics_path": f"intrinsics/{stem}.json",
+                "intrinsics": {"fx": 1.0, "fy": 1.0, "cx": 0.0, "cy": 0.0},
+            }
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+    cache_dir = profile.root / "processing_cache" / "process-test"
+    axes_dir = cache_dir / "charuco_axes"
+    masks_dir = cache_dir / "masks"
+    axes_dir.mkdir(parents=True, exist_ok=True)
+    masks_dir.mkdir(parents=True, exist_ok=True)
+    axes_image = np.full((3, 3, 3), 127, dtype=np.uint8)
+    mask_selected = np.array([[0, 1], [2, 0]], dtype=np.uint8)
+    mask_unselected = np.ones((2, 2), dtype=np.uint8)
+    assert cv2.imwrite(str(axes_dir / "selected.png"), axes_image)
+    assert cv2.imwrite(str(axes_dir / "unselected.png"), axes_image)
+    assert cv2.imwrite(str(masks_dir / "selected.png"), mask_selected)
+    assert cv2.imwrite(str(masks_dir / "unselected.png"), mask_unselected)
+    latest_report = {
+        "object": profile.name,
+        "run_id": "process-test",
+        "readiness": "ready",
+        "accepted": 2,
+        "required_keyframes": 1,
+        "thresholds": {"min_depth_m": 0.05, "max_depth_m": 1.0},
+        "processing_cache_path": str(cache_dir),
+        "records": [
+            {
+                "candidate_id": "session-1:000000",
+                "session_id": "session-1",
+                "frame_index": 0,
+                "accepted": True,
+                "selected_index": 0,
+                "cached_mask_path": "masks/selected.png",
+                "charuco_axes_preview_path": "charuco_axes/selected.png",
+            },
+            {
+                "candidate_id": "session-1:000001",
+                "session_id": "session-1",
+                "frame_index": 1,
+                "accepted": True,
+                "selected_index": None,
+                "cached_mask_path": "masks/unselected.png",
+                "charuco_axes_preview_path": "charuco_axes/unselected.png",
+            },
+        ],
+    }
+    profile.logs_dir.mkdir(parents=True, exist_ok=True)
+    (profile.logs_dir / "reference_processing_latest.json").write_text(
+        json.dumps(latest_report, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
 def test_health_endpoint_returns_protocol_version(tmp_path):
     service = FoundationPoseV2Service(registry=ObjectProfileRegistry(tmp_path), builder_factory=FakeBuilder)
     server, thread, base_url = _serve(service)
@@ -211,6 +288,110 @@ def test_health_endpoint_returns_protocol_version(tmp_path):
     assert payload["protocol_version"] == 2
     assert payload["status"] == "ready"
     assert isinstance(payload["server_time_monotonic_ns"], int)
+
+
+def test_debug_artifacts_endpoint_returns_selected_processing_candidates_only(tmp_path):
+    registry = ObjectProfileRegistry(tmp_path)
+    profile = registry.create("phone")
+    _write_processing_debug_fixture(profile)
+    service = FoundationPoseV2Service(registry=registry, builder_factory=FakeBuilder)
+    server, thread, base_url = _serve(service)
+    try:
+        with urllib_request.urlopen(f"{base_url}/foundationpose/v2/debug/phone", timeout=2.0) as response:
+            data = response.read()
+            headers = response.headers
+    finally:
+        _stop(server, thread)
+
+    assert headers.get("Content-Type") == "application/zip"
+    assert headers.get("X-FoundationPose-Debug-Candidate-Count") == "1"
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        names = set(zf.namelist())
+        manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+        candidate = manifest["candidates"][0]
+        mask_png = zf.read(candidate["mask"])
+        depth_png = zf.read(candidate["depth_colormap"])
+    assert manifest["profile"] == "phone"
+    assert manifest["run_id"] == "process-test"
+    assert manifest["candidate_count"] == 1
+    assert candidate["candidate_id"] == "session-1:000000"
+    assert candidate["charuco_axes"] in names
+    assert candidate["mask"] in names
+    assert candidate["depth_colormap"] in names
+    assert all("000001" not in name for name in names)
+
+    cv2 = pytest.importorskip("cv2")
+    mask = cv2.imdecode(np.frombuffer(mask_png, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+    depth = cv2.imdecode(np.frombuffer(depth_png, dtype=np.uint8), cv2.IMREAD_COLOR)
+    assert mask.tolist() == [[0, 255], [255, 0]]
+    assert depth[0, 0].tolist() == [0, 0, 0]
+    assert depth[1, 1].tolist() == [0, 0, 0]
+
+
+def test_debug_artifacts_endpoint_reports_missing_processing_cache(tmp_path):
+    registry = ObjectProfileRegistry(tmp_path)
+    profile = registry.create("phone")
+    profile.logs_dir.mkdir(parents=True, exist_ok=True)
+    (profile.logs_dir / "reference_processing_latest.json").write_text(
+        json.dumps({"run_id": "process-test", "processing_cache_path": str(profile.root / "missing"), "records": []}),
+        encoding="utf-8",
+    )
+    service = FoundationPoseV2Service(registry=registry, builder_factory=FakeBuilder)
+    server, thread, base_url = _serve(service)
+    try:
+        try:
+            urllib_request.urlopen(f"{base_url}/foundationpose/v2/debug/phone", timeout=2.0)
+            raise AssertionError("expected HTTP 404")
+        except urllib_error.HTTPError as exc:
+            assert exc.code == 404
+            payload = decode_foundationpose_response(exc.read())
+    finally:
+        _stop(server, thread)
+
+    assert payload["ok"] is False
+    assert payload["status"] == "missing"
+    assert "Processing cache not found" in payload["reason"]
+
+
+def test_debug_artifacts_endpoint_reports_no_selected_candidates(tmp_path):
+    registry = ObjectProfileRegistry(tmp_path)
+    profile = registry.create("phone")
+    cache_dir = profile.root / "processing_cache" / "process-test"
+    cache_dir.mkdir(parents=True)
+    profile.logs_dir.mkdir(parents=True, exist_ok=True)
+    (profile.logs_dir / "reference_processing_latest.json").write_text(
+        json.dumps(
+            {
+                "run_id": "process-test",
+                "processing_cache_path": str(cache_dir),
+                "records": [
+                    {
+                        "candidate_id": "session-1:000000",
+                        "session_id": "session-1",
+                        "frame_index": 0,
+                        "accepted": True,
+                        "selected_index": None,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    service = FoundationPoseV2Service(registry=registry, builder_factory=FakeBuilder)
+    server, thread, base_url = _serve(service)
+    try:
+        try:
+            urllib_request.urlopen(f"{base_url}/foundationpose/v2/debug/phone", timeout=2.0)
+            raise AssertionError("expected HTTP 409")
+        except urllib_error.HTTPError as exc:
+            assert exc.code == 409
+            payload = decode_foundationpose_response(exc.read())
+    finally:
+        _stop(server, thread)
+
+    assert payload["ok"] is False
+    assert payload["status"] == "error"
+    assert "no selected candidates" in payload["reason"]
 
 
 def test_build_rejects_bad_content_type(tmp_path):

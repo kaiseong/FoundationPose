@@ -6,6 +6,7 @@ import inspect
 import json
 from pathlib import Path
 import sys
+from urllib import error as urllib_error
 import zipfile
 
 import numpy as np
@@ -16,6 +17,7 @@ from visual_servoing.foundationpose_model_free.gui_app import (
     GuiCommandBuilder,
     GuiConfig,
     create_recordings_archive,
+    remote_download_debug_artifacts,
     remote_build_assets,
     remote_download_model_asset,
     remote_process_recordings,
@@ -23,6 +25,7 @@ from visual_servoing.foundationpose_model_free.gui_app import (
     resolve_gui_config,
     summarize_processing_rejections,
     write_segmentation_preview,
+    _recording_preview_should_stop,
 )
 from visual_servoing.visual_servo_protocol_v2 import (
     REQUEST_CONTENT_TYPE,
@@ -234,6 +237,7 @@ def test_gui_main_workflow_hides_legacy_capture_buttons_and_keeps_tracking_focus
     assert 'text="Stop Recording"' in build_source
     assert 'text="Processing"' in build_source
     assert 'text="Reselect"' in build_source
+    assert 'text="Debug"' in build_source
     assert 'text="Force Build"' in build_source
     assert 'text="Board Axis Snapshot"' in build_source
     assert 'text="Detect Preview"' in build_source
@@ -463,6 +467,121 @@ def test_remote_download_model_asset_saves_model_obj(tmp_path, monkeypatch):
     assert target.read_bytes() == b"# obj\n"
     assert result["bytes"] == 6
     assert result["sha256"] == "abc123"
+
+
+def test_remote_download_debug_artifacts_fetches_encoded_profile_and_extracts_zip(tmp_path, monkeypatch):
+    calls = []
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("manifest.json", json.dumps({"candidate_count": 1}))
+        zf.writestr("masks/session-1_000000.png", b"mask")
+        zf.writestr("depth_colormap/session-1_000000.png", b"depth")
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return buffer.getvalue()
+
+    def fake_urlopen(url, timeout):
+        calls.append((url, timeout))
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        "visual_servoing.foundationpose_model_free.gui_app.urllib_request.urlopen",
+        fake_urlopen,
+    )
+
+    profile_root = tmp_path / "multimeter zed"
+    result = remote_download_debug_artifacts(
+        host="192.168.0.3",
+        port=8081,
+        profile="multimeter zed",
+        profile_root=profile_root,
+    )
+
+    output_dir = Path(result["output_dir"])
+    assert calls == [("http://192.168.0.3:8081/foundationpose/v2/debug/multimeter%20zed", 120.0)]
+    assert output_dir.parent == profile_root / "debug_downloads"
+    assert (output_dir / "manifest.json").exists()
+    assert (output_dir / "masks" / "session-1_000000.png").read_bytes() == b"mask"
+    assert (output_dir / "depth_colormap" / "session-1_000000.png").read_bytes() == b"depth"
+    assert result["file_count"] == 3
+
+
+def test_remote_download_debug_artifacts_rejects_unsafe_zip_members(tmp_path, monkeypatch):
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("../escape.txt", b"bad")
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return buffer.getvalue()
+
+    monkeypatch.setattr(
+        "visual_servoing.foundationpose_model_free.gui_app.urllib_request.urlopen",
+        lambda url, timeout: FakeResponse(),
+    )
+
+    try:
+        remote_download_debug_artifacts(
+            host="192.168.0.3",
+            port=8081,
+            profile="meter",
+            profile_root=tmp_path / "meter",
+        )
+        raise AssertionError("expected unsafe member rejection")
+    except RuntimeError as exc:
+        assert "unsafe debug artifact member" in str(exc)
+    assert not (tmp_path / "escape.txt").exists()
+
+
+def test_remote_download_debug_artifacts_preserves_server_error_detail(tmp_path, monkeypatch):
+    def fake_urlopen(url, timeout):
+        payload = json.dumps(
+            {
+                "ok": False,
+                "status": "error",
+                "reason": "latest Processing report has no selected candidates",
+            }
+        ).encode("utf-8")
+        raise urllib_error.HTTPError(url, 409, "Conflict", {}, io.BytesIO(payload))
+
+    monkeypatch.setattr(
+        "visual_servoing.foundationpose_model_free.gui_app.urllib_request.urlopen",
+        fake_urlopen,
+    )
+
+    try:
+        remote_download_debug_artifacts(
+            host="192.168.0.3",
+            port=8081,
+            profile="meter",
+            profile_root=tmp_path / "meter",
+        )
+        raise AssertionError("expected server error detail")
+    except RuntimeError as exc:
+        message = str(exc)
+    assert "HTTP 409" in message
+    assert "latest Processing report has no selected candidates" in message
+
+
+def test_recording_preview_ignores_stale_stop_state_during_startup_grace():
+    assert _recording_preview_should_stop(key=ord("q"), window_visible=True, now_s=1.0, grace_until_s=2.0) is False
+    assert _recording_preview_should_stop(key=255, window_visible=False, now_s=1.0, grace_until_s=2.0) is False
+    assert _recording_preview_should_stop(key=ord("q"), window_visible=True, now_s=2.1, grace_until_s=2.0) is True
+    assert _recording_preview_should_stop(key=255, window_visible=False, now_s=2.1, grace_until_s=2.0) is True
+    assert _recording_preview_should_stop(key=255, window_visible=True, now_s=2.1, grace_until_s=2.0) is False
 
 
 def test_create_recordings_archive_includes_request_and_sessions(tmp_path):
