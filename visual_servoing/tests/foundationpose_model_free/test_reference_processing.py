@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import json
 from pathlib import Path
 
 import numpy as np
@@ -113,6 +114,36 @@ def test_processing_publishes_references_and_is_idempotent(tmp_path):
     assert len(list(profile.rgb_dir.glob("*.png"))) == 16
     assert latest_processing_report(profile)["readiness"] == READINESS_READY
     assert (profile.cam_in_ob_dir / "000000.txt").exists()
+
+
+def test_processing_writes_charuco_axes_previews_for_detected_frames(tmp_path, monkeypatch):
+    from visual_servoing.foundationpose_model_free import reference_processing as reference_processing_module
+
+    profile = ObjectProfileRegistry(tmp_path).create("mouse", prompt="wireless mouse")
+    _record_frames(profile, count=3)
+
+    def fake_draw_axes(image_rgb, intrinsics, result):
+        del intrinsics, result
+        return np.zeros_like(image_rgb)
+
+    monkeypatch.setattr(reference_processing_module, "draw_charuco_axes_overlay_bgr", fake_draw_axes)
+    report = process_recorded_references(
+        profile,
+        mask_provider=FakeMaskProvider(),
+        board_spec=CharucoBoardSpec(),
+        quality_config=CharucoQualityConfig(),
+        board_object=BoardObjectTransform.identity(),
+        config=ReferenceProcessingConfig(required_keyframes=3, max_keyframes=3),
+        pose_detector=_fake_pose_detector,
+    )
+
+    cache_path = Path(str(report.processing_cache_path))
+    previews = sorted((cache_path / "charuco_axes").rglob("*.png"))
+    records = json.loads((cache_path / "records.json").read_text(encoding="utf-8"))["records"]
+    assert len(previews) == 3
+    assert report.processing_summary["charuco_axes_preview_count"] == 3
+    assert all(record.get("charuco_axes_preview_path") for record in records)
+    assert all((cache_path / str(record["charuco_axes_preview_path"])).exists() for record in records)
 
 
 def test_reselect_recorded_references_reuses_processing_cache_without_sam(tmp_path):

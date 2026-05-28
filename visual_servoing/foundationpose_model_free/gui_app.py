@@ -1593,7 +1593,7 @@ def create_recordings_archive(profile_root: str | Path, *, request_payload: dict
             )
             file_count += 2
             for record in selected:
-                for key in ("rgb_path", "depth_path", "depth_mm_path", "intrinsics_path"):
+                for key in ("rgb_path", "depth_path"):
                     rel = record.get(key)
                     if not rel:
                         continue
@@ -1605,17 +1605,6 @@ def create_recordings_archive(profile_root: str | Path, *, request_payload: dict
                         continue
                     zf.write(path, archive_name)
                     file_count += 1
-            for path in sorted(session_dir.rglob("*")):
-                if not path.is_file() or path.name in {"session.json", "frames.jsonl"}:
-                    continue
-                rel_parts = path.relative_to(session_dir).parts
-                if rel_parts and rel_parts[0] in {"rgb", "depth", "depth_mm", "intrinsics"}:
-                    continue
-                archive_name = path.relative_to(profile_root).as_posix()
-                if archive_name in zf.namelist():
-                    continue
-                zf.write(path, archive_name)
-                file_count += 1
     archive = buffer.getvalue()
     return archive, {
         "session_count": len([session for session, items in selected_by_session.items() if items]),

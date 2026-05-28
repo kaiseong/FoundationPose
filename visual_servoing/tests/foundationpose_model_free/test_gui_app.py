@@ -409,6 +409,8 @@ def test_create_recordings_archive_includes_request_and_sessions(tmp_path):
     assert "recordings/session-1/frames.jsonl" in names
     assert "recordings/session-1/rgb/000000.png" in names
     assert "recordings/session-1/depth/000000.npy" in names
+    assert "recordings/session-1/depth_mm/000000.png" not in names
+    assert "recordings/session-1/intrinsics/000000.json" not in names
 
 
 def test_create_recordings_archive_samples_large_recordings(tmp_path):
@@ -432,6 +434,8 @@ def test_create_recordings_archive_samples_large_recordings(tmp_path):
     assert selected == [0, 3, 6, 9]
     assert "recordings/session-1/rgb/000001.png" not in names
     assert "recordings/session-1/rgb/000009.png" in names
+    assert "recordings/session-1/depth_mm/000009.png" not in names
+    assert "recordings/session-1/intrinsics/000009.json" not in names
 
 
 def _write_fake_recorded_frame(session_dir: Path, index: int) -> None:

@@ -24,6 +24,7 @@ from .charuco_reference import (
     CHARUCO_DETECTOR_PRESET_OPENCV_DEFAULT,
     DictionaryCandidateResult,
     detect_charuco_pose,
+    draw_charuco_axes_overlay_bgr,
     record_charuco_pose_provenance,
 )
 from .mask_provider import MaskProvider, MaskResult
@@ -41,6 +42,7 @@ PROCESSING_CACHE_DIRNAME = "processing_cache"
 PROCESSING_CACHE_POINTER = "latest.json"
 PROCESSING_CACHE_RECORDS = "records.json"
 PROCESSING_CACHE_VERSION = 1
+CHARUCO_AXES_PREVIEW_DIRNAME = "charuco_axes"
 
 
 @dataclass(frozen=True)
@@ -231,6 +233,9 @@ def process_recorded_references(
             },
         )
         _, cache_payload = load_processing_cache(profile, cache_dir=cache_path)
+        cache_processing_summary = (
+            dict(cache_payload.get("processing_summary")) if isinstance(cache_payload.get("processing_summary"), dict) else {}
+        )
         cached_records = list(cache_payload.get("records", []))
         selected_records = select_view_diverse_records(cached_records, config=config)
         for index, record in enumerate(selected_records):
@@ -271,6 +276,11 @@ def process_recorded_references(
                 "total_recorded_frames": len(recorded_frame_index),
                 "detector_preset": detector_config.preset,
                 "detector_config": detector_config.to_dict(),
+                "charuco_axes_preview_count": int(cache_processing_summary.get("charuco_axes_preview_count", 0)),
+                "charuco_axes_preview_dir": cache_processing_summary.get(
+                    "charuco_axes_preview_dir",
+                    CHARUCO_AXES_PREVIEW_DIRNAME,
+                ),
             },
         )
         return write_processing_report(profile, report)
@@ -405,6 +415,15 @@ def write_processing_cache(
                 record.pop("cached_mask_path", None)
                 record["accepted"] = False
                 record["reasons"] = [f"cached mask image missing during incremental processing: {mask_rel}"]
+        preview_rel = record.get("charuco_axes_preview_path")
+        if preview_rel and source_cache_dir is not None:
+            source_preview = source_cache_dir / str(preview_rel)
+            target_preview = run_dir / str(preview_rel)
+            if source_preview.exists():
+                target_preview.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_preview, target_preview)
+            else:
+                record.pop("charuco_axes_preview_path", None)
         record["selected_index"] = None
         records.append(record)
     for item in evaluated:
@@ -415,7 +434,15 @@ def write_processing_cache(
             mask_path.parent.mkdir(parents=True, exist_ok=True)
             cv2.imwrite(str(mask_path), np.asarray(item.mask.mask).astype(np.uint8) * 255)
             record["cached_mask_path"] = mask_rel.as_posix()
+        preview_rel = _write_charuco_axes_preview(run_dir, item, cv2=cv2)
+        if preview_rel is not None:
+            record["charuco_axes_preview_path"] = preview_rel
         records.append(record)
+    processing_summary = dict(cache_metadata or {})
+    processing_summary["charuco_axes_preview_count"] = len(
+        [record for record in records if record.get("charuco_axes_preview_path")]
+    )
+    processing_summary["charuco_axes_preview_dir"] = CHARUCO_AXES_PREVIEW_DIRNAME
     payload = {
         "version": PROCESSING_CACHE_VERSION,
         "run_id": run_id,
@@ -429,7 +456,7 @@ def write_processing_cache(
         "thresholds": config.to_dict(),
         "frame_evaluation_config": _frame_evaluation_config(config),
         "mask_provider": _mask_provider_metadata(mask_provider),
-        "processing_summary": dict(cache_metadata or {}),
+        "processing_summary": processing_summary,
         "records": records,
     }
     (run_dir / PROCESSING_CACHE_RECORDS).write_text(
@@ -442,6 +469,22 @@ def write_processing_cache(
         encoding="utf-8",
     )
     return run_dir
+
+
+def _write_charuco_axes_preview(run_dir: Path, item: EvaluatedCandidate, *, cv2) -> str | None:
+    pose = item.charuco_pose
+    if pose is None or not pose.ok or pose.camera_T_board is None:
+        return None
+    preview_rel = Path(CHARUCO_AXES_PREVIEW_DIRNAME) / item.candidate.session_id / f"{item.candidate.frame_index:06d}.png"
+    preview_path = run_dir / preview_rel
+    preview_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        overlay = draw_charuco_axes_overlay_bgr(item.candidate.rgb, item.candidate.intrinsics, pose)
+    except Exception:
+        return None
+    if not cv2.imwrite(str(preview_path), overlay):
+        return None
+    return preview_rel.as_posix()
 
 
 def load_processing_cache(
