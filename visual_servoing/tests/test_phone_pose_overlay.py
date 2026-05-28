@@ -9,6 +9,7 @@ from visual_servoing.phone_pose.overlay import (
     project_points,
 )
 from visual_servoing.phone_pose.rgbd_geometry import CameraIntrinsics
+from visual_servoing.point_pose.overlay import _timing_summary
 
 
 def test_project_axes_uses_intrinsics():
@@ -63,3 +64,23 @@ def test_draw_status_overlay_adds_live_status_text():
     assert rendered.shape == image.shape
     assert int(rendered.sum()) > 0
     assert not np.array_equal(rendered, image)
+
+
+def test_timing_summary_includes_hybrid_tracking_fields():
+    summary = _timing_summary(
+        {
+            "camera_read_ms": 1.0,
+            "remote_segmentation_ms": 2.0,
+            "register_ms": 3.0,
+            "track_one_ms": 4.0,
+            "frame_total_ms": 5.0,
+            "cuda_allocated_mb": 10.0,
+            "cuda_reserved_mb": 20.0,
+        }
+    )
+
+    assert "rseg:2.0" in summary
+    assert "reg:3.0" in summary
+    assert "trk:4.0" in summary
+    assert "total:5.0" in summary
+    assert "cuda:10/20MB" in summary

@@ -629,7 +629,7 @@ class FoundationPoseV2Service:
             provider = Sam3MaskProvider(
                 prompt=str(options.get("prompt") or profile.prompt),
                 device=str(options.get("sam_device") or options.get("device") or "auto"),
-                confidence_threshold=float(options.get("sam_threshold", options.get("threshold", 0.3))),
+                confidence_threshold=float(options.get("sam_threshold", options.get("threshold", 0.1))),
                 resolution=int(options.get("sam_resolution", 1008)),
             )
             report = process_recorded_references(

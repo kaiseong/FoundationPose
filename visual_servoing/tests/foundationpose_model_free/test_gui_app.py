@@ -323,6 +323,43 @@ def test_gui_command_builder_constructs_remote_track_command(tmp_path):
     assert "--address" not in command
 
 
+def test_gui_command_builder_constructs_hybrid_track_command(tmp_path):
+    builder = GuiCommandBuilder(config=GuiConfig(data_root=str(tmp_path), python_executable="python"))
+
+    command = builder.track_hybrid_live(
+        server_host="192.168.0.3",
+        server_port=8081,
+        object_name="mouse",
+        prompt="wireless mouse",
+        foundationpose_root="/home/kgs/FoundationPose",
+        auto_reinit_after_lost_frames=5,
+        camera_model="zed",
+        serial="12345",
+        width=672,
+        height=376,
+        refine_iterations=1,
+        track_iterations=1,
+        sam_device="cpu",
+        sam_resolution=512,
+        data_root=str(tmp_path),
+    )
+
+    assert command[:3] == ["python", "-m", "visual_servoing.scripts.fp_track_live"]
+    assert command[command.index("--remote-init-mask-server") + 1] == "192.168.0.3:8081"
+    assert command[command.index("--remote-init-mask-device") + 1] == "cpu"
+    assert command[command.index("--remote-init-mask-resolution") + 1] == "512"
+    assert command[command.index("--object") + 1] == "mouse"
+    assert command[command.index("--prompt") + 1] == "wireless mouse"
+    assert command[command.index("--camera") + 1] == "zed"
+    assert command[command.index("--zed-depth-mode") + 1] == "NEURAL"
+    assert command[command.index("--serial") + 1] == "12345"
+    assert command[command.index("--refine-iterations") + 1] == "1"
+    assert command[command.index("--track-iterations") + 1] == "1"
+    assert "--auto-reinit" not in command
+    assert "--width" not in command
+    assert "--height" not in command
+
+
 def test_gui_source_contains_remote_connect_state_flow():
     build_source = inspect.getsource(FoundationPoseWorkflowGui._build)
     connect_source = inspect.getsource(FoundationPoseWorkflowGui.connect_remote_server)
@@ -330,6 +367,7 @@ def test_gui_source_contains_remote_connect_state_flow():
     segmentation_source = inspect.getsource(FoundationPoseWorkflowGui.run_segmentation_check)
     local_tracking_source = inspect.getsource(FoundationPoseWorkflowGui.run_tracking_local)
     remote_tracking_source = inspect.getsource(FoundationPoseWorkflowGui.run_tracking_remote)
+    hybrid_tracking_source = inspect.getsource(FoundationPoseWorkflowGui.run_tracking_hybrid)
     reinit_source = inspect.getsource(FoundationPoseWorkflowGui.reinitialize_tracking_event)
     build_command_source = inspect.getsource(FoundationPoseWorkflowGui.run_build_assets)
     force_build_source = inspect.getsource(FoundationPoseWorkflowGui.run_force_build_assets)
@@ -342,13 +380,19 @@ def test_gui_source_contains_remote_connect_state_flow():
     assert 'text="Connect"' in build_source
     assert 'text="Track Local"' in build_source
     assert 'text="Track Remote"' in build_source
+    assert 'text="Track Hybrid"' in build_source
+    assert "run_tracking_hybrid" in build_source
     assert "threading.Thread" in connect_source
     assert "remote_events" in poll_source
     assert "_start_remote_segmentation_check" in segmentation_source
     assert "track_live" in local_tracking_source
     assert "_download_remote_model_for_local_tracking" in local_tracking_source
     assert "track_remote_live" in remote_tracking_source
+    assert "track_hybrid_live" in hybrid_tracking_source
+    assert '_last_tracking_mode = "hybrid"' in hybrid_tracking_source
+    assert "_download_remote_model_for_local_tracking" in hybrid_tracking_source
     assert "_last_tracking_mode" in reinit_source
+    assert "run_tracking_hybrid" in reinit_source
     assert "_start_remote_build" in build_command_source
     assert "_start_remote_build" in force_build_source
     assert build_command_source.index("_start_remote_build") < build_command_source.index("latest_processing_report")

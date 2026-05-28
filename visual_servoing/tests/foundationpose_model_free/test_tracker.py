@@ -120,6 +120,30 @@ def test_tracker_releases_reinitialization_mask_provider(tmp_path):
     assert mask_provider.release_calls == 1
 
 
+def test_tracker_calls_mask_provider_only_for_init_and_manual_reinit(tmp_path):
+    profile = ObjectProfileRegistry(tmp_path).create("phone")
+    adapter = CountingAdapter()
+    mask_provider = CountingMaskProvider()
+    tracker = FoundationPoseLiveTracker(profile=profile, adapter=adapter, mask_provider=mask_provider)
+    rgb, depth, _mask, intr = _frame_inputs()
+
+    first = tracker.process_frame(rgb=rgb, depth_m=depth, intrinsics=intr)
+    second = tracker.process_frame(rgb=rgb, depth_m=depth, intrinsics=intr)
+    tracker.request_reinit()
+    third = tracker.process_frame(rgb=rgb, depth_m=depth, intrinsics=intr)
+
+    assert first.state == TrackingState.REINIT
+    assert second.state == TrackingState.TRACKING
+    assert third.state == TrackingState.REINIT
+    assert mask_provider.get_mask_calls == 2
+    assert adapter.register_calls == 2
+    assert adapter.track_calls == 1
+    assert first.metadata is not None
+    assert first.metadata["mask_provider_source"] == "fake"
+    assert "register_ms" in first.metadata
+    assert "track_one_ms" in second.metadata
+
+
 def test_tracker_warns_when_initial_pose_origin_is_far_from_mask_center(tmp_path):
     profile = ObjectProfileRegistry(tmp_path).create("phone")
     adapter = CountingAdapter()
@@ -301,6 +325,15 @@ class ReleasableMaskProvider(AlwaysMaskProvider):
 
     def release(self) -> None:
         self.release_calls += 1
+
+
+class CountingMaskProvider(AlwaysMaskProvider):
+    def __init__(self) -> None:
+        self.get_mask_calls = 0
+
+    def get_mask(self, image_rgb, *, depth_m=None, object_name=None):
+        self.get_mask_calls += 1
+        return super().get_mask(image_rgb, depth_m=depth_m, object_name=object_name)
 
 
 class CountingEstimator:

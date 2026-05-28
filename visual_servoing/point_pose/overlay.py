@@ -172,8 +172,11 @@ def _status_color(status: str) -> tuple[int, int, int]:
 def _timing_summary(timing_ms: Mapping[str, float]) -> str:
     fields = (
         ("cap", "camera_read_ms"),
+        ("rseg", "remote_segmentation_ms"),
         ("seg", "segmentation_ms"),
         ("bp", "backproject_ms"),
+        ("reg", "register_ms"),
+        ("trk", "track_one_ms"),
         ("pose", "pose_estimation_ms"),
         ("draw", "pose_overlay_ms"),
         ("disp", "display_ms"),
@@ -185,6 +188,13 @@ def _timing_summary(timing_ms: Mapping[str, float]) -> str:
     for label, key in fields:
         if key in timing_ms:
             parts.append(f"{label}:{float(timing_ms[key]):.1f}")
+    if "cuda_allocated_mb" in timing_ms:
+        cuda_text = f"cuda:{float(timing_ms['cuda_allocated_mb']):.0f}"
+        if "cuda_reserved_mb" in timing_ms:
+            cuda_text += f"/{float(timing_ms['cuda_reserved_mb']):.0f}MB"
+        else:
+            cuda_text += "MB"
+        parts.append(cuda_text)
     return "ms " + " | ".join(parts)
 
 

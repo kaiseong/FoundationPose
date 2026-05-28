@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from visual_servoing.foundationpose_model_free.foundationpose_adapter import (
 )
 from visual_servoing.foundationpose_model_free.mask_provider import (
     PrecomputedMaskProvider,
+    RemoteSegmentationMaskProvider,
     Sam3MaskProvider,
 )
 from visual_servoing.foundationpose_model_free.registry import ObjectProfileRegistry
@@ -37,7 +39,7 @@ from visual_servoing.point_pose.realsense_d405 import LiveRgbdCamera, SUPPORTED_
 from visual_servoing.point_pose.zed_camera import DEFAULT_ZED_DEPTH_MODE, ZED_DEPTH_MODES
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--object", required=True)
     parser.add_argument("--prompt", help="Override the profile prompt for SAM3 initialization.")
@@ -45,6 +47,23 @@ def main() -> int:
     parser.add_argument("--foundationpose-root", default=None)
     parser.add_argument("--mesh", help="Override generated profile mesh path.")
     parser.add_argument("--init-mask", help="Use a precomputed first-frame mask instead of SAM3.")
+    parser.add_argument(
+        "--remote-init-mask-server",
+        help="Use the FoundationPose v2 server for initialization/reinitialization masks, then track locally.",
+    )
+    parser.add_argument("--remote-init-mask-timeout-s", type=float, default=10.0)
+    parser.add_argument(
+        "--remote-init-mask-device",
+        default=None,
+        help="SAM device used by the remote segmentation server. Defaults to --device.",
+    )
+    parser.add_argument("--remote-init-mask-resolution", type=int, default=1008)
+    parser.add_argument(
+        "--remote-init-mask-threshold",
+        type=float,
+        default=None,
+        help="SAM threshold used by the remote segmentation server. Defaults to --threshold.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--threshold", type=float, default=0.3)
     parser.add_argument("--camera", choices=SUPPORTED_LIVE_CAMERA_MODELS, default="d405")
@@ -97,8 +116,15 @@ def main() -> int:
     parser.add_argument("--pose-depth-window-radius-px", type=int, default=7)
     parser.add_argument("--max-pose-jump-m", type=float, default=None)
     parser.add_argument("--implausible-lost-threshold", type=int, default=1)
-    args = parser.parse_args()
+    return parser
 
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     profile = ObjectProfileRegistry(args.data_root).get(args.object)
     if args.prompt:
         profile.prompt = args.prompt
@@ -124,28 +150,49 @@ def main() -> int:
             tracking_iterations=args.track_iterations,
         )
     )
-    mask_provider = (
-        PrecomputedMaskProvider(args.init_mask)
-        if args.init_mask
-        else Sam3MaskProvider(prompt=profile.prompt, device=args.device, confidence_threshold=args.threshold)
-    )
+    mask_provider = build_mask_provider(args, profile)
+    recovery_config = build_recovery_config(args)
     tracker = FoundationPoseLiveTracker(
         profile=profile,
         adapter=adapter,
         mask_provider=mask_provider,
-        recovery_config=TrackingRecoveryConfig(
-            hold_last_pose_frames=args.hold_last_pose_frames,
-            auto_reinit=args.auto_reinit,
-            auto_reinit_after_lost_frames=args.auto_reinit_after_lost_frames,
-            verify_pose_depth=bool(args.enable_depth_lost_check and not args.disable_depth_lost_check),
-            warn_initial_pose_mask_alignment=bool(args.warn_initial_pose_mask_alignment),
-            pose_depth_tolerance_m=args.pose_depth_tolerance_m,
-            pose_depth_window_radius_px=args.pose_depth_window_radius_px,
-            max_pose_jump_m=args.max_pose_jump_m,
-            implausible_lost_threshold=args.implausible_lost_threshold,
-        ),
+        recovery_config=recovery_config,
     )
     return run_live(args, profile.prompt, tracker)
+
+
+def build_mask_provider(args: argparse.Namespace, profile) -> object:
+    if args.init_mask:
+        return PrecomputedMaskProvider(args.init_mask)
+    if args.remote_init_mask_server:
+        return RemoteSegmentationMaskProvider(
+            args.remote_init_mask_server,
+            prompt=profile.prompt,
+            device=args.remote_init_mask_device or args.device,
+            confidence_threshold=(
+                args.threshold if args.remote_init_mask_threshold is None else args.remote_init_mask_threshold
+            ),
+            resolution=args.remote_init_mask_resolution,
+            timeout_s=args.remote_init_mask_timeout_s,
+        )
+    return Sam3MaskProvider(prompt=profile.prompt, device=args.device, confidence_threshold=args.threshold)
+
+
+def build_recovery_config(args: argparse.Namespace) -> TrackingRecoveryConfig:
+    hybrid_remote_init = bool(args.remote_init_mask_server and not args.init_mask)
+    setattr(args, "hybrid_remote_init", hybrid_remote_init)
+    setattr(args, "hybrid_auto_reinit_disabled", hybrid_remote_init)
+    return TrackingRecoveryConfig(
+        hold_last_pose_frames=args.hold_last_pose_frames,
+        auto_reinit=bool(args.auto_reinit and not hybrid_remote_init),
+        auto_reinit_after_lost_frames=args.auto_reinit_after_lost_frames,
+        verify_pose_depth=bool(args.enable_depth_lost_check and not args.disable_depth_lost_check),
+        warn_initial_pose_mask_alignment=bool(args.warn_initial_pose_mask_alignment),
+        pose_depth_tolerance_m=args.pose_depth_tolerance_m,
+        pose_depth_window_radius_px=args.pose_depth_window_radius_px,
+        max_pose_jump_m=args.max_pose_jump_m,
+        implausible_lost_threshold=args.implausible_lost_threshold,
+    )
 
 
 def run_live(args: argparse.Namespace, prompt: str, tracker: FoundationPoseLiveTracker) -> int:
@@ -186,6 +233,12 @@ def run_live(args: argparse.Namespace, prompt: str, tracker: FoundationPoseLiveT
                 status = result.state
                 message = result.message
                 result_metadata = result.metadata
+                merge_timing_metadata(timing_ms, result_metadata)
+                if getattr(args, "hybrid_auto_reinit_disabled", False):
+                    message = combine_status_messages(
+                        message,
+                        "hybrid remote-init: auto reinit disabled; press R to reinitialize",
+                    )
                 if pose is not None:
                     start = time.perf_counter()
                     if result.mask is not None:
@@ -219,6 +272,7 @@ def run_live(args: argparse.Namespace, prompt: str, tracker: FoundationPoseLiveT
             fps_smooth = current_fps if fps_smooth is None else 0.85 * fps_smooth + 0.15 * current_fps
             previous_frame_time = now
             timing_ms["fps"] = fps_smooth
+            timing_ms["frame_total_ms"] = elapsed_ms(frame_start)
             start = time.perf_counter()
             overlay = draw_status_overlay(
                 overlay,
@@ -283,6 +337,39 @@ def emit_json(
     if metadata:
         payload["tracking_metadata"] = metadata
     print(json.dumps(payload, separators=(",", ":")))
+
+
+def merge_timing_metadata(timing_ms: dict[str, float], metadata: dict[str, object] | None) -> None:
+    if metadata:
+        for key in ("remote_segmentation_ms", "register_ms", "track_one_ms", "mask_provider_ms"):
+            value = metadata.get(key)
+            if isinstance(value, (int, float)):
+                timing_ms[key] = float(value)
+    timing_ms.update(cuda_memory_snapshot())
+
+
+def cuda_memory_snapshot() -> dict[str, float]:
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return {}
+    cuda = getattr(torch, "cuda", None)
+    if cuda is None:
+        return {}
+    try:
+        if not cuda.is_available():
+            return {}
+        allocated = float(cuda.memory_allocated()) / (1024.0 * 1024.0)
+        reserved = float(cuda.memory_reserved()) / (1024.0 * 1024.0)
+        snapshot = {
+            "cuda_allocated_mb": allocated,
+            "cuda_reserved_mb": reserved,
+        }
+        max_allocated = getattr(cuda, "max_memory_allocated", None)
+        if callable(max_allocated):
+            snapshot["cuda_max_allocated_mb"] = float(max_allocated()) / (1024.0 * 1024.0)
+        return snapshot
+    except Exception:
+        return {}
 
 
 def pose_distance_payload(pose: np.ndarray, *, expected_distance_m: float | None = None) -> dict[str, object]:

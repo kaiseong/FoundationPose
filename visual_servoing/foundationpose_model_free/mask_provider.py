@@ -2,12 +2,24 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, field
 import gc
+import time
 from pathlib import Path
 from typing import Protocol
+from urllib import request as urllib_request
 
 import numpy as np
+
+from visual_servoing.visual_servo_protocol_v2 import (
+    REQUEST_CONTENT_TYPE,
+    decode_foundationpose_response,
+    encode_foundationpose_segmentation_request,
+)
+
+
+FOUNDATIONPOSE_SEGMENTATION_PATH = "/foundationpose/v2/segmentation"
 
 
 class MaskProviderError(RuntimeError):
@@ -289,6 +301,107 @@ class Sam3MaskProvider:
             return
 
 
+class RemoteSegmentationMaskProvider:
+    def __init__(
+        self,
+        server: str,
+        *,
+        prompt: str = "object",
+        device: str = "cuda",
+        confidence_threshold: float = 0.3,
+        resolution: int = 1008,
+        timeout_s: float = 10.0,
+        quality_config: MaskQualityConfig | None = None,
+    ) -> None:
+        self.server_url = _normalize_foundationpose_server_url(server)
+        self.prompt = str(prompt).strip() or "object"
+        self.device = str(device).strip() or "cuda"
+        self.confidence_threshold = float(confidence_threshold)
+        self.resolution = int(resolution)
+        self.timeout_s = float(timeout_s)
+        self.quality_config = quality_config or MaskQualityConfig(min_confidence=self.confidence_threshold)
+        self._previous_mask: np.ndarray | None = None
+
+    def get_mask(
+        self,
+        image_rgb: np.ndarray,
+        *,
+        depth_m: np.ndarray | None = None,
+        object_name: str | None = None,
+    ) -> MaskResult:
+        if depth_m is None:
+            raise MaskProviderError("remote segmentation requires depth_m")
+        prompt = str(object_name or self.prompt).strip()
+        if not prompt:
+            raise MaskProviderError("remote segmentation requires a prompt")
+        request_id = f"remote-mask-{time.monotonic_ns()}"
+        body = encode_foundationpose_segmentation_request(
+            rgb=np.asarray(image_rgb),
+            depth_m=np.asarray(depth_m, dtype=np.float32),
+            request_id=request_id,
+            capture_monotonic_ns=time.monotonic_ns(),
+            prompt=prompt,
+            mask_options={
+                "device": self.device,
+                "threshold": self.confidence_threshold,
+                "resolution": self.resolution,
+            },
+            metadata={"source": "fp_track_live_remote_init"},
+        )
+        request = urllib_request.Request(
+            f"{self.server_url}{FOUNDATIONPOSE_SEGMENTATION_PATH}",
+            data=body,
+            headers={"Content-Type": REQUEST_CONTENT_TYPE},
+            method="POST",
+        )
+        start = time.perf_counter()
+        try:
+            with urllib_request.urlopen(request, timeout=self.timeout_s) as response:
+                payload = decode_foundationpose_response(response.read())
+        except Exception as exc:
+            raise MaskProviderError(f"remote segmentation request failed: {exc}") from exc
+        remote_segmentation_ms = (time.perf_counter() - start) * 1000.0
+        if payload.get("ok") is not True:
+            reason = payload.get("error") or payload.get("reason") or payload.get("status") or "remote response not ok"
+            raise MaskProviderError(f"remote segmentation failed: {reason}")
+        mask_png_b64 = payload.get("mask_png_b64")
+        if not isinstance(mask_png_b64, str) or not mask_png_b64:
+            raise MaskProviderError("remote segmentation response missing mask_png_b64")
+        mask = _decode_mask_png(mask_png_b64)
+        image_shape = np.asarray(image_rgb).shape[:2]
+        if mask.shape != tuple(image_shape):
+            raise MaskProviderError(f"remote segmentation mask shape {mask.shape} does not match image shape {image_shape}")
+        confidence = _extract_remote_mask_confidence(payload)
+        quality = validate_mask_quality(
+            mask,
+            image_shape=tuple(image_shape),
+            confidence=confidence,
+            depth_m=depth_m,
+            previous_mask=self._previous_mask,
+            config=self.quality_config,
+        )
+        _raise_for_quality_failure(quality)
+        self._previous_mask = mask.copy()
+        return MaskResult(
+            mask=mask,
+            source="remote_segmentation",
+            confidence=confidence,
+            metadata={
+                "server": self.server_url,
+                "request_id": request_id,
+                "prompt": prompt,
+                "device": self.device,
+                "resolution": self.resolution,
+                "threshold": self.confidence_threshold,
+                "remote_segmentation_ms": remote_segmentation_ms,
+                "mask": payload.get("mask"),
+                "mask_source": payload.get("mask_source"),
+                "mask_metadata": payload.get("mask_metadata"),
+                "mask_quality": quality.__dict__,
+            },
+        )
+
+
 def load_binary_mask(path: str | Path, *, shape: tuple[int, int] | None = None) -> np.ndarray:
     path = Path(path)
     if path.suffix == ".npy":
@@ -447,6 +560,45 @@ def validate_mask_quality(
 def _raise_for_quality_failure(quality: MaskQualityResult) -> None:
     if not quality.ok:
         raise MaskProviderError("mask quality failed: " + "; ".join(quality.reasons))
+
+
+def _normalize_foundationpose_server_url(server: str) -> str:
+    value = str(server).strip()
+    if not value:
+        raise ValueError("remote segmentation server is required")
+    if not value.startswith(("http://", "https://")):
+        value = f"http://{value}"
+    return value.rstrip("/")
+
+
+def _decode_mask_png(mask_png_b64: str) -> np.ndarray:
+    cv2 = _require_cv2()
+    try:
+        encoded = base64.b64decode(mask_png_b64)
+    except Exception as exc:
+        raise MaskProviderError("remote segmentation mask_png_b64 is not valid base64") from exc
+    image = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        raise MaskProviderError("remote segmentation mask_png_b64 is not a readable PNG")
+    return image > 0
+
+
+def _extract_remote_mask_confidence(payload: dict[str, object]) -> float | None:
+    candidates: list[object] = []
+    mask = payload.get("mask")
+    if isinstance(mask, dict):
+        candidates.extend([mask.get("score"), mask.get("confidence")])
+    mask_metadata = payload.get("mask_metadata")
+    if isinstance(mask_metadata, dict):
+        candidates.extend([mask_metadata.get("score"), mask_metadata.get("confidence")])
+    for value in candidates:
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def _largest_component_fraction(mask: np.ndarray) -> float:

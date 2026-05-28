@@ -408,6 +408,59 @@ class GuiCommandBuilder:
         self._append_data_root(command, data_root)
         return command
 
+    def track_hybrid_live(
+        self,
+        *,
+        server_host: str,
+        server_port: int,
+        object_name: str,
+        prompt: str,
+        foundationpose_root: str,
+        auto_reinit_after_lost_frames: int,
+        camera_model: str = "d405",
+        serial: str | None = None,
+        width: int = 640,
+        height: int = 480,
+        fps: int = 15,
+        refine_iterations: int = 5,
+        track_iterations: int = 2,
+        zed_depth_mode: str = DEFAULT_ZED_DEPTH_MODE,
+        sam_device: str = "auto",
+        sam_resolution: int = 1008,
+        data_root: str | None = None,
+    ) -> list[str]:
+        command = self.module(
+            "visual_servoing.scripts.fp_track_live",
+            "--object",
+            object_name,
+            "--prompt",
+            prompt,
+            "--foundationpose-root",
+            foundationpose_root,
+            "--camera",
+            camera_model,
+            "--fps",
+            str(fps),
+            "--print-timing",
+            "--remote-init-mask-server",
+            f"{server_host}:{int(server_port)}",
+            "--remote-init-mask-device",
+            str(sam_device),
+            "--remote-init-mask-resolution",
+            str(int(sam_resolution)),
+            "--auto-reinit-after-lost-frames",
+            str(auto_reinit_after_lost_frames),
+            "--refine-iterations",
+            str(refine_iterations),
+            "--track-iterations",
+            str(track_iterations),
+        )
+        self._append_live_dimensions(command, camera_model=camera_model, width=width, height=height)
+        self._append_zed_depth_mode(command, camera_model=camera_model, depth_mode=zed_depth_mode)
+        self._append_serial(command, serial)
+        self._append_data_root(command, data_root)
+        return command
+
     @staticmethod
     def _append_data_root(command: list[str], data_root: str | None) -> None:
         if data_root:
@@ -712,8 +765,9 @@ class FoundationPoseWorkflowGui:
         ttk.Spinbox(build, from_=1, to=10, textvariable=self.track_iterations, width=5).grid(row=0, column=6)
         ttk.Button(build, text="Track Local", command=self.run_tracking_local).grid(row=1, column=0)
         ttk.Button(build, text="Track Remote", command=self.run_tracking_remote).grid(row=1, column=1)
-        ttk.Button(build, text="Reinit Tracking", command=self.reinitialize_tracking_event).grid(row=1, column=2)
-        ttk.Button(build, text="Stop Command", command=self.stop_command).grid(row=1, column=3)
+        ttk.Button(build, text="Track Hybrid", command=self.run_tracking_hybrid).grid(row=1, column=2)
+        ttk.Button(build, text="Reinit Tracking", command=self.reinitialize_tracking_event).grid(row=1, column=3)
+        ttk.Button(build, text="Stop Command", command=self.stop_command).grid(row=1, column=4)
 
         logs = ttk.LabelFrame(stages, text="Status / Logs", padding=6)
         logs.grid(row=4, column=0, sticky="nsew", pady=(8, 0))
@@ -1100,6 +1154,36 @@ class FoundationPoseWorkflowGui:
             remote=True,
         )
 
+    def run_tracking_hybrid(self) -> None:
+        profile = self._current_profile()
+        if not self._release_live_sessions_for_gpu():
+            return
+        if find_generated_mesh(profile) is None:
+            if not self._download_remote_model_for_local_tracking(profile):
+                return
+        self._last_tracking_mode = "hybrid"
+        self._start_command(
+            self.command_builder.track_hybrid_live(
+                server_host=self.server_host.get().strip(),
+                server_port=int(self.server_port.get()),
+                object_name=profile.name,
+                prompt=self.prompt.get(),
+                foundationpose_root=self.foundationpose_root.get(),
+                auto_reinit_after_lost_frames=int(self.auto_reinit_after.get()),
+                camera_model=self.camera_model.get(),
+                serial=self.camera_serial.get(),
+                width=int(self.camera_width.get()),
+                height=int(self.camera_height.get()),
+                fps=int(self.camera_fps.get()),
+                refine_iterations=int(self.refine_iterations.get()),
+                track_iterations=int(self.track_iterations.get()),
+                sam_device=self.sam_device.get(),
+                sam_resolution=int(self.sam_resolution.get()),
+                data_root=self.config.data_root,
+            ),
+            remote=True,
+        )
+
     def _download_remote_model_for_local_tracking(self, profile) -> bool:
         host = self.server_host.get().strip()
         port = int(self.server_port.get())
@@ -1255,7 +1339,10 @@ class FoundationPoseWorkflowGui:
             self.remote_events.put(RemoteHealthEvent("Remote", f"Remote build {state}: {reason}"))
 
     def reinitialize_tracking_event(self, event=None) -> None:
-        restart_tracking = self.run_tracking_remote if self._last_tracking_mode == "remote" else self.run_tracking_local
+        restart_tracking = {
+            "remote": self.run_tracking_remote,
+            "hybrid": self.run_tracking_hybrid,
+        }.get(self._last_tracking_mode, self.run_tracking_local)
         if self.runner.running:
             self.runner.stop()
             self.root.after(700, restart_tracking)
@@ -1544,7 +1631,7 @@ class FoundationPoseWorkflowGui:
             "excluded_candidate_ids": list(normalize_excluded_candidate_ids(self.excluded_candidate_ids.get())),
             "sam_device": self.sam_device.get(),
             "sam_resolution": int(self.sam_resolution.get()),
-            "sam_threshold": 0.3,
+            "sam_threshold": 0.1,
             "required_keyframes": int(self.reference_target.get()),
             "max_keyframes": int(self.max_keyframes.get()),
             "min_mask_area_fraction": 0.0005,

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import time
 
 import numpy as np
 
@@ -99,26 +100,41 @@ class FoundationPoseLiveTracker:
                 if mask is None:
                     if self.mask_provider is None:
                         raise ValueError("initialization requires a mask or mask_provider")
+                    start = time.perf_counter()
                     mask_result = self.mask_provider.get_mask(
                         rgb,
                         depth_m=depth_m,
                         object_name=self.profile.prompt,
                     )
+                    mask_provider_ms = elapsed_ms(start)
                     mask = mask_result.mask
+                    metadata["mask_provider_source"] = mask_result.source
+                    metadata["mask_provider_ms"] = mask_provider_ms
+                    if mask_result.source == "remote_segmentation":
+                        metadata["remote_segmentation_ms"] = float(
+                            mask_result.metadata.get("remote_segmentation_ms", mask_provider_ms)
+                        )
+                    if mask_result.confidence is not None:
+                        metadata["mask_confidence"] = float(mask_result.confidence)
+                    metadata["mask_provider_metadata"] = mask_result.metadata
                     release = getattr(self.mask_provider, "release", None)
                     if callable(release):
                         release()
                 init_mask = np.asarray(mask).astype(bool)
+                start = time.perf_counter()
                 pose = self.adapter.register(
                     rgb=rgb,
                     depth_m=depth_m,
                     intrinsics=intrinsics,
                     mask=mask,
                 )
+                metadata["register_ms"] = elapsed_ms(start)
                 self.initialized = True
                 self._reinit_requested = False
             else:
+                start = time.perf_counter()
                 pose = self.adapter.track_one(rgb=rgb, depth_m=depth_m, intrinsics=intrinsics)
+                metadata["track_one_ms"] = elapsed_ms(start)
         except Exception as exc:
             message = str(exc) or "tracking/reinitialization failed"
             self.metrics.update(None)
@@ -258,6 +274,10 @@ class FoundationPoseLiveTracker:
 def _valid_pose(matrix: np.ndarray) -> bool:
     pose = np.asarray(matrix)
     return pose.shape == (4, 4) and bool(np.all(np.isfinite(pose)))
+
+
+def elapsed_ms(start: float) -> float:
+    return (time.perf_counter() - start) * 1000.0
 
 
 def _pose_mask_alignment_message(

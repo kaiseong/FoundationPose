@@ -46,6 +46,18 @@ from visual_servoing.point_pose.realsense_d405 import LiveRgbdCamera, SUPPORTED_
 from visual_servoing.point_pose.rgbd_geometry import CameraIntrinsics
 
 
+DEFAULT_SAM_THRESHOLD = 0.3
+DEFAULT_PROCESSING_SAM_THRESHOLD = 0.1
+
+
+def _sam_threshold(args: argparse.Namespace, *, processing: bool = False) -> float:
+    if args.threshold is not None:
+        return float(args.threshold)
+    if processing:
+        return DEFAULT_PROCESSING_SAM_THRESHOLD
+    return DEFAULT_SAM_THRESHOLD
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -77,7 +89,7 @@ def main() -> int:
     parser.add_argument("--record-interval-s", type=float, default=0.0)
     parser.add_argument("--prompt", default=None)
     parser.add_argument("--device", default="auto", choices=("auto", "cuda", "cpu"))
-    parser.add_argument("--threshold", type=float, default=0.3)
+    parser.add_argument("--threshold", type=float, default=None)
     parser.add_argument("--sam-resolution", type=int, default=1008)
     parser.add_argument("--squares-x", type=int, default=5)
     parser.add_argument("--squares-y", type=int, default=8)
@@ -345,7 +357,7 @@ def _live_capture(
     provider = Sam3MaskProvider(
         prompt=args.prompt or profile.prompt,
         device=args.device,
-        confidence_threshold=args.threshold,
+        confidence_threshold=_sam_threshold(args),
         resolution=args.sam_resolution,
     )
     accepted = 0
@@ -462,7 +474,7 @@ def _record_raw(
         board_object=board_object,
         sam_device=args.device,
         sam_resolution=args.sam_resolution,
-        sam_confidence_threshold=args.threshold,
+        sam_confidence_threshold=_sam_threshold(args),
     )
     start = time.perf_counter()
     frame_limit = max(int(args.frames), 0)
@@ -516,7 +528,7 @@ def _process_recordings(
     provider = Sam3MaskProvider(
         prompt=args.prompt or profile.prompt,
         device=args.device,
-        confidence_threshold=args.threshold,
+        confidence_threshold=_sam_threshold(args, processing=True),
         resolution=args.sam_resolution,
     )
     if args.evaluate_only:
@@ -574,7 +586,7 @@ def _compare_charuco_detector_presets(
         provider = Sam3MaskProvider(
             prompt=args.prompt or profile.prompt,
             device=args.device,
-            confidence_threshold=args.threshold,
+            confidence_threshold=_sam_threshold(args, processing=True),
             resolution=args.sam_resolution,
         )
         reports[preset] = evaluate_recorded_references(

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import json
+
 import numpy as np
 
 from visual_servoing.foundationpose_model_free.mask_provider import (
@@ -7,8 +10,13 @@ from visual_servoing.foundationpose_model_free.mask_provider import (
     MaskQualityConfig,
     MaskProviderError,
     PrecomputedMaskProvider,
+    RemoteSegmentationMaskProvider,
     Sam3MaskProvider,
     validate_mask_quality,
+)
+from visual_servoing.visual_servo_protocol_v2 import (
+    REQUEST_CONTENT_TYPE,
+    decode_foundationpose_segmentation_request,
 )
 
 
@@ -35,6 +43,190 @@ def test_manual_polygon_mask_provider_rasterizes_polygon():
     assert result.source == "manual_polygon"
     assert result.mask.shape == image.shape[:2]
     assert int(result.mask.sum()) > 0
+
+
+def test_remote_segmentation_mask_provider_posts_rgbd_and_decodes_png(monkeypatch):
+    cv2 = _require_test_cv2()
+    image = np.zeros((20, 20, 3), dtype=np.uint8)
+    depth = np.ones((20, 20), dtype=np.float32)
+    mask = np.zeros((20, 20), dtype=np.uint8)
+    mask[5:15, 5:15] = 255
+    ok, encoded = cv2.imencode(".png", mask)
+    assert ok
+    calls = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "ok": True,
+                    "status": "segmented",
+                    "mask": {"area": int(mask.sum() > 0), "confidence": 0.91},
+                    "mask_png_b64": base64.b64encode(encoded.tobytes()).decode("ascii"),
+                    "mask_source": "sam3",
+                    "mask_metadata": {"index": 0},
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        calls.append((request, timeout))
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        "visual_servoing.foundationpose_model_free.mask_provider.urllib_request.urlopen",
+        fake_urlopen,
+    )
+    provider = RemoteSegmentationMaskProvider(
+        "192.168.0.3:8081",
+        prompt="multimeter",
+        device="cpu",
+        confidence_threshold=0.2,
+        resolution=512,
+        timeout_s=7.0,
+    )
+
+    result = provider.get_mask(image, depth_m=depth, object_name="meter")
+
+    assert result.source == "remote_segmentation"
+    assert result.mask.dtype == bool
+    assert result.mask.shape == image.shape[:2]
+    assert int(result.mask.sum()) == 100
+    assert result.confidence == 0.91
+    assert result.metadata["server"] == "http://192.168.0.3:8081"
+    assert result.metadata["mask_source"] == "sam3"
+    assert result.metadata["remote_segmentation_ms"] >= 0.0
+    request, timeout = calls[0]
+    assert request.full_url == "http://192.168.0.3:8081/foundationpose/v2/segmentation"
+    assert timeout == 7.0
+    assert dict(request.header_items())["Content-type"] == REQUEST_CONTENT_TYPE
+    decoded = decode_foundationpose_segmentation_request(request.data)
+    assert decoded.prompt == "meter"
+    assert decoded.rgb.shape == (20, 20, 3)
+    assert decoded.depth_m.shape == (20, 20)
+    assert decoded.mask_options["device"] == "cpu"
+    assert decoded.mask_options["threshold"] == 0.2
+    assert decoded.mask_options["resolution"] == 512
+
+
+def test_remote_segmentation_mask_provider_requires_depth():
+    provider = RemoteSegmentationMaskProvider("127.0.0.1:8081", prompt="meter")
+
+    try:
+        provider.get_mask(np.zeros((20, 20, 3), dtype=np.uint8))
+    except MaskProviderError as exc:
+        assert "requires depth_m" in str(exc)
+    else:
+        raise AssertionError("expected MaskProviderError")
+
+
+def test_remote_segmentation_mask_provider_surfaces_server_failure(monkeypatch):
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps({"ok": False, "reason": "no usable mask"}).encode("utf-8")
+
+    monkeypatch.setattr(
+        "visual_servoing.foundationpose_model_free.mask_provider.urllib_request.urlopen",
+        lambda request, timeout: FakeResponse(),
+    )
+    provider = RemoteSegmentationMaskProvider("127.0.0.1:8081", prompt="meter")
+
+    try:
+        provider.get_mask(np.zeros((20, 20, 3), dtype=np.uint8), depth_m=np.ones((20, 20), dtype=np.float32))
+    except MaskProviderError as exc:
+        assert "remote segmentation failed: no usable mask" in str(exc)
+    else:
+        raise AssertionError("expected MaskProviderError")
+
+
+def test_remote_segmentation_mask_provider_surfaces_request_failure(monkeypatch):
+    def fake_urlopen(request, timeout):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(
+        "visual_servoing.foundationpose_model_free.mask_provider.urllib_request.urlopen",
+        fake_urlopen,
+    )
+    provider = RemoteSegmentationMaskProvider("127.0.0.1:8081", prompt="meter")
+
+    try:
+        provider.get_mask(np.zeros((20, 20, 3), dtype=np.uint8), depth_m=np.ones((20, 20), dtype=np.float32))
+    except MaskProviderError as exc:
+        assert "remote segmentation request failed" in str(exc)
+        assert "connection refused" in str(exc)
+    else:
+        raise AssertionError("expected MaskProviderError")
+
+
+def test_remote_segmentation_mask_provider_rejects_missing_mask_png(monkeypatch):
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps({"ok": True, "status": "segmented"}).encode("utf-8")
+
+    monkeypatch.setattr(
+        "visual_servoing.foundationpose_model_free.mask_provider.urllib_request.urlopen",
+        lambda request, timeout: FakeResponse(),
+    )
+    provider = RemoteSegmentationMaskProvider("127.0.0.1:8081", prompt="meter")
+
+    try:
+        provider.get_mask(np.zeros((20, 20, 3), dtype=np.uint8), depth_m=np.ones((20, 20), dtype=np.float32))
+    except MaskProviderError as exc:
+        assert "missing mask_png_b64" in str(exc)
+    else:
+        raise AssertionError("expected MaskProviderError")
+
+
+def test_remote_segmentation_mask_provider_rejects_bad_mask_shape(monkeypatch):
+    cv2 = _require_test_cv2()
+    mask = np.ones((10, 10), dtype=np.uint8) * 255
+    ok, encoded = cv2.imencode(".png", mask)
+    assert ok
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "ok": True,
+                    "mask_png_b64": base64.b64encode(encoded.tobytes()).decode("ascii"),
+                }
+            ).encode("utf-8")
+
+    monkeypatch.setattr(
+        "visual_servoing.foundationpose_model_free.mask_provider.urllib_request.urlopen",
+        lambda request, timeout: FakeResponse(),
+    )
+    provider = RemoteSegmentationMaskProvider("127.0.0.1:8081", prompt="meter")
+
+    try:
+        provider.get_mask(np.zeros((20, 20, 3), dtype=np.uint8), depth_m=np.ones((20, 20), dtype=np.float32))
+    except MaskProviderError as exc:
+        assert "does not match image shape" in str(exc)
+    else:
+        raise AssertionError("expected MaskProviderError")
 
 
 def test_sam3_mask_provider_reports_root_cause():
@@ -214,3 +406,9 @@ class DtypeFallbackProvider(Sam3MaskProvider):
     def _get_segmenter(self, prompt: str):
         self.autocast_history.append(self.autocast_dtype)
         return DtypeMismatchSegmenter(prompt=prompt, autocast_dtype=self.autocast_dtype)
+
+
+def _require_test_cv2():
+    import pytest
+
+    return pytest.importorskip("cv2")

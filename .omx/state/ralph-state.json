@@ -1,0 +1,59 @@
+{
+  "active": false,
+  "iteration": 1,
+  "max_iterations": 10,
+  "current_phase": "complete",
+  "started_at": "2026-05-28T23:40:00Z",
+  "completed_at": "2026-05-28T16:10:58Z",
+  "context_snapshot_path": ".omx/context/remote-init-local-tracking-20260528T135451Z.md",
+  "spec_path": ".omx/specs/deep-interview-charuco-corner-origin-exclusion.md",
+  "prd_path": ".omx/plans/prd-foundationpose-charuco-corner-origin-exclusion.md",
+  "test_spec_path": ".omx/plans/test-spec-foundationpose-charuco-corner-origin-exclusion.md",
+  "completion_audit": {
+    "passed": true,
+    "prompt_to_artifact_checklist": [
+      {
+        "requirement": "Implement `$ralph .omx/plans/final-foundationpose-remote-init-local-tracking.md` without reducing scope.",
+        "status": "passed",
+        "evidence": "Ralph state points to final plan and current implementation adds Track Hybrid across provider, tracker, CLI, GUI, overlay, and tests."
+      },
+      {
+        "requirement": "Hybrid mode must use the v2 server only for initial/manual reinit segmentation masks.",
+        "status": "passed",
+        "evidence": "RemoteSegmentationMaskProvider posts RGBD to /foundationpose/v2/segmentation; FoundationPoseLiveTracker calls mask_provider only in init/reinit path and track_one on normal frames."
+      },
+      {
+        "requirement": "Hybrid must not silently fall back to local SAM3 and must force automatic reinit off.",
+        "status": "passed",
+        "evidence": "build_mask_provider selects Precomputed, then RemoteSegmentation, then Sam3 only when no remote server is configured; build_recovery_config sets auto_reinit false for hybrid and status text reports manual-R reinit."
+      },
+      {
+        "requirement": "GUI must expose Track Hybrid and preserve existing Track Local/Track Remote behavior.",
+        "status": "passed",
+        "evidence": "GuiCommandBuilder.track_hybrid_live builds local fp_track_live with remote-init flags; GUI button invokes run_tracking_hybrid and reinit dispatch preserves hybrid mode."
+      },
+      {
+        "requirement": "Timing/diagnostics must expose remote_segmentation_ms, register_ms, track_one_ms, frame_total_ms, and safe CUDA memory fields.",
+        "status": "passed",
+        "evidence": "Tracker metadata records provider/register/track timings; fp_track_live promotes timing to JSON/overlay before draw; cuda_memory_snapshot only inspects already-loaded torch and returns empty safely otherwise."
+      },
+      {
+        "requirement": "Ralph architect verification and deslop pass required before completion.",
+        "status": "passed",
+        "evidence": "Architect re-verification APPROVED after frame_total overlay blocker fix; scoped deslop scan found no masking fallback edits needed after tests locked behavior."
+      }
+    ],
+    "verification_evidence": [
+      "python -m py_compile visual_servoing/scripts/fp_track_live.py visual_servoing/foundationpose_model_free/mask_provider.py visual_servoing/foundationpose_model_free/tracker.py visual_servoing/foundationpose_model_free/gui_app.py visual_servoing/point_pose/overlay.py: passed",
+      "PYTHONPATH=/home/kgs/FoundationPose PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest visual_servoing/tests/foundationpose_model_free/test_mask_provider.py visual_servoing/tests/foundationpose_model_free/test_tracker.py visual_servoing/tests/foundationpose_model_free/test_gui_app.py visual_servoing/tests/foundationpose_model_free/test_track_live_output.py visual_servoing/tests/test_phone_pose_overlay.py visual_servoing/tests/test_visual_servo_server_v2.py -q: 93 passed in 6.28s",
+      "git diff --check: passed with no whitespace errors",
+      "GUI command smoke: track_hybrid_live emits python -m visual_servoing.scripts.fp_track_live with --remote-init-mask-server 192.168.0.3:8081 and --zed-depth-mode NEURAL, without --auto-reinit",
+      "Architect final verification: APPROVED, no blockers; confirmed frame_total_ms is assigned before overlay and regression test covers source order"
+    ]
+  },
+  "plan_path": ".omx/plans/final-foundationpose-remote-init-local-tracking.md",
+  "targeted_tests": "not rerun in final pass; full suite 325 passed covers targeted tests",
+  "agent_tiers_doc": "not_found_under_/home/kgs/.codex",
+  "run_outcome": "finish",
+  "lifecycle_outcome": "finished"
+}
