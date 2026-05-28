@@ -34,6 +34,7 @@ from visual_servoing.point_pose.overlay import (
     draw_status_overlay,
 )
 from visual_servoing.point_pose.realsense_d405 import LiveRgbdCamera, SUPPORTED_LIVE_CAMERA_MODELS
+from visual_servoing.point_pose.zed_camera import DEFAULT_ZED_DEPTH_MODE, ZED_DEPTH_MODES
 
 
 def main() -> int:
@@ -52,6 +53,12 @@ def main() -> int:
     parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--frame-timeout-ms", type=int, default=5000)
+    parser.add_argument(
+        "--zed-depth-mode",
+        choices=ZED_DEPTH_MODES,
+        default=DEFAULT_ZED_DEPTH_MODE,
+        help="ZED SDK depth mode. NEURAL requires TensorRT; use ULTRA if NEURAL cannot open.",
+    )
     parser.add_argument("--axis-length-m", type=float, default=0.05)
     parser.add_argument("--refine-iterations", type=int, default=5)
     parser.add_argument("--track-iterations", type=int, default=2)
@@ -153,6 +160,7 @@ def run_live(args: argparse.Namespace, prompt: str, tracker: FoundationPoseLiveT
         width=args.width,
         height=args.height,
         fps=args.fps,
+        zed_depth_mode=args.zed_depth_mode,
     ) as camera:
         if not args.no_window:
             cv2.namedWindow(window_title, cv2.WINDOW_NORMAL)

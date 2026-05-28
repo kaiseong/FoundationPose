@@ -11,6 +11,9 @@ from visual_servoing.visual_servo_client_v2 import (
     build_tracking_request_body,
     mask_options_from_args,
     parse_args,
+    pose_matrix,
+    render_response_overlay,
+    response_timing_ms,
     send_track_request,
 )
 from visual_servoing.visual_servo_protocol_v2 import decode_foundationpose_track_request
@@ -64,6 +67,16 @@ def test_v2_client_parser_has_no_robot_command_options():
     assert forbidden.isdisjoint(option_names)
 
 
+def test_v2_client_parser_defaults_to_window_and_zed_neural():
+    args = parse_args(["--object", "phone"])
+    explicit = parse_args(["--object", "phone", "--zed-depth-mode", "ULTRA", "--no-window"])
+
+    assert args.no_window is False
+    assert args.zed_depth_mode == "NEURAL"
+    assert explicit.zed_depth_mode == "ULTRA"
+    assert explicit.no_window is True
+
+
 def test_tracking_request_metadata_is_pose_only():
     args = parse_args(
         [
@@ -100,6 +113,22 @@ def test_tracking_request_metadata_is_pose_only():
         assert forbidden not in decoded.metadata
 
 
+def test_tracking_request_reinit_can_be_overridden_for_one_frame():
+    args = parse_args(["--object", "phone"])
+
+    body = build_tracking_request_body(
+        frame=FakeFrame(),
+        args=args,
+        frame_index=1,
+        request_id="req-1",
+        capture_monotonic_ns=1234,
+        reinit=True,
+    )
+    decoded = decode_foundationpose_track_request(body)
+
+    assert decoded.reinit is True
+
+
 def test_send_track_request_uses_v2_endpoint_and_content_type(monkeypatch):
     calls = []
 
@@ -125,3 +154,35 @@ def test_send_track_request_uses_v2_endpoint_and_content_type(monkeypatch):
     assert calls[0][0].endswith("/foundationpose/v2/track")
     assert calls[0][1]["Content-type"] == "application/x-foundationpose-rgbd-npz"
     assert calls[0][2] == 7.0
+
+
+def test_remote_tracking_overlay_draws_camera_pose_axes():
+    rgb = np.zeros((80, 100, 3), dtype=np.uint8)
+    intrinsics = CameraIntrinsics(fx=80.0, fy=80.0, cx=50.0, cy=40.0, width=100, height=80)
+    camera_t_object = np.eye(4, dtype=np.float64)
+    camera_t_object[:3, 3] = [0.0, 0.0, 1.0]
+
+    overlay = render_response_overlay(
+        rgb,
+        intrinsics,
+        {
+            "ok": True,
+            "tracking_state": "TRACKING",
+            "camera_T_object": camera_t_object.tolist(),
+        },
+        prompt="phone",
+        frame_index=3,
+        fps=12.3,
+        timing_ms={"camera_read_ms": 1.0, "pose_estimation_ms": 2.0},
+        axis_length_m=0.05,
+    )
+
+    assert overlay.shape == rgb.shape
+    assert int(overlay.sum()) > 0
+    np.testing.assert_allclose(pose_matrix(camera_t_object.tolist()), camera_t_object)
+
+
+def test_response_timing_extracts_server_tracking_fields():
+    timing = response_timing_ms({"server_timing_ms": {"tracking_ms": 12.5, "session_ms": 1.5}})
+
+    assert timing == {"remote_tracking_ms": 12.5, "remote_session_ms": 1.5}

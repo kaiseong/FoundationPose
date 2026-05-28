@@ -28,6 +28,7 @@ from visual_servoing.point_pose.live_camera_config import (
     is_default_camera_resolution,
 )
 from visual_servoing.point_pose.realsense_d405 import LiveRgbdCamera
+from visual_servoing.point_pose.zed_camera import DEFAULT_ZED_DEPTH_MODE
 from visual_servoing.visual_servo_protocol_v2 import (
     REQUEST_CONTENT_TYPE,
     encode_foundationpose_segmentation_request,
@@ -307,6 +308,7 @@ class GuiCommandBuilder:
         fps: int = 15,
         refine_iterations: int = 5,
         track_iterations: int = 2,
+        zed_depth_mode: str = DEFAULT_ZED_DEPTH_MODE,
         data_root: str | None = None,
     ) -> list[str]:
         command = self.module(
@@ -330,6 +332,7 @@ class GuiCommandBuilder:
             str(track_iterations),
         )
         self._append_live_dimensions(command, camera_model=camera_model, width=width, height=height)
+        self._append_zed_depth_mode(command, camera_model=camera_model, depth_mode=zed_depth_mode)
         if auto_reinit:
             command.append("--auto-reinit")
         self._append_serial(command, serial)
@@ -353,6 +356,7 @@ class GuiCommandBuilder:
         fps: int = 15,
         refine_iterations: int = 5,
         track_iterations: int = 2,
+        zed_depth_mode: str = DEFAULT_ZED_DEPTH_MODE,
         data_root: str | None = None,
     ) -> list[str]:
         command = self.module(
@@ -377,6 +381,7 @@ class GuiCommandBuilder:
             str(track_iterations),
         )
         self._append_live_dimensions(command, camera_model=camera_model, width=width, height=height)
+        self._append_zed_depth_mode(command, camera_model=camera_model, depth_mode=zed_depth_mode)
         if auto_reinit:
             command.append("--auto-reinit")
         command.extend(["--auto-reinit-after-lost-frames", str(auto_reinit_after_lost_frames)])
@@ -399,6 +404,11 @@ class GuiCommandBuilder:
         if camera_model.lower() == "zed" and is_default_camera_resolution(camera_model, width, height):
             return
         command.extend(["--width", str(width), "--height", str(height)])
+
+    @staticmethod
+    def _append_zed_depth_mode(command: list[str], *, camera_model: str, depth_mode: str) -> None:
+        if camera_model.lower() == "zed":
+            command.extend(["--zed-depth-mode", str(depth_mode).upper()])
 
 
 class BackgroundCommandRunner:

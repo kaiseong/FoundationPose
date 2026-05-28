@@ -10,7 +10,9 @@ from urllib import request as urllib_request
 
 import numpy as np
 
+from visual_servoing.point_pose.overlay import draw_axes_overlay, draw_status_overlay
 from visual_servoing.point_pose.realsense_d405 import LiveRgbdCamera, SUPPORTED_LIVE_CAMERA_MODELS
+from visual_servoing.point_pose.zed_camera import DEFAULT_ZED_DEPTH_MODE, ZED_DEPTH_MODES
 from visual_servoing.visual_servo_protocol_v2 import (
     REQUEST_CONTENT_TYPE,
     decode_foundationpose_response,
@@ -33,9 +35,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--frame-timeout-ms", type=int, default=5000)
-    parser.add_argument("--zed-depth-mode", default="NEURAL")
+    parser.add_argument(
+        "--zed-depth-mode",
+        choices=ZED_DEPTH_MODES,
+        default=DEFAULT_ZED_DEPTH_MODE,
+        help="ZED SDK depth mode. NEURAL requires TensorRT; use ULTRA if NEURAL cannot open.",
+    )
     parser.add_argument("--max-frames", type=int, default=0, help="0 means run until interrupted.")
     parser.add_argument("--request-timeout-s", type=float, default=10.0)
+    parser.add_argument("--axis-length-m", type=float, default=0.05)
+    parser.add_argument("--no-window", action="store_true")
+    parser.add_argument("--window-title", default=None)
     parser.add_argument("--refine-iterations", type=int, default=5)
     parser.add_argument("--track-iterations", type=int, default=2)
     parser.add_argument("--reinit", action="store_true")
@@ -90,6 +100,7 @@ def build_tracking_request_body(
     frame_index: int,
     request_id: str,
     capture_monotonic_ns: int,
+    reinit: bool | None = None,
 ) -> bytes:
     return encode_foundationpose_track_request(
         rgb=frame.rgb,
@@ -103,7 +114,7 @@ def build_tracking_request_body(
         foundationpose_root=args.foundationpose_root,
         refine_iterations=args.refine_iterations,
         track_iterations=args.track_iterations,
-        reinit=args.reinit,
+        reinit=args.reinit if reinit is None else bool(reinit),
         mask_options=mask_options_from_args(args),
         recovery_options=recovery_options_from_args(args),
         metadata={"client": "visual_servo_client_v2"},
@@ -147,6 +158,11 @@ def parse_t5_T_camera(raw: str | None) -> np.ndarray:
 
 def run_live(args: argparse.Namespace) -> int:
     server_url = server_base_url(args)
+    cv2 = None if args.no_window else require_cv2()
+    window_title = args.window_title or f"{str(args.camera).upper()} FoundationPose Remote"
+    previous_frame_time = time.monotonic()
+    fps_smooth = None
+    manual_reinit_next = False
     with LiveRgbdCamera(
         model=args.camera,
         serial=args.serial,
@@ -155,24 +171,141 @@ def run_live(args: argparse.Namespace) -> int:
         fps=args.fps,
         zed_depth_mode=args.zed_depth_mode,
     ) as camera:
+        if cv2 is not None:
+            cv2.namedWindow(window_title, cv2.WINDOW_NORMAL)
         frame_index = 0
-        while True:
-            capture_ns = time.monotonic_ns()
-            frame = camera.read(timeout_ms=args.frame_timeout_ms)
-            request_id = f"{capture_ns}-{frame_index}"
-            body = build_tracking_request_body(
-                frame=frame,
-                args=args,
-                frame_index=frame_index,
-                request_id=request_id,
-                capture_monotonic_ns=capture_ns,
-            )
-            response = send_track_request(server_url, body, timeout_s=args.request_timeout_s)
-            print(format_response_line(response) if not args.print_json else json.dumps(response, separators=(",", ":")))
-            frame_index += 1
-            if args.max_frames and frame_index >= args.max_frames:
-                break
+        try:
+            while True:
+                frame_start = time.perf_counter()
+                timing_ms: dict[str, float] = {}
+                capture_ns = time.monotonic_ns()
+                start = time.perf_counter()
+                frame = camera.read(timeout_ms=args.frame_timeout_ms)
+                timing_ms["camera_read_ms"] = elapsed_ms(start)
+                request_id = f"{capture_ns}-{frame_index}"
+                start = time.perf_counter()
+                body = build_tracking_request_body(
+                    frame=frame,
+                    args=args,
+                    frame_index=frame_index,
+                    request_id=request_id,
+                    capture_monotonic_ns=capture_ns,
+                    reinit=bool(args.reinit or manual_reinit_next),
+                )
+                manual_reinit_next = False
+                timing_ms["encode_ms"] = elapsed_ms(start)
+                start = time.perf_counter()
+                response = send_track_request(server_url, body, timeout_s=args.request_timeout_s)
+                timing_ms["pose_estimation_ms"] = elapsed_ms(start)
+                timing_ms.update(response_timing_ms(response))
+
+                now = time.monotonic()
+                current_fps = 1.0 / max(now - previous_frame_time, 1e-9)
+                fps_smooth = current_fps if fps_smooth is None else 0.85 * fps_smooth + 0.15 * current_fps
+                previous_frame_time = now
+                timing_ms["fps"] = fps_smooth
+
+                key = None
+                if cv2 is not None:
+                    start = time.perf_counter()
+                    overlay = render_response_overlay(
+                        frame.rgb,
+                        frame.intrinsics,
+                        response,
+                        prompt=args.prompt or args.profile,
+                        frame_index=frame_index,
+                        fps=fps_smooth,
+                        timing_ms=timing_ms,
+                        axis_length_m=args.axis_length_m,
+                    )
+                    cv2.imshow(window_title, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+                    key = cv2.waitKey(1) & 0xFF
+                    timing_ms["display_ms"] = elapsed_ms(start)
+
+                timing_ms["frame_total_ms"] = elapsed_ms(frame_start)
+                print(
+                    format_response_line(response)
+                    if not args.print_json
+                    else json.dumps(response, separators=(",", ":")),
+                    flush=True,
+                )
+                if key in (ord("q"), 27):
+                    break
+                if key in (ord("r"), ord("R")):
+                    manual_reinit_next = True
+                frame_index += 1
+                if args.max_frames and frame_index >= args.max_frames:
+                    break
+        finally:
+            if cv2 is not None:
+                cv2.destroyWindow(window_title)
     return 0
+
+
+def render_response_overlay(
+    rgb: np.ndarray,
+    intrinsics,
+    response: dict[str, Any],
+    *,
+    prompt: str,
+    frame_index: int,
+    fps: float | None,
+    timing_ms: dict[str, float],
+    axis_length_m: float,
+) -> np.ndarray:
+    overlay = np.asarray(rgb, dtype=np.uint8).copy()
+    status = str(response.get("tracking_state") or response.get("status") or "LOST").upper()
+    message = response_message(response)
+    pose = pose_matrix(response.get("camera_T_object"))
+    if pose is not None:
+        try:
+            overlay = draw_axes_overlay(overlay, pose, intrinsics, axis_length_m=axis_length_m)
+        except Exception as exc:
+            message = combine_messages(message, f"overlay: {exc}")
+    return draw_status_overlay(
+        overlay,
+        status=status,
+        prompt=prompt,
+        frame_index=frame_index,
+        fps=fps,
+        message=message,
+        timing_ms=timing_ms,
+    )
+
+
+def response_timing_ms(response: dict[str, Any]) -> dict[str, float]:
+    timing: dict[str, float] = {}
+    server_timing = response.get("server_timing_ms")
+    if isinstance(server_timing, dict):
+        if "tracking_ms" in server_timing:
+            timing["remote_tracking_ms"] = float(server_timing["tracking_ms"])
+        if "session_ms" in server_timing:
+            timing["remote_session_ms"] = float(server_timing["session_ms"])
+    return timing
+
+
+def response_message(response: dict[str, Any]) -> str | None:
+    messages = []
+    for key in ("message", "error", "reason"):
+        value = response.get(key)
+        if value:
+            messages.append(str(value))
+    return "; ".join(messages) if messages else None
+
+
+def combine_messages(first: str | None, second: str | None) -> str | None:
+    if first and second:
+        return f"{first}; {second}"
+    return first or second
+
+
+def pose_matrix(value: Any) -> np.ndarray | None:
+    if value is None:
+        return None
+    matrix = np.asarray(value, dtype=np.float64)
+    if matrix.shape != (4, 4) or not np.all(np.isfinite(matrix)):
+        return None
+    return matrix
 
 
 def format_response_line(response: dict[str, Any]) -> str:
@@ -194,13 +327,23 @@ def format_response_line(response: dict[str, Any]) -> str:
 
 
 def _pose_xyz(value: Any) -> str | None:
-    if value is None:
-        return None
-    matrix = np.asarray(value, dtype=np.float64)
-    if matrix.shape != (4, 4):
+    matrix = pose_matrix(value)
+    if matrix is None:
         return None
     xyz = matrix[:3, 3]
     return f"({xyz[0]:.3f},{xyz[1]:.3f},{xyz[2]:.3f})"
+
+
+def elapsed_ms(start: float) -> float:
+    return (time.perf_counter() - start) * 1000.0
+
+
+def require_cv2():
+    try:
+        import cv2  # type: ignore
+    except Exception as exc:  # pragma: no cover - depends on environment
+        raise RuntimeError("OpenCV is required for remote tracking preview. Use --no-window to disable it.") from exc
+    return cv2
 
 
 def main(argv: list[str] | None = None) -> int:

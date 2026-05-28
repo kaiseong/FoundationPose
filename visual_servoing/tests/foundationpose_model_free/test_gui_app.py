@@ -275,6 +275,7 @@ def test_gui_command_builder_uses_zed_live_path_without_forced_default_dimension
     assert explicit[explicit.index("--width") + 1] == "1280"
     assert explicit[explicit.index("--height") + 1] == "720"
     assert track[track.index("--camera") + 1] == "zed"
+    assert track[track.index("--zed-depth-mode") + 1] == "NEURAL"
     assert "--width" not in track
     assert "--height" not in track
 
@@ -303,6 +304,7 @@ def test_gui_command_builder_constructs_remote_track_command(tmp_path):
     assert command[command.index("--server-port") + 1] == "8081"
     assert command[command.index("--object") + 1] == "mouse"
     assert command[command.index("--camera") + 1] == "zed"
+    assert command[command.index("--zed-depth-mode") + 1] == "NEURAL"
     assert "--auto-reinit" in command
     assert command[command.index("--refine-iterations") + 1] == "1"
     assert command[command.index("--track-iterations") + 1] == "1"
