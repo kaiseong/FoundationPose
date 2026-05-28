@@ -68,7 +68,7 @@ RECORDINGS_ZIP_CONTENT_TYPE = "application/x-foundationpose-recordings+zip"
 PROCESSING_REQUEST_JSON = "foundationpose_processing_request.json"
 TAIL_LIMIT = 4000
 MESH_HASH_LIMIT_BYTES = 50 * 1024 * 1024
-SERVER_DEFAULT_MAX_CONTENT_LENGTH = 512 * 1024 * 1024
+SERVER_DEFAULT_MAX_CONTENT_LENGTH = 2 * 1024 * 1024 * 1024
 
 
 class UnknownProfileError(ValueError):
