@@ -33,6 +33,7 @@ from visual_servoing.foundationpose_model_free.reference_processing import (
     evaluate_recorded_references,
     index_recorded_frame_records,
     latest_processing_report,
+    normalize_excluded_candidate_id,
     normalize_excluded_candidate_ids,
     profile_excluded_candidate_ids,
     process_recorded_references,
@@ -600,6 +601,19 @@ def test_normalize_excluded_candidate_ids_dedupes_common_separators():
         "a:000001",
         "b:000002",
         "c:000003",
+    )
+
+
+def test_normalize_excluded_candidate_ids_accepts_debug_artifact_filenames():
+    assert normalize_excluded_candidate_id("001_session-20260528T103112Z-315663245_000056.png") == (
+        "session-20260528T103112Z-315663245:000056"
+    )
+    assert normalize_excluded_candidate_ids(
+        "charuco_axes/001_session-20260528T103112Z-315663245_000056.png,"
+        "008_session-20260528T103112Z-315663245_000223"
+    ) == (
+        "session-20260528T103112Z-315663245:000056",
+        "session-20260528T103112Z-315663245:000223",
     )
 
 

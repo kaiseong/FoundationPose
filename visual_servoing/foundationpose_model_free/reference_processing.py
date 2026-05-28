@@ -49,6 +49,7 @@ PROCESSING_CACHE_VERSION = 1
 CHARUCO_AXES_PREVIEW_DIRNAME = "charuco_axes"
 REFERENCE_PROCESSING_SETTINGS_KEY = "reference_processing_settings"
 EXCLUDED_CANDIDATE_IDS_KEY = "excluded_candidate_ids"
+DEBUG_ARTIFACT_STEM_RE = re.compile(r"^\d{3}_(?P<session>.+)_(?P<frame>\d{6})$")
 
 
 @dataclass(frozen=True)
@@ -184,12 +185,32 @@ def normalize_excluded_candidate_ids(value: Any | None) -> tuple[str, ...]:
             continue
         parts = re.split(r"[,;\s]+", raw) if isinstance(raw, str) else [str(raw)]
         for part in parts:
-            candidate_id = str(part).strip()
+            candidate_id = normalize_excluded_candidate_id(str(part).strip())
             if not candidate_id or candidate_id in seen:
                 continue
             seen.add(candidate_id)
             result.append(candidate_id)
     return tuple(result)
+
+
+def normalize_excluded_candidate_id(value: str) -> str:
+    """Return the canonical candidate id accepted by exclusion filters.
+
+    Debug downloads name files as ``001_<session_id>_<frame>.png`` for easy
+    visual sorting, while Processing records store ids as ``<session_id>:<frame>``.
+    Accept both forms so users can paste the Debug filename directly.
+    """
+
+    candidate_id = value.strip()
+    if not candidate_id:
+        return ""
+    name = candidate_id.replace("\\", "/").rsplit("/", 1)[-1]
+    if "." in name:
+        name = name.rsplit(".", 1)[0]
+    match = DEBUG_ARTIFACT_STEM_RE.fullmatch(name)
+    if match:
+        return f"{match.group('session')}:{match.group('frame')}"
+    return candidate_id
 
 
 def profile_excluded_candidate_ids(profile: ObjectProfile) -> tuple[str, ...]:

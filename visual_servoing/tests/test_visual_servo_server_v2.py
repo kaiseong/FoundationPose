@@ -334,6 +334,8 @@ def test_debug_artifacts_endpoint_returns_selected_processing_candidates_only(tm
     assert manifest["charuco_origin_convention"] == "charuco_corner_id_0"
     assert manifest["charuco_origin_offset_board_m"] == [0.03, 0.03, 0.0]
     assert candidate["candidate_id"] == "session-1:000000"
+    assert candidate["exclude_id"] == "session-1:000000"
+    assert candidate["artifact_stem"] == "000_session-1_000000"
     assert candidate["charuco_axes"] in names
     assert candidate["mask"] in names
     assert candidate["depth_colormap"] in names

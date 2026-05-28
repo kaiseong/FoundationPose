@@ -59,6 +59,8 @@ def build_processing_debug_artifacts_zip(profile: ObjectProfile) -> tuple[bytes,
             stem = _artifact_stem(selected_index, str(record.get("session_id") or frame_record.session_id), int(record.get("frame_index", frame_record.index)))
             candidate_manifest: dict[str, Any] = {
                 "candidate_id": candidate_id,
+                "exclude_id": candidate_id,
+                "artifact_stem": stem,
                 "selected_index": selected_index,
                 "session_id": str(record.get("session_id") or frame_record.session_id),
                 "frame_index": int(record.get("frame_index", frame_record.index)),
