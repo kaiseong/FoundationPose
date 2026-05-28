@@ -333,9 +333,7 @@ class FoundationPoseV2Service:
         tracker_sessions: TrackerSessionManager | None = None,
     ) -> None:
         self.registry = registry or ObjectProfileRegistry()
-        self.builder_factory = builder_factory or (
-            lambda foundationpose_root: FoundationPoseAssetBuilder(foundationpose_root=foundationpose_root)
-        )
+        self.builder_factory = builder_factory or _make_asset_builder
         self.processing_runner = processing_runner
         self.segmentation_runner = segmentation_runner
         self.job_manager = job_manager or BuildJobManager()
@@ -607,6 +605,14 @@ def _resolve_server_foundationpose_root(requested: str | None) -> str | None:
         if _looks_like_foundationpose_root(candidate):
             return str(candidate.resolve())
     return requested_value or None
+
+
+def _make_asset_builder(foundationpose_root: str | Path) -> FoundationPoseAssetBuilder:
+    build_python = os.environ.get("FOUNDATIONPOSE_BUILD_PYTHON")
+    return FoundationPoseAssetBuilder(
+        foundationpose_root=foundationpose_root,
+        python_executable=build_python or None,
+    )
 
 
 def _server_foundationpose_root_candidates(requested: str) -> list[Path]:

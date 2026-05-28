@@ -27,6 +27,7 @@ from visual_servoing.visual_servo_protocol_v2 import (
 )
 from visual_servoing.visual_servo_server_v2 import FoundationPoseV2Service, make_handler, mesh_identity
 from visual_servoing.visual_servo_server_v2 import RECORDINGS_ZIP_CONTENT_TYPE
+from visual_servoing.visual_servo_server_v2 import _make_asset_builder
 
 
 class FakeBuilder:
@@ -313,6 +314,16 @@ def test_tracking_uses_server_foundationpose_root_when_client_path_is_invalid(tm
     assert status == 200
     assert payload["ok"] is True
     assert seen_roots == [str(server_root.resolve())]
+
+
+def test_default_asset_builder_uses_build_python_override(tmp_path, monkeypatch):
+    build_python = tmp_path / "fpbuild-python"
+    monkeypatch.setenv("FOUNDATIONPOSE_BUILD_PYTHON", str(build_python))
+
+    builder = _make_asset_builder("/fp")
+
+    assert builder.foundationpose_root.as_posix() == "/fp"
+    assert builder.python_executable == str(build_python)
 
 
 def test_build_missing_fields_and_unknown_profile(tmp_path):
