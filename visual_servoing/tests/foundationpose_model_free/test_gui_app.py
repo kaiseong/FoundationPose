@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import base64
 import io
 import inspect
 import json
 from pathlib import Path
 import sys
 import zipfile
+
+import numpy as np
 
 from visual_servoing.foundationpose_model_free.gui_app import (
     BackgroundCommandRunner,
@@ -15,7 +18,13 @@ from visual_servoing.foundationpose_model_free.gui_app import (
     create_recordings_archive,
     remote_build_assets,
     remote_process_recordings,
+    remote_segmentation_sanity,
     resolve_gui_config,
+    write_segmentation_preview,
+)
+from visual_servoing.visual_servo_protocol_v2 import (
+    REQUEST_CONTENT_TYPE,
+    decode_foundationpose_segmentation_request,
 )
 
 
@@ -305,6 +314,7 @@ def test_gui_source_contains_remote_connect_state_flow():
     build_source = inspect.getsource(FoundationPoseWorkflowGui._build)
     connect_source = inspect.getsource(FoundationPoseWorkflowGui.connect_remote_server)
     poll_source = inspect.getsource(FoundationPoseWorkflowGui._poll_queues)
+    segmentation_source = inspect.getsource(FoundationPoseWorkflowGui.run_segmentation_check)
     command_source = inspect.getsource(FoundationPoseWorkflowGui.run_tracking)
     build_command_source = inspect.getsource(FoundationPoseWorkflowGui.run_build_assets)
     force_build_source = inspect.getsource(FoundationPoseWorkflowGui.run_force_build_assets)
@@ -317,10 +327,12 @@ def test_gui_source_contains_remote_connect_state_flow():
     assert 'text="Connect"' in build_source
     assert "threading.Thread" in connect_source
     assert "remote_events" in poll_source
+    assert "_start_remote_segmentation_check" in segmentation_source
     assert "track_remote_live" in command_source
     assert "_start_remote_build" in build_command_source
     assert "_start_remote_build" in force_build_source
     assert build_command_source.index("_start_remote_build") < build_command_source.index("latest_processing_report")
+    assert segmentation_source.index("_start_remote_segmentation_check") < segmentation_source.index("segmentation_sanity")
     assert "_start_remote_processing" in processing_source
     assert "_start_remote_processing" in reselect_source
     assert processing_source.index("_start_remote_processing") < processing_source.index("_charuco_command")
@@ -453,6 +465,77 @@ def test_remote_process_recordings_posts_zip_and_polls_job(monkeypatch):
     assert headers["X-foundationpose-profile"] == "meter"
     assert calls[1][0] == "http://192.168.0.3:8081/foundationpose/v2/recordings/process/job-1"
     assert calls[2][0] == "http://192.168.0.3:8081/foundationpose/v2/recordings/process/job-1"
+
+
+def test_remote_segmentation_sanity_posts_npz_to_server(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "ok": True,
+                    "status": "segmented",
+                    "mask": {"area": 4, "area_fraction": 0.2},
+                    "mask_png_b64": "mask",
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        calls.append((request, timeout))
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        "visual_servoing.foundationpose_model_free.gui_app.urllib_request.urlopen",
+        fake_urlopen,
+    )
+
+    result = remote_segmentation_sanity(
+        host="192.168.0.3",
+        port=8081,
+        prompt="multimeter",
+        rgb=np.zeros((4, 5, 3), dtype=np.uint8),
+        depth_m=np.ones((4, 5), dtype=np.float32),
+        sam_device="cpu",
+        sam_resolution=128,
+    )
+
+    assert result["status"] == "segmented"
+    request = calls[0][0]
+    assert request.full_url == "http://192.168.0.3:8081/foundationpose/v2/segmentation"
+    assert dict(request.header_items())["Content-type"] == REQUEST_CONTENT_TYPE
+    decoded = decode_foundationpose_segmentation_request(request.data)
+    assert decoded.prompt == "multimeter"
+    assert decoded.rgb.shape == (4, 5, 3)
+    assert decoded.depth_m.shape == (4, 5)
+    assert decoded.mask_options["device"] == "cpu"
+    assert decoded.mask_options["resolution"] == 128
+
+
+def test_write_segmentation_preview_writes_rgb_and_overlay(tmp_path):
+    import pytest
+
+    cv2 = pytest.importorskip("cv2")
+
+    mask = np.zeros((4, 5), dtype=np.uint8)
+    mask[1:3, 2:4] = 255
+    ok, encoded = cv2.imencode(".png", mask)
+    assert ok
+    rgb_path, overlay_path = write_segmentation_preview(
+        tmp_path,
+        rgb=np.zeros((4, 5, 3), dtype=np.uint8),
+        mask_png_b64=base64.b64encode(encoded.tobytes()).decode("ascii"),
+    )
+
+    assert rgb_path.exists()
+    assert overlay_path.exists()
+    assert "remote_segmentation" in overlay_path.as_posix()
 
 
 def test_gui_resolves_and_passes_default_data_root(tmp_path, monkeypatch):

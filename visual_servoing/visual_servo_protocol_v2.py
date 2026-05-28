@@ -39,6 +39,17 @@ class FoundationPoseTrackRequest:
     metadata: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class FoundationPoseSegmentationRequest:
+    rgb: np.ndarray
+    depth_m: np.ndarray
+    request_id: str
+    capture_monotonic_ns: int
+    prompt: str
+    mask_options: dict[str, Any]
+    metadata: dict[str, Any]
+
+
 def encode_foundationpose_track_request(
     *,
     rgb: np.ndarray,
@@ -95,6 +106,44 @@ def encode_foundationpose_track_request(
     return buffer.getvalue()
 
 
+def encode_foundationpose_segmentation_request(
+    *,
+    rgb: np.ndarray,
+    depth_m: np.ndarray,
+    request_id: str,
+    capture_monotonic_ns: int,
+    prompt: str,
+    mask_options: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> bytes:
+    rgb = _validate_rgb(rgb)
+    depth_m = _validate_depth(depth_m, rgb_shape=rgb.shape[:2])
+    request_id = str(request_id)
+    prompt = str(prompt).strip()
+    if not request_id:
+        raise ValueError("request_id is required")
+    if not prompt:
+        raise ValueError("prompt is required")
+    payload_metadata = dict(metadata or {})
+    payload_metadata.update(
+        {
+            "protocol_version": PROTOCOL_VERSION,
+            "request_id": request_id,
+            "capture_monotonic_ns": int(capture_monotonic_ns),
+            "prompt": prompt,
+            "mask_options": dict(mask_options or {}),
+        }
+    )
+    buffer = BytesIO()
+    np.savez(
+        buffer,
+        rgb=rgb,
+        depth_m=depth_m,
+        metadata_json=np.array(json.dumps(payload_metadata, separators=(",", ":"))),
+    )
+    return buffer.getvalue()
+
+
 def decode_foundationpose_track_request(
     data: bytes,
     *,
@@ -140,6 +189,46 @@ def decode_foundationpose_track_request(
             reinit=bool(metadata.get("reinit", False)),
             mask_options=_mapping(metadata.get("mask_options"), "mask_options"),
             recovery_options=_mapping(metadata.get("recovery_options"), "recovery_options"),
+            metadata=metadata,
+        )
+
+
+def decode_foundationpose_segmentation_request(
+    data: bytes,
+    *,
+    max_content_length: int = DEFAULT_MAX_CONTENT_LENGTH,
+) -> FoundationPoseSegmentationRequest:
+    if len(data) > int(max_content_length):
+        raise ValueError(f"request body exceeds {max_content_length} bytes")
+    try:
+        archive = np.load(BytesIO(data), allow_pickle=False)
+    except Exception as exc:
+        raise ValueError("invalid FoundationPose segmentation npz payload") from exc
+    with archive:
+        required = {"rgb", "depth_m", "metadata_json"}
+        missing = required.difference(archive.files)
+        if missing:
+            raise ValueError(f"FoundationPose segmentation payload missing fields: {sorted(missing)}")
+        metadata = _decode_metadata(archive["metadata_json"])
+        if int(metadata.get("protocol_version", -1)) != PROTOCOL_VERSION:
+            raise ValueError("unsupported FoundationPose protocol version")
+        request_id = str(metadata.get("request_id", ""))
+        if not request_id:
+            raise ValueError("request_id is required")
+        if "capture_monotonic_ns" not in metadata:
+            raise ValueError("capture_monotonic_ns is required")
+        prompt = str(metadata.get("prompt", "")).strip()
+        if not prompt:
+            raise ValueError("prompt is required")
+        rgb = _validate_rgb(archive["rgb"])
+        depth_m = _validate_depth(archive["depth_m"], rgb_shape=rgb.shape[:2])
+        return FoundationPoseSegmentationRequest(
+            rgb=rgb,
+            depth_m=depth_m,
+            request_id=request_id,
+            capture_monotonic_ns=int(metadata["capture_monotonic_ns"]),
+            prompt=prompt,
+            mask_options=_mapping(metadata.get("mask_options"), "mask_options"),
             metadata=metadata,
         )
 

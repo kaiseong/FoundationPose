@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 import argparse
 import io
@@ -25,6 +26,11 @@ from visual_servoing.point_pose.live_camera_config import (
     SUPPORTED_LIVE_CAMERA_MODELS,
     default_camera_resolution,
     is_default_camera_resolution,
+)
+from visual_servoing.point_pose.realsense_d405 import LiveRgbdCamera
+from visual_servoing.visual_servo_protocol_v2 import (
+    REQUEST_CONTENT_TYPE,
+    encode_foundationpose_segmentation_request,
 )
 
 from .charuco_reference import (
@@ -64,6 +70,9 @@ class RecordingEvent:
 class RemoteHealthEvent:
     state: str
     text: str
+    preview_rgb_path: str | None = None
+    preview_overlay_path: str | None = None
+    preview_status: str | None = None
 
 
 DEFAULT_CAMERA_RESOLUTIONS = {
@@ -76,6 +85,7 @@ REMOTE_BUILD_POLL_INTERVAL_S = 2.0
 REMOTE_BUILD_TIMEOUT_S = 60.0 * 60.0
 REMOTE_PROCESS_POLL_INTERVAL_S = 2.0
 REMOTE_PROCESS_TIMEOUT_S = 60.0 * 60.0
+REMOTE_SEGMENTATION_WARMUP_FRAMES = 10
 RECORDINGS_ZIP_CONTENT_TYPE = "application/x-foundationpose-recordings+zip"
 PROCESSING_REQUEST_JSON = "foundationpose_processing_request.json"
 
@@ -724,6 +734,9 @@ class FoundationPoseWorkflowGui:
         )
 
     def run_segmentation_check(self) -> None:
+        if self.remote_state.get() == "Remote":
+            self._start_remote_segmentation_check()
+            return
         self._start_command(
             self.command_builder.segmentation_sanity(
                 prompt=self.prompt.get(),
@@ -741,6 +754,87 @@ class FoundationPoseWorkflowGui:
         self.status.set("Checking FoundationPose v2 server")
         thread = threading.Thread(target=self._remote_health_worker, args=(host, port), daemon=True)
         thread.start()
+
+    def _start_remote_segmentation_check(self) -> None:
+        host = self.server_host.get().strip()
+        port = int(self.server_port.get())
+        self.status.set("Capturing one frame for remote segmentation")
+        thread = threading.Thread(
+            target=self._remote_segmentation_worker,
+            args=(
+                host,
+                port,
+                self.prompt.get(),
+                self.camera_model.get(),
+                self.camera_serial.get().strip() or None,
+                int(self.camera_width.get()),
+                int(self.camera_height.get()),
+                int(self.camera_fps.get()),
+                self.sam_device.get(),
+                int(self.sam_resolution.get()),
+                self._current_profile().root,
+            ),
+            daemon=True,
+        )
+        thread.start()
+
+    def _remote_segmentation_worker(
+        self,
+        host: str,
+        port: int,
+        prompt: str,
+        camera_model: str,
+        serial: str | None,
+        width: int,
+        height: int,
+        fps: int,
+        sam_device: str,
+        sam_resolution: int,
+        profile_root: Path,
+    ) -> None:
+        try:
+            with LiveRgbdCamera(
+                model=camera_model,
+                serial=serial,
+                width=width,
+                height=height,
+                fps=fps,
+            ) as camera:
+                frame = None
+                for _ in range(REMOTE_SEGMENTATION_WARMUP_FRAMES):
+                    frame = camera.read()
+                if frame is None:
+                    frame = camera.read()
+            payload = remote_segmentation_sanity(
+                host=host,
+                port=port,
+                prompt=prompt,
+                rgb=frame.rgb,
+                depth_m=frame.depth_m,
+                sam_device=sam_device,
+                sam_resolution=sam_resolution,
+                timeout_s=20.0,
+            )
+            rgb_path, overlay_path = write_segmentation_preview(
+                profile_root,
+                rgb=frame.rgb,
+                mask_png_b64=str(payload.get("mask_png_b64") or ""),
+            )
+        except Exception as exc:
+            self.remote_events.put(RemoteHealthEvent("Disconnected", f"Remote segmentation failed: {exc}"))
+            return
+        mask = payload.get("mask") if isinstance(payload.get("mask"), dict) else {}
+        area = mask.get("area", 0)
+        fraction = float(mask.get("area_fraction", 0.0))
+        self.remote_events.put(
+            RemoteHealthEvent(
+                "Remote",
+                f"Remote segmentation ok: area={area} ({fraction:.3%})",
+                preview_rgb_path=str(rgb_path),
+                preview_overlay_path=str(overlay_path),
+                preview_status=f"Remote SAM mask: area={area} ({fraction:.3%})",
+            )
+        )
 
     def _remote_health_worker(self, host: str, port: int) -> None:
         try:
@@ -1193,6 +1287,12 @@ class FoundationPoseWorkflowGui:
         self.remote_state.set(event.state)
         self.status.set(event.text)
         self._append_log(event.text)
+        if event.preview_rgb_path and event.preview_overlay_path:
+            self._show_remote_segmentation_preview(
+                Path(event.preview_rgb_path),
+                Path(event.preview_overlay_path),
+                status=event.preview_status or event.text,
+            )
 
     def _handle_recording_event(self, event: RecordingEvent | Exception) -> None:
         if isinstance(event, Exception):
@@ -1297,6 +1397,21 @@ class FoundationPoseWorkflowGui:
         self.capture_rgb_preview.configure(image=axis_image, text="")
         self.capture_mask_preview.configure(image="", text="No mask overlay")
         self.capture_preview_status.set(f"Board axes: {path.name}")
+
+    def _show_remote_segmentation_preview(self, rgb_path: Path, overlay_path: Path, *, status: str) -> None:
+        if not rgb_path.exists() or not overlay_path.exists():
+            self.capture_preview_status.set("Remote segmentation preview was not saved")
+            return
+        try:
+            rgb_image = tk.PhotoImage(file=str(rgb_path))
+            overlay_image = tk.PhotoImage(file=str(overlay_path))
+        except Exception as exc:
+            self.capture_preview_status.set(f"Remote segmentation preview failed: {exc}")
+            return
+        self._capture_preview_images = (rgb_image, overlay_image)
+        self.capture_rgb_preview.configure(image=rgb_image, text="")
+        self.capture_mask_preview.configure(image=overlay_image, text="")
+        self.capture_preview_status.set(status)
 
     def _current_profile(self):
         name = self.profile_name.get().strip() or self._selected_name()
@@ -1493,6 +1608,70 @@ def remote_process_recordings(
         if time.monotonic() >= deadline:
             raise RuntimeError(f"remote processing timed out: job_id={job_id}")
         time.sleep(float(poll_interval_s))
+
+
+def remote_segmentation_sanity(
+    *,
+    host: str,
+    port: int,
+    prompt: str,
+    rgb,
+    depth_m,
+    sam_device: str,
+    sam_resolution: int,
+    timeout_s: float = 20.0,
+) -> dict:
+    base_url = f"http://{host}:{int(port)}/foundationpose/v2"
+    request_id = f"gui-segmentation-{time.monotonic_ns()}"
+    body = encode_foundationpose_segmentation_request(
+        rgb=rgb,
+        depth_m=depth_m,
+        request_id=request_id,
+        capture_monotonic_ns=time.monotonic_ns(),
+        prompt=prompt,
+        mask_options={
+            "device": sam_device,
+            "threshold": 0.3,
+            "resolution": int(sam_resolution),
+        },
+    )
+    return _post_bytes(
+        f"{base_url}/segmentation",
+        body,
+        timeout_s=timeout_s,
+        headers={"Content-Type": REQUEST_CONTENT_TYPE},
+    )
+
+
+def write_segmentation_preview(profile_root: str | Path, *, rgb, mask_png_b64: str) -> tuple[Path, Path]:
+    try:
+        import cv2  # type: ignore
+        import numpy as np
+    except Exception as exc:
+        raise RuntimeError("OpenCV and NumPy are required for remote segmentation preview.") from exc
+    if not mask_png_b64:
+        raise RuntimeError("remote segmentation response did not include a mask preview")
+    mask_bytes = base64.b64decode(mask_png_b64.encode("ascii"))
+    mask = cv2.imdecode(np.frombuffer(mask_bytes, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        raise RuntimeError("failed to decode remote segmentation mask")
+    rgb_array = np.asarray(rgb, dtype=np.uint8)
+    if mask.shape != rgb_array.shape[:2]:
+        raise RuntimeError(f"mask shape {mask.shape} does not match RGB shape {rgb_array.shape[:2]}")
+    mask_bool = mask > 0
+    overlay_rgb = rgb_array.copy()
+    color = np.array([255, 0, 0], dtype=np.uint8)
+    overlay_rgb[mask_bool] = (0.55 * overlay_rgb[mask_bool] + 0.45 * color).astype(np.uint8)
+    out_dir = Path(profile_root).expanduser() / "logs" / "remote_segmentation"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"segmentation_{time.monotonic_ns()}"
+    rgb_path = out_dir / f"{stem}_rgb.png"
+    overlay_path = out_dir / f"{stem}_overlay.png"
+    rgb_bgr = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2BGR)
+    overlay_bgr = cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(str(rgb_path), _resize_preview(rgb_bgr, max_size=(440, 330)))
+    cv2.imwrite(str(overlay_path), _resize_preview(overlay_bgr, max_size=(440, 330)))
+    return rgb_path, overlay_path
 
 
 def _post_json(url: str, payload: dict, *, timeout_s: float) -> dict:

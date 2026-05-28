@@ -19,8 +19,10 @@ from visual_servoing.foundationpose_model_free.registry import ObjectProfileRegi
 from visual_servoing.point_pose.rgbd_geometry import CameraIntrinsics
 from visual_servoing.visual_servo_protocol_v2 import (
     REQUEST_CONTENT_TYPE,
+    decode_foundationpose_segmentation_request,
     decode_foundationpose_track_request,
     decode_foundationpose_response,
+    encode_foundationpose_segmentation_request,
     encode_foundationpose_track_request,
 )
 from visual_servoing.visual_servo_server_v2 import FoundationPoseV2Service, make_handler, mesh_identity
@@ -93,6 +95,19 @@ def fake_processing_runner(profile, options):
     }
 
 
+def fake_segmentation_runner(request):
+    assert request.prompt == "multimeter"
+    assert request.rgb.shape == (4, 5, 3)
+    return {
+        "ok": True,
+        "status": "segmented",
+        "request_id": request.request_id,
+        "prompt": request.prompt,
+        "mask": {"area": 4, "area_fraction": 0.2, "shape": [4, 5], "box_xyxy": [2, 1, 4, 3]},
+        "mask_png_b64": "fake-mask",
+    }
+
+
 def _serve(service):
     server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(service))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -139,6 +154,17 @@ def _track_body(*, profile="phone", t5_T_camera=None, **metadata):
         mask_options=metadata.pop("mask_options", {}),
         recovery_options=metadata.pop("recovery_options", {}),
         metadata=metadata,
+    )
+
+
+def _segmentation_body():
+    return encode_foundationpose_segmentation_request(
+        rgb=np.zeros((4, 5, 3), dtype=np.uint8),
+        depth_m=np.ones((4, 5), dtype=np.float32),
+        request_id="seg-1",
+        capture_monotonic_ns=456,
+        prompt="multimeter",
+        mask_options={"device": "cpu", "threshold": 0.3, "resolution": 128},
     )
 
 
@@ -284,6 +310,59 @@ def test_process_recordings_upload_creates_profile_and_polls_job(tmp_path):
     assert status_payload["state"] == "succeeded"
     assert status_payload["result"]["readiness"] == "ready"
     assert status_payload["result"]["accepted"] == 3
+
+
+def test_segmentation_protocol_round_trip():
+    request = decode_foundationpose_segmentation_request(_segmentation_body())
+
+    assert request.request_id == "seg-1"
+    assert request.prompt == "multimeter"
+    assert request.rgb.shape == (4, 5, 3)
+    assert request.depth_m.shape == (4, 5)
+    assert request.mask_options["device"] == "cpu"
+    assert request.mask_options["resolution"] == 128
+
+
+def test_segmentation_endpoint_runs_server_side_mask(tmp_path):
+    service = FoundationPoseV2Service(
+        registry=ObjectProfileRegistry(tmp_path),
+        builder_factory=FakeBuilder,
+        segmentation_runner=fake_segmentation_runner,
+    )
+    server, thread, base_url = _serve(service)
+    try:
+        status, payload = _post(
+            f"{base_url}/foundationpose/v2/segmentation",
+            _segmentation_body(),
+            REQUEST_CONTENT_TYPE,
+        )
+    finally:
+        _stop(server, thread)
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["status"] == "segmented"
+    assert payload["request_id"] == "seg-1"
+    assert payload["prompt"] == "multimeter"
+    assert payload["mask"]["area"] == 4
+    assert payload["mask_png_b64"] == "fake-mask"
+
+
+def test_segmentation_rejects_bad_content_type(tmp_path):
+    service = FoundationPoseV2Service(
+        registry=ObjectProfileRegistry(tmp_path),
+        builder_factory=FakeBuilder,
+        segmentation_runner=fake_segmentation_runner,
+    )
+    server, thread, base_url = _serve(service)
+    try:
+        try:
+            _post(f"{base_url}/foundationpose/v2/segmentation", b"bad", "application/octet-stream")
+            raise AssertionError("expected HTTP error")
+        except urllib_error.HTTPError as exc:
+            assert exc.code == 415
+    finally:
+        _stop(server, thread)
 
 
 def test_track_rejects_bad_content_type(tmp_path):

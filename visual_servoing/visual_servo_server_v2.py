@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from dataclasses import dataclass, field
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -49,10 +50,12 @@ from visual_servoing.foundationpose_model_free.tracker import (
 )
 from visual_servoing.visual_servo_protocol_v2 import (
     DEFAULT_MAX_CONTENT_LENGTH,
+    FoundationPoseSegmentationRequest,
     PROTOCOL_VERSION,
     REQUEST_CONTENT_TYPE,
     RESPONSE_CONTENT_TYPE,
     FoundationPoseTrackRequest,
+    decode_foundationpose_segmentation_request,
     decode_foundationpose_track_request,
     encode_foundationpose_response,
 )
@@ -63,6 +66,7 @@ BUILD_PATH = "/foundationpose/v2/assets/build"
 BUILD_STATUS_PREFIX = "/foundationpose/v2/assets/build/"
 PROCESS_RECORDINGS_PATH = "/foundationpose/v2/recordings/process"
 PROCESS_RECORDINGS_STATUS_PREFIX = "/foundationpose/v2/recordings/process/"
+SEGMENTATION_PATH = "/foundationpose/v2/segmentation"
 TRACK_PATH = "/foundationpose/v2/track"
 RECORDINGS_ZIP_CONTENT_TYPE = "application/x-foundationpose-recordings+zip"
 PROCESSING_REQUEST_JSON = "foundationpose_processing_request.json"
@@ -320,6 +324,7 @@ class FoundationPoseV2Service:
         builder_factory: Callable[[str | Path], FoundationPoseAssetBuilder] | None = None,
         tracker_factory: Callable[[ObjectProfile, Path, FoundationPoseTrackRequest], Any] | None = None,
         processing_runner: Callable[[ObjectProfile, dict[str, Any]], dict[str, Any]] | None = None,
+        segmentation_runner: Callable[[FoundationPoseSegmentationRequest], dict[str, Any]] | None = None,
         job_manager: BuildJobManager | None = None,
         processing_job_manager: ProcessingJobManager | None = None,
         tracker_sessions: TrackerSessionManager | None = None,
@@ -329,6 +334,7 @@ class FoundationPoseV2Service:
             lambda foundationpose_root: FoundationPoseAssetBuilder(foundationpose_root=foundationpose_root)
         )
         self.processing_runner = processing_runner
+        self.segmentation_runner = segmentation_runner
         self.job_manager = job_manager or BuildJobManager()
         self.processing_job_manager = processing_job_manager or ProcessingJobManager()
         self.tracker_sessions = tracker_sessions or TrackerSessionManager(tracker_factory=tracker_factory)
@@ -413,6 +419,65 @@ class FoundationPoseV2Service:
         if job is None:
             return 404, {"ok": False, "status": "error", "reason": f"unknown processing job: {job_id}"}
         return 200, job.payload()
+
+    def segment(self, request: FoundationPoseSegmentationRequest) -> tuple[int, dict[str, Any]]:
+        if self.segmentation_runner is not None:
+            try:
+                return 200, self.segmentation_runner(request)
+            except Exception as exc:
+                return 500, {
+                    "ok": False,
+                    "status": "error",
+                    "request_id": request.request_id,
+                    "prompt": request.prompt,
+                    "reason": str(exc),
+                    "server_time_monotonic_ns": time.monotonic_ns(),
+                }
+        mask_options = dict(request.mask_options)
+        provider = Sam3MaskProvider(
+            prompt=request.prompt,
+            device=str(mask_options.get("device", "auto")),
+            confidence_threshold=float(mask_options.get("threshold", 0.3)),
+            resolution=int(mask_options.get("resolution", 1008)),
+        )
+        try:
+            result = provider.get_mask(request.rgb, depth_m=request.depth_m, object_name=request.prompt)
+        except Exception as exc:
+            return 500, {
+                "ok": False,
+                "status": "error",
+                "request_id": request.request_id,
+                "prompt": request.prompt,
+                "reason": str(exc),
+                "server_time_monotonic_ns": time.monotonic_ns(),
+            }
+        finally:
+            release = getattr(provider, "release", None)
+            if callable(release):
+                release()
+        mask = np.asarray(result.mask, dtype=bool)
+        try:
+            mask_png_b64 = _mask_png_b64(mask)
+        except Exception as exc:
+            return 500, {
+                "ok": False,
+                "status": "error",
+                "request_id": request.request_id,
+                "prompt": request.prompt,
+                "reason": str(exc),
+                "server_time_monotonic_ns": time.monotonic_ns(),
+            }
+        return 200, {
+            "ok": True,
+            "status": "segmented",
+            "request_id": request.request_id,
+            "prompt": request.prompt,
+            "mask": _mask_summary(mask),
+            "mask_png_b64": mask_png_b64,
+            "mask_source": result.source,
+            "mask_metadata": result.metadata,
+            "server_time_monotonic_ns": time.monotonic_ns(),
+        }
 
     def track(self, request: FoundationPoseTrackRequest) -> tuple[int, dict[str, Any]]:
         server_received_ns = time.monotonic_ns()
@@ -567,6 +632,9 @@ def make_handler(
             if self.path == PROCESS_RECORDINGS_PATH:
                 self._handle_process_recordings()
                 return
+            if self.path == SEGMENTATION_PATH:
+                self._handle_segmentation()
+                return
             if self.path == TRACK_PATH:
                 self._handle_track()
                 return
@@ -606,6 +674,20 @@ def make_handler(
                 request_id=self.headers.get("X-FoundationPose-Request-Id"),
                 profile_name=self.headers.get("X-FoundationPose-Profile"),
             )
+            self._send_json(status_code, response)
+
+        def _handle_segmentation(self) -> None:
+            content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip()
+            if content_type != REQUEST_CONTENT_TYPE:
+                self._send_json(415, {"ok": False, "status": "error", "reason": "unsupported content type"})
+                return
+            try:
+                body = self._read_body()
+                request = decode_foundationpose_segmentation_request(body, max_content_length=max_content_length)
+            except Exception as exc:
+                self._send_json(400, {"ok": False, "status": "error", "reason": str(exc)})
+                return
+            status_code, response = service.segment(request)
             self._send_json(status_code, response)
 
         def _handle_track(self) -> None:
@@ -764,6 +846,38 @@ def _processing_config_from_options(options: dict[str, Any]) -> ReferenceProcess
         max_depth_m=float(options.get("max_depth_m", 3.0)),
         publish=not bool(options.get("evaluate_only", False)),
     )
+
+
+def _mask_summary(mask: np.ndarray) -> dict[str, Any]:
+    mask = np.asarray(mask, dtype=bool)
+    area = int(np.count_nonzero(mask))
+    summary: dict[str, Any] = {
+        "area": area,
+        "area_fraction": float(area / max(mask.size, 1)),
+        "shape": [int(value) for value in mask.shape],
+        "box_xyxy": None,
+    }
+    if area > 0:
+        ys, xs = np.nonzero(mask)
+        summary["box_xyxy"] = [
+            int(xs.min()),
+            int(ys.min()),
+            int(xs.max()) + 1,
+            int(ys.max()) + 1,
+        ]
+    return summary
+
+
+def _mask_png_b64(mask: np.ndarray) -> str:
+    try:
+        import cv2  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("OpenCV is required to encode segmentation masks.") from exc
+    mask_u8 = np.asarray(mask, dtype=np.uint8) * 255
+    ok, encoded = cv2.imencode(".png", mask_u8)
+    if not ok:
+        raise RuntimeError("failed to encode segmentation mask")
+    return base64.b64encode(encoded.tobytes()).decode("ascii")
 
 
 def recovery_config_from_options(options: dict[str, Any]) -> TrackingRecoveryConfig:
