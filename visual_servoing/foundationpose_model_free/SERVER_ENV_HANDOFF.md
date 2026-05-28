@@ -124,7 +124,7 @@ Then install the normal runtime packages that BundleSDF and processing need:
 
 ```bash
 python -m pip install \
-  joblib matplotlib opencv-python trimesh xatlas imageio PyYAML scipy scikit-learn \
+  joblib matplotlib opencv-python trimesh xatlas rtree imageio PyYAML scipy scikit-learn \
   h5py ruamel.yaml transformations pandas Pillow pyrender \
   pyOpenGL pyOpenGL_accelerate kornia omegaconf psutil tqdm \
   warp-lang scikit-image open3d
@@ -165,6 +165,7 @@ for name in [
     "cv2",
     "trimesh",
     "xatlas",
+    "rtree",
     "yaml",
     "imageio",
     "sam3",
@@ -192,6 +193,7 @@ import joblib
 import matplotlib.pyplot as plt
 import trimesh
 import xatlas
+import rtree
 import pyrender
 import OpenGL
 import cv2
@@ -333,6 +335,7 @@ pytorch3d    -> install source or wheel compatible with the env torch
 nvdiffrast   -> python -m pip install --no-build-isolation git+https://github.com/NVlabs/nvdiffrast.git
 kaolin       -> torch/CUDA-matched Kaolin wheel, currently torch 2.8.0 cu128 + kaolin 0.18.0
 xatlas       -> python -m pip install xatlas
+rtree        -> python -m pip install rtree
 No display   -> export PYOPENGL_PLATFORM=egl before starting the server/build subprocess
 glGenTextures TypeError -> python -m pip install --upgrade PyOpenGL==3.1.10 PyOpenGL_accelerate==3.1.10
 ```

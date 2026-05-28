@@ -49,6 +49,8 @@ def run_checks(*, foundationpose_path: str | Path | None = None, camera: str = "
         _import_check("pytorch3d", required=True),
         _module_check("trimesh", required=True),
         _module_check("xatlas", required=True),
+        _module_check("rtree", required=True),
+        _trimesh_proximity_check(required=True),
         _pyopengl_version_check(required=True),
         _pyrender_egl_texture_check(required=True),
         _module_check("kaolin", required=False),
@@ -118,6 +120,26 @@ def _pyopengl_version_check(*, required: bool) -> CheckResult:
     ok = parts >= (3, 1, 10)
     detail = f"{version}; Python 3.12/EGL textured rendering needs PyOpenGL>=3.1.10"
     return CheckResult(name, ok, detail, required=required)
+
+
+def _trimesh_proximity_check(*, required: bool) -> CheckResult:
+    try:
+        import numpy as np
+        import trimesh
+
+        mesh = trimesh.creation.box()
+        points = np.array([[0.25, 0.25, 1.0]], dtype=np.float64)
+        locations, distances, triangle_ids = trimesh.proximity.closest_point(mesh, points)
+        if locations.shape != (1, 3) or distances.shape != (1,) or triangle_ids.shape != (1,):
+            raise RuntimeError("unexpected closest_point output shapes")
+    except Exception as exc:
+        return CheckResult(
+            "trimesh_proximity",
+            False,
+            f"failed; install rtree for trimesh.proximity.closest_point: {exc}",
+            required=required,
+        )
+    return CheckResult("trimesh_proximity", True, "closest_point OK", required=required)
 
 
 def _pyrender_egl_texture_check(*, required: bool) -> CheckResult:
