@@ -38,10 +38,13 @@ def save_reference_frame(
     mask_bool = np.asarray(mask).astype(bool)
     if depth.shape != rgb_u8.shape[:2] or mask_bool.shape != rgb_u8.shape[:2]:
         raise ValueError("depth and mask must match RGB image size")
+    depth, depth_quality = sanitize_depth_m(depth)
+    metadata_payload = dict(metadata or {})
+    metadata_payload["depth_quality"] = depth_quality
 
     cv2.imwrite(str(rgb_path), cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2BGR))
     np.save(depth_path, depth)
-    cv2.imwrite(str(depth_enhanced_path), np.clip(depth * 1000.0, 0, 65535).astype(np.uint16))
+    cv2.imwrite(str(depth_enhanced_path), depth_to_uint16_mm(depth))
     cv2.imwrite(str(mask_path), mask_bool.astype(np.uint8) * 255)
     np.savetxt(profile.refs_dir / "K.txt", intrinsics.as_matrix())
     _write_select_frames(profile)
@@ -70,9 +73,9 @@ def save_reference_frame(
     )
     if cam_in_ob is not None:
         np.savetxt(profile.cam_in_ob_dir / f"{index:06d}.txt", np.asarray(cam_in_ob, dtype=np.float64))
-    if metadata:
+    if metadata_payload:
         (profile.refs_dir / f"{index:06d}.json").write_text(
-            json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+            json.dumps(metadata_payload, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
     profile.reference_count = max(profile.reference_count, count_reference_frames(profile))
@@ -105,6 +108,48 @@ def has_reference_poses(profile: ObjectProfile) -> bool:
 
 def foundationpose_ref_view_dir(profile: ObjectProfile) -> Path:
     return profile.refs_dir
+
+
+def sanitize_depth_m(depth_m: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
+    depth = np.asarray(depth_m, dtype=np.float32)
+    finite = np.isfinite(depth)
+    positive_finite = finite & (depth > 0.0)
+    sanitized = np.where(positive_finite, depth, 0.0).astype(np.float32, copy=False)
+    total = int(depth.size)
+    valid_count = int(positive_finite.sum())
+    invalid_count = int(total - valid_count)
+    quality: dict[str, Any] = {
+        "total_pixels": total,
+        "valid_depth_pixels": valid_count,
+        "valid_depth_ratio": float(valid_count / max(total, 1)),
+        "invalid_depth_pixels": invalid_count,
+        "invalid_depth_ratio": float(invalid_count / max(total, 1)),
+        "nonfinite_depth_pixels": int(total - int(finite.sum())),
+        "nonpositive_depth_pixels": int((finite & (depth <= 0.0)).sum()),
+    }
+    if valid_count:
+        valid_depths = depth[positive_finite]
+        quality.update(
+            {
+                "valid_depth_min_m": float(np.min(valid_depths)),
+                "valid_depth_max_m": float(np.max(valid_depths)),
+                "valid_depth_median_m": float(np.median(valid_depths)),
+            }
+        )
+    else:
+        quality.update(
+            {
+                "valid_depth_min_m": None,
+                "valid_depth_max_m": None,
+                "valid_depth_median_m": None,
+            }
+        )
+    return np.ascontiguousarray(sanitized), quality
+
+
+def depth_to_uint16_mm(depth_m: np.ndarray) -> np.ndarray:
+    depth, _ = sanitize_depth_m(depth_m)
+    return np.clip(depth * 1000.0, 0, 65535).astype(np.uint16)
 
 
 def _write_select_frames(profile: ObjectProfile) -> None:
