@@ -1,0 +1,543 @@
+"""Stdlib HTTP server for FoundationPose pose-only remote processing."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass, field
+import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+from pathlib import Path
+import threading
+import time
+import traceback
+from typing import Any, Callable
+import uuid
+
+import numpy as np
+
+from visual_servoing.foundationpose_model_free.asset_builder import (
+    AssetBuildResult,
+    FoundationPoseAssetBuilder,
+    find_generated_mesh,
+)
+from visual_servoing.foundationpose_model_free.foundationpose_adapter import (
+    FoundationPoseAdapter,
+    FoundationPoseConfig,
+)
+from visual_servoing.foundationpose_model_free.mask_provider import Sam3MaskProvider
+from visual_servoing.foundationpose_model_free.profile_schema import ObjectProfile
+from visual_servoing.foundationpose_model_free.registry import ObjectProfileRegistry
+from visual_servoing.foundationpose_model_free.tracker import (
+    FoundationPoseLiveTracker,
+    TrackingRecoveryConfig,
+)
+from visual_servoing.visual_servo_protocol_v2 import (
+    DEFAULT_MAX_CONTENT_LENGTH,
+    PROTOCOL_VERSION,
+    REQUEST_CONTENT_TYPE,
+    RESPONSE_CONTENT_TYPE,
+    FoundationPoseTrackRequest,
+    decode_foundationpose_track_request,
+    encode_foundationpose_response,
+)
+
+
+HEALTH_PATH = "/foundationpose/v2/health"
+BUILD_PATH = "/foundationpose/v2/assets/build"
+BUILD_STATUS_PREFIX = "/foundationpose/v2/assets/build/"
+TRACK_PATH = "/foundationpose/v2/track"
+TAIL_LIMIT = 4000
+MESH_HASH_LIMIT_BYTES = 50 * 1024 * 1024
+
+
+class UnknownProfileError(ValueError):
+    pass
+
+
+@dataclass
+class BuildJob:
+    job_id: str
+    profile: str
+    state: str = "queued"
+    started_at: float | None = None
+    completed_at: float | None = None
+    returncode: int | None = None
+    stdout_tail: str = ""
+    stderr_tail: str = ""
+    error: str | None = None
+    validation_report: dict[str, Any] | None = None
+    command: list[str] = field(default_factory=list)
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "ok": self.state == "succeeded",
+            "job_id": self.job_id,
+            "state": self.state,
+            "profile": self.profile,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "returncode": self.returncode,
+            "stdout_tail": self.stdout_tail,
+            "stderr_tail": self.stderr_tail,
+            "error": self.error,
+            "validation_report": self.validation_report,
+            "command": self.command,
+        }
+
+
+class BuildJobManager:
+    def __init__(self, *, max_tail_chars: int = TAIL_LIMIT) -> None:
+        self.max_tail_chars = int(max_tail_chars)
+        self._jobs: dict[str, BuildJob] = {}
+        self._lock = threading.Lock()
+
+    def enqueue(self, *, profile: ObjectProfile, builder: FoundationPoseAssetBuilder) -> BuildJob:
+        job = BuildJob(job_id=uuid.uuid4().hex, profile=profile.name)
+        with self._lock:
+            self._jobs[job.job_id] = job
+        thread = threading.Thread(target=self._run, args=(job, profile, builder), daemon=True)
+        thread.start()
+        return job
+
+    def get(self, job_id: str) -> BuildJob | None:
+        with self._lock:
+            return self._jobs.get(job_id)
+
+    def _run(self, job: BuildJob, profile: ObjectProfile, builder: FoundationPoseAssetBuilder) -> None:
+        job.state = "running"
+        job.started_at = time.time()
+        try:
+            result = builder.build(profile, execute=True)
+            self._apply_result(job, result)
+            job.state = "succeeded" if int(result.returncode) == 0 else "failed"
+        except Exception as exc:
+            job.state = "failed"
+            job.error = str(exc)
+            job.stderr_tail = _tail(traceback.format_exc(), self.max_tail_chars)
+        finally:
+            job.completed_at = time.time()
+
+    def _apply_result(self, job: BuildJob, result: AssetBuildResult) -> None:
+        job.returncode = int(result.returncode)
+        job.stdout_tail = _tail(result.stdout, self.max_tail_chars)
+        job.stderr_tail = _tail(result.stderr, self.max_tail_chars)
+        job.validation_report = result.validation_report
+        job.command = list(result.command)
+
+
+@dataclass(frozen=True)
+class TrackerCacheKey:
+    profile: str
+    foundationpose_root: str | None
+    mesh_identity_json: str
+    refine_iterations: int
+    track_iterations: int
+    mask_options_json: str
+    recovery_options_json: str
+
+
+@dataclass
+class TrackerSession:
+    session_id: str
+    key: TrackerCacheKey
+    tracker: Any
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    created_monotonic_ns: int = field(default_factory=time.monotonic_ns)
+
+
+class TrackerSessionManager:
+    def __init__(
+        self,
+        *,
+        tracker_factory: Callable[[ObjectProfile, Path, FoundationPoseTrackRequest], Any] | None = None,
+    ) -> None:
+        self._tracker_factory = tracker_factory
+        self._sessions: dict[TrackerCacheKey, TrackerSession] = {}
+        self._lock = threading.Lock()
+
+    def session_for(
+        self,
+        *,
+        profile: ObjectProfile,
+        mesh_path: Path,
+        request: FoundationPoseTrackRequest,
+    ) -> tuple[TrackerSession, bool, dict[str, Any]]:
+        key = TrackerCacheKey(
+            profile=profile.name,
+            foundationpose_root=request.foundationpose_root,
+            mesh_identity_json=_stable_json(mesh_identity(mesh_path)),
+            refine_iterations=int(request.refine_iterations),
+            track_iterations=int(request.track_iterations),
+            mask_options_json=_stable_json(request.mask_options),
+            recovery_options_json=_stable_json(request.recovery_options),
+        )
+        with self._lock:
+            session = self._sessions.get(key)
+            if session is not None:
+                return session, True, {"cache_key": key.__dict__}
+            tracker = self._make_tracker(profile, mesh_path, request)
+            session = TrackerSession(session_id=uuid.uuid4().hex, key=key, tracker=tracker)
+            self._sessions[key] = session
+            return session, False, {"cache_key": key.__dict__}
+
+    def _make_tracker(self, profile: ObjectProfile, mesh_path: Path, request: FoundationPoseTrackRequest) -> Any:
+        if self._tracker_factory is not None:
+            return self._tracker_factory(profile, mesh_path, request)
+        adapter = FoundationPoseAdapter(
+            FoundationPoseConfig(
+                foundationpose_root=Path(request.foundationpose_root).expanduser().resolve()
+                if request.foundationpose_root
+                else None,
+                mesh_path=mesh_path,
+                debug_dir=profile.logs_dir / "debug",
+                refinement_iterations=request.refine_iterations,
+                tracking_iterations=request.track_iterations,
+            )
+        )
+        mask_options = dict(request.mask_options)
+        mask_provider = Sam3MaskProvider(
+            prompt=profile.prompt,
+            device=str(mask_options.get("device", "cuda")),
+            confidence_threshold=float(mask_options.get("threshold", 0.3)),
+            resolution=int(mask_options.get("resolution", 1008)),
+        )
+        return FoundationPoseLiveTracker(
+            profile=profile,
+            adapter=adapter,
+            mask_provider=mask_provider,
+            recovery_config=recovery_config_from_options(request.recovery_options),
+        )
+
+
+class FoundationPoseV2Service:
+    def __init__(
+        self,
+        *,
+        registry: ObjectProfileRegistry | None = None,
+        builder_factory: Callable[[str | Path], FoundationPoseAssetBuilder] | None = None,
+        tracker_factory: Callable[[ObjectProfile, Path, FoundationPoseTrackRequest], Any] | None = None,
+        job_manager: BuildJobManager | None = None,
+        tracker_sessions: TrackerSessionManager | None = None,
+    ) -> None:
+        self.registry = registry or ObjectProfileRegistry()
+        self.builder_factory = builder_factory or (
+            lambda foundationpose_root: FoundationPoseAssetBuilder(foundationpose_root=foundationpose_root)
+        )
+        self.job_manager = job_manager or BuildJobManager()
+        self.tracker_sessions = tracker_sessions or TrackerSessionManager(tracker_factory=tracker_factory)
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "protocol_version": PROTOCOL_VERSION,
+            "status": "ready",
+            "server_time_monotonic_ns": time.monotonic_ns(),
+        }
+
+    def build_assets(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        missing = [key for key in ("request_id", "profile", "foundationpose_root", "execute") if key not in payload]
+        if missing:
+            return 400, {"ok": False, "status": "error", "reason": f"missing required fields: {missing}"}
+        try:
+            profile = self._profile(str(payload["profile"]))
+        except UnknownProfileError as exc:
+            return 404, {"ok": False, "status": "error", "reason": str(exc)}
+        builder = self.builder_factory(str(payload["foundationpose_root"]))
+        if not bool(payload.get("execute")):
+            try:
+                result = builder.build(profile, execute=False)
+                return 200, _build_result_payload(result, profile=profile.name)
+            except Exception as exc:
+                return 200, {
+                    "ok": False,
+                    "status": "validation_failed",
+                    "profile": profile.name,
+                    "reason": str(exc),
+                }
+        job = self.job_manager.enqueue(profile=profile, builder=builder)
+        return 202, {"ok": True, "status": "queued", "job_id": job.job_id, "profile": profile.name}
+
+    def build_status(self, job_id: str) -> tuple[int, dict[str, Any]]:
+        job = self.job_manager.get(job_id)
+        if job is None:
+            return 404, {"ok": False, "status": "error", "reason": f"unknown build job: {job_id}"}
+        return 200, job.payload()
+
+    def track(self, request: FoundationPoseTrackRequest) -> tuple[int, dict[str, Any]]:
+        server_received_ns = time.monotonic_ns()
+        timing_ms: dict[str, float] = {}
+        try:
+            profile = self._profile(request.profile)
+        except UnknownProfileError as exc:
+            return 404, _track_error(request, server_received_ns, timing_ms, str(exc))
+        mesh_path = find_generated_mesh(profile)
+        if mesh_path is None:
+            return 409, _track_error(
+                request,
+                server_received_ns,
+                timing_ms,
+                f"profile {profile.name} has no fresh generated mesh/model.obj; run asset build first",
+            )
+
+        start = time.perf_counter()
+        session, cache_hit, cache_metadata = self.tracker_sessions.session_for(
+            profile=profile,
+            mesh_path=mesh_path,
+            request=request,
+        )
+        timing_ms["session_ms"] = _elapsed_ms(start)
+        start = time.perf_counter()
+        with session.lock:
+            if request.reinit:
+                request_reinit = getattr(session.tracker, "request_reinit", None)
+                if callable(request_reinit):
+                    request_reinit()
+            result = session.tracker.process_frame(
+                rgb=request.rgb,
+                depth_m=request.depth_m,
+                intrinsics=request.intrinsics,
+            )
+        timing_ms["tracking_ms"] = _elapsed_ms(start)
+        pose = result.pose.camera_T_object if getattr(result, "pose", None) is not None else None
+        camera_T_object = np.asarray(pose, dtype=np.float64) if pose is not None else None
+        t5_T_object = request.t5_T_camera @ camera_T_object if camera_T_object is not None else None
+        server_completed_ns = time.monotonic_ns()
+        return 200, {
+            "ok": camera_T_object is not None,
+            "status": str(getattr(result, "state", "LOST")).lower(),
+            "request_id": request.request_id,
+            "frame_index": request.frame_index,
+            "profile": profile.name,
+            "tracker_session_id": session.session_id,
+            "camera_T_object": _matrix_or_none(camera_T_object),
+            "t5_T_object": _matrix_or_none(t5_T_object),
+            "tracking_state": getattr(result, "state", "LOST"),
+            "fresh_pose": bool(getattr(result, "fresh_pose", False)),
+            "held_pose": bool(getattr(result, "held_pose", False)),
+            "message": getattr(result, "message", None),
+            "server_received_monotonic_ns": server_received_ns,
+            "server_completed_monotonic_ns": server_completed_ns,
+            "server_timing_ms": timing_ms,
+            "tracker_cache": {
+                "cache_hit": cache_hit,
+                "session_created_monotonic_ns": session.created_monotonic_ns,
+                **cache_metadata,
+            },
+            "tracker_metadata": getattr(result, "metadata", None) or {},
+        }
+
+    def _profile(self, name: str) -> ObjectProfile:
+        try:
+            return self.registry.get(name)
+        except FileNotFoundError as exc:
+            raise UnknownProfileError(str(exc)) from exc
+
+
+def make_handler(
+    service: FoundationPoseV2Service,
+    *,
+    max_content_length: int = DEFAULT_MAX_CONTENT_LENGTH,
+):
+    class FoundationPoseV2Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
+            if self.path == HEALTH_PATH:
+                self._send_json(200, service.health())
+                return
+            if self.path.startswith(BUILD_STATUS_PREFIX):
+                job_id = self.path[len(BUILD_STATUS_PREFIX) :].strip("/")
+                if not job_id:
+                    self._send_json(404, {"ok": False, "status": "error", "reason": "missing job_id"})
+                    return
+                status_code, payload = service.build_status(job_id)
+                self._send_json(status_code, payload)
+                return
+            self._send_json(404, {"ok": False, "status": "error", "reason": "not found"})
+
+        def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+            if self.path == BUILD_PATH:
+                self._handle_build()
+                return
+            if self.path == TRACK_PATH:
+                self._handle_track()
+                return
+            self._send_json(404, {"ok": False, "status": "error", "reason": "not found"})
+
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+        def _handle_build(self) -> None:
+            content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip()
+            if content_type != "application/json":
+                self._send_json(415, {"ok": False, "status": "error", "reason": "unsupported content type"})
+                return
+            try:
+                body = self._read_body()
+                payload = json.loads(body.decode("utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("build request must be a JSON object")
+            except Exception as exc:
+                self._send_json(400, {"ok": False, "status": "error", "reason": str(exc)})
+                return
+            status_code, response = service.build_assets(payload)
+            self._send_json(status_code, response)
+
+        def _handle_track(self) -> None:
+            content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip()
+            if content_type != REQUEST_CONTENT_TYPE:
+                self._send_json(415, {"ok": False, "status": "error", "reason": "unsupported content type"})
+                return
+            try:
+                body = self._read_body()
+                request = decode_foundationpose_track_request(body, max_content_length=max_content_length)
+            except Exception as exc:
+                self._send_json(400, {"ok": False, "status": "error", "reason": str(exc)})
+                return
+            status_code, response = service.track(request)
+            self._send_json(status_code, response)
+
+        def _read_body(self) -> bytes:
+            try:
+                content_length = int(self.headers.get("Content-Length", "0"))
+            except ValueError as exc:
+                raise ValueError("invalid content length") from exc
+            if content_length <= 0:
+                raise ValueError("empty request body")
+            if content_length > int(max_content_length):
+                raise ValueError("request body too large")
+            return self.rfile.read(content_length)
+
+        def _send_json(self, status_code: int, payload: dict[str, Any]) -> None:
+            data = encode_foundationpose_response(payload)
+            try:
+                self.send_response(status_code)
+                self.send_header("Content-Type", RESPONSE_CONTENT_TYPE)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                return
+
+    return FoundationPoseV2Handler
+
+
+def recovery_config_from_options(options: dict[str, Any]) -> TrackingRecoveryConfig:
+    return TrackingRecoveryConfig(
+        hold_last_pose_frames=int(options.get("hold_last_pose_frames", 0)),
+        auto_reinit=bool(options.get("auto_reinit", False)),
+        auto_reinit_after_lost_frames=int(options.get("auto_reinit_after_lost_frames", 30)),
+        verify_pose_depth=bool(options.get("verify_pose_depth", False)),
+        warn_initial_pose_mask_alignment=bool(options.get("warn_initial_pose_mask_alignment", False)),
+        pose_depth_tolerance_m=float(options.get("pose_depth_tolerance_m", 0.18)),
+        pose_depth_window_radius_px=int(options.get("pose_depth_window_radius_px", 7)),
+        max_pose_jump_m=options.get("max_pose_jump_m"),
+        implausible_lost_threshold=int(options.get("implausible_lost_threshold", 1)),
+    )
+
+
+def mesh_identity(mesh_path: Path) -> dict[str, Any]:
+    path = Path(mesh_path).expanduser().resolve()
+    stat = path.stat()
+    payload: dict[str, Any] = {
+        "path": str(path),
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+        "sha256": None,
+    }
+    if stat.st_size <= MESH_HASH_LIMIT_BYTES:
+        payload["sha256"] = _sha256_file(path)
+    return payload
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="FoundationPose v2 pose-only HTTP server.")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8081)
+    parser.add_argument("--data-root")
+    parser.add_argument("--max-content-length", type=int, default=DEFAULT_MAX_CONTENT_LENGTH)
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    service = FoundationPoseV2Service(registry=ObjectProfileRegistry(args.data_root))
+    server = ThreadingHTTPServer((args.host, int(args.port)), make_handler(service, max_content_length=args.max_content_length))
+    print(json.dumps({"event": "foundationpose_v2_server_listening", "host": args.host, "port": args.port}))
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
+def _build_result_payload(result: AssetBuildResult, *, profile: str) -> dict[str, Any]:
+    return {
+        "ok": int(result.returncode) == 0,
+        "status": "validated" if not result.executed else "succeeded" if int(result.returncode) == 0 else "failed",
+        "profile": profile,
+        "executed": bool(result.executed),
+        "returncode": int(result.returncode),
+        "elapsed_ms": float(result.elapsed_ms),
+        "stdout_tail": _tail(result.stdout, TAIL_LIMIT),
+        "stderr_tail": _tail(result.stderr, TAIL_LIMIT),
+        "validation_report": result.validation_report,
+        "command": list(result.command),
+    }
+
+
+def _track_error(
+    request: FoundationPoseTrackRequest,
+    server_received_ns: int,
+    timing_ms: dict[str, float],
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "status": "lost",
+        "request_id": request.request_id,
+        "frame_index": request.frame_index,
+        "profile": request.profile,
+        "camera_T_object": None,
+        "t5_T_object": None,
+        "tracking_state": "LOST",
+        "fresh_pose": False,
+        "held_pose": False,
+        "message": reason,
+        "server_received_monotonic_ns": server_received_ns,
+        "server_completed_monotonic_ns": time.monotonic_ns(),
+        "server_timing_ms": timing_ms,
+    }
+
+
+def _matrix_or_none(matrix: np.ndarray | None) -> list[list[float]] | None:
+    if matrix is None:
+        return None
+    return np.asarray(matrix, dtype=np.float64).tolist()
+
+
+def _tail(text: str | None, limit: int) -> str:
+    if not text:
+        return ""
+    return str(text)[-int(limit) :]
+
+
+def _stable_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _elapsed_ms(start: float) -> float:
+    return (time.perf_counter() - start) * 1000.0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

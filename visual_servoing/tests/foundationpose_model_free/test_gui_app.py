@@ -264,6 +264,53 @@ def test_gui_command_builder_uses_zed_live_path_without_forced_default_dimension
     assert "--height" not in track
 
 
+def test_gui_command_builder_constructs_remote_track_command(tmp_path):
+    builder = GuiCommandBuilder(config=GuiConfig(data_root=str(tmp_path), python_executable="python"))
+
+    command = builder.track_remote_live(
+        server_host="192.168.0.3",
+        server_port=8081,
+        object_name="mouse",
+        prompt="wireless mouse",
+        foundationpose_root="/home/kgs/FoundationPose",
+        auto_reinit=True,
+        auto_reinit_after_lost_frames=5,
+        camera_model="zed",
+        width=672,
+        height=376,
+        refine_iterations=1,
+        track_iterations=1,
+        data_root=str(tmp_path),
+    )
+
+    assert command[:3] == ["python", "-m", "visual_servoing.visual_servo_client_v2"]
+    assert command[command.index("--server-host") + 1] == "192.168.0.3"
+    assert command[command.index("--server-port") + 1] == "8081"
+    assert command[command.index("--object") + 1] == "mouse"
+    assert command[command.index("--camera") + 1] == "zed"
+    assert "--auto-reinit" in command
+    assert command[command.index("--refine-iterations") + 1] == "1"
+    assert command[command.index("--track-iterations") + 1] == "1"
+    assert "--execute" not in command
+    assert "--address" not in command
+
+
+def test_gui_source_contains_remote_connect_state_flow():
+    build_source = inspect.getsource(FoundationPoseWorkflowGui._build)
+    connect_source = inspect.getsource(FoundationPoseWorkflowGui.connect_remote_server)
+    poll_source = inspect.getsource(FoundationPoseWorkflowGui._poll_queues)
+    command_source = inspect.getsource(FoundationPoseWorkflowGui.run_tracking)
+    done_source = inspect.getsource(FoundationPoseWorkflowGui._handle_command_event)
+
+    assert 'text="Server"' in build_source
+    assert 'text="Port"' in build_source
+    assert 'text="Connect"' in build_source
+    assert "threading.Thread" in connect_source
+    assert "remote_events" in poll_source
+    assert "track_remote_live" in command_source
+    assert "Disconnected" in done_source
+
+
 def test_gui_resolves_and_passes_default_data_root(tmp_path, monkeypatch):
     from visual_servoing.common import paths
     from visual_servoing.foundationpose_model_free.gui_app import resolve_gui_config

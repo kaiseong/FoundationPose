@@ -202,6 +202,27 @@ def test_server_module_import_does_not_require_robot_sdk():
     assert result.stdout.strip() == "ok"
 
 
+def test_frozen_v1_modules_import_without_robot_sdk():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; sys.modules['rby1_sdk']=None; "
+                "import visual_servoing.visual_servo_client_v1; "
+                "import visual_servoing.visual_servo_server_v1; print('ok')"
+            ),
+        ],
+        cwd="/home/kgs/FoundationPose",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"
+
+
 def test_server_rejects_invalid_ee_link_before_action_payload():
     service = VisualServoService(segmenter_factory=FakeSegmenter)
     payload = service.handle(

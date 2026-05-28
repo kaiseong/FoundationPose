@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import argparse
+import json
 import os
 from pathlib import Path
 import queue
@@ -13,6 +14,8 @@ import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import Callable
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 from visual_servoing.common.paths import data_root
 from visual_servoing.point_pose.live_camera_config import (
@@ -52,6 +55,12 @@ class RecordingEvent:
     text: str
     session_id: str | None = None
     frame_count: int = 0
+
+
+@dataclass(frozen=True)
+class RemoteHealthEvent:
+    state: str
+    text: str
 
 
 DEFAULT_CAMERA_RESOLUTIONS = {
@@ -306,6 +315,54 @@ class GuiCommandBuilder:
         self._append_data_root(command, data_root)
         return command
 
+    def track_remote_live(
+        self,
+        *,
+        server_host: str,
+        server_port: int,
+        object_name: str,
+        prompt: str,
+        foundationpose_root: str,
+        auto_reinit: bool,
+        auto_reinit_after_lost_frames: int,
+        camera_model: str = "d405",
+        serial: str | None = None,
+        width: int = 640,
+        height: int = 480,
+        fps: int = 15,
+        refine_iterations: int = 5,
+        track_iterations: int = 2,
+        data_root: str | None = None,
+    ) -> list[str]:
+        command = self.module(
+            "visual_servoing.visual_servo_client_v2",
+            "--server-host",
+            str(server_host),
+            "--server-port",
+            str(int(server_port)),
+            "--object",
+            object_name,
+            "--prompt",
+            prompt,
+            "--foundationpose-root",
+            foundationpose_root,
+            "--camera",
+            camera_model,
+            "--fps",
+            str(fps),
+            "--refine-iterations",
+            str(refine_iterations),
+            "--track-iterations",
+            str(track_iterations),
+        )
+        self._append_live_dimensions(command, camera_model=camera_model, width=width, height=height)
+        if auto_reinit:
+            command.append("--auto-reinit")
+        command.extend(["--auto-reinit-after-lost-frames", str(auto_reinit_after_lost_frames)])
+        self._append_serial(command, serial)
+        self._append_data_root(command, data_root)
+        return command
+
     @staticmethod
     def _append_data_root(command: list[str], data_root: str | None) -> None:
         if data_root:
@@ -399,6 +456,7 @@ class FoundationPoseWorkflowGui:
         self.command_builder = GuiCommandBuilder(config=self.config)
         self.command_events: queue.Queue[CommandEvent] = queue.Queue()
         self.recording_events: queue.Queue[RecordingEvent | Exception] = queue.Queue()
+        self.remote_events: queue.Queue[RemoteHealthEvent] = queue.Queue()
         self.runner = BackgroundCommandRunner(on_event=self.command_events.put, cwd=self.command_builder.cwd)
         self.recording_session: ReferenceRecordingSession | None = None
         self.recording_busy = False
@@ -406,12 +464,16 @@ class FoundationPoseWorkflowGui:
         self._recording_thread: threading.Thread | None = None
         self._capture_preview_images: tuple[tk.PhotoImage, ...] | None = None
         self._pending_axis_preview_path: Path | None = None
+        self._active_remote_command = False
 
         self.root = tk.Tk()
         self.root.title(self.config.title)
         self.profile_name = tk.StringVar(value="phone")
         self.prompt = tk.StringVar(value="mobile phone")
         self.status = tk.StringVar(value="Ready")
+        self.remote_state = tk.StringVar(value="Local")
+        self.server_host = tk.StringVar(value="127.0.0.1")
+        self.server_port = tk.IntVar(value=8081)
         self.capture_status = tk.StringVar(value="Capture: 0 / 16")
         self.recording_status = tk.StringVar(value="Recording: no raw frames")
         self.processing_status = tk.StringVar(value="Processing: no report")
@@ -506,6 +568,12 @@ class FoundationPoseWorkflowGui:
         ttk.Entry(setup, textvariable=self.camera_height, width=8).grid(row=2, column=3, sticky="w")
         ttk.Label(setup, text="FPS").grid(row=2, column=4, sticky="e")
         ttk.Entry(setup, textvariable=self.camera_fps, width=5).grid(row=2, column=5, sticky="w")
+        ttk.Label(setup, text="Server").grid(row=3, column=0, sticky="w")
+        ttk.Entry(setup, textvariable=self.server_host, width=16).grid(row=3, column=1, sticky="ew")
+        ttk.Label(setup, text="Port").grid(row=3, column=2, sticky="e")
+        ttk.Entry(setup, textvariable=self.server_port, width=7).grid(row=3, column=3, sticky="w")
+        ttk.Button(setup, text="Connect", command=self.connect_remote_server).grid(row=3, column=4, sticky="ew")
+        ttk.Label(setup, textvariable=self.remote_state, anchor="w").grid(row=3, column=5, sticky="w")
 
         capture = ttk.LabelFrame(stages, text="3. Recording / Processing", padding=6)
         capture.grid(row=1, column=0, sticky="ew", pady=(8, 0))
@@ -658,6 +726,23 @@ class FoundationPoseWorkflowGui:
             )
         )
 
+    def connect_remote_server(self) -> None:
+        host = self.server_host.get().strip()
+        port = int(self.server_port.get())
+        self.status.set("Checking FoundationPose v2 server")
+        thread = threading.Thread(target=self._remote_health_worker, args=(host, port), daemon=True)
+        thread.start()
+
+    def _remote_health_worker(self, host: str, port: int) -> None:
+        try:
+            payload = check_remote_health(host=host, port=port, timeout_s=2.0)
+            if payload.get("ok") is True and int(payload.get("protocol_version", -1)) == 2:
+                self.remote_events.put(RemoteHealthEvent("Remote", f"Connected to {host}:{port}"))
+            else:
+                self.remote_events.put(RemoteHealthEvent("Local", f"Unexpected server response from {host}:{port}"))
+        except Exception as exc:
+            self.remote_events.put(RemoteHealthEvent("Local", f"Remote unavailable: {exc}"))
+
     def start_recording(self) -> None:
         if self.recording_session is not None:
             self.status.set("Recording is already running")
@@ -786,6 +871,28 @@ class FoundationPoseWorkflowGui:
         profile = self._current_profile()
         if not self._release_live_sessions_for_gpu():
             return
+        if self.remote_state.get() == "Remote":
+            self._start_command(
+                self.command_builder.track_remote_live(
+                    server_host=self.server_host.get().strip(),
+                    server_port=int(self.server_port.get()),
+                    object_name=profile.name,
+                    prompt=self.prompt.get(),
+                    foundationpose_root=self.foundationpose_root.get(),
+                    auto_reinit=bool(self.auto_reinit.get()),
+                    auto_reinit_after_lost_frames=int(self.auto_reinit_after.get()),
+                    camera_model=self.camera_model.get(),
+                    serial=self.camera_serial.get(),
+                    width=int(self.camera_width.get()),
+                    height=int(self.camera_height.get()),
+                    fps=int(self.camera_fps.get()),
+                    refine_iterations=int(self.refine_iterations.get()),
+                    track_iterations=int(self.track_iterations.get()),
+                    data_root=self.config.data_root,
+                ),
+                remote=True,
+            )
+            return
         self._start_command(
             self.command_builder.track_live(
                 object_name=profile.name,
@@ -821,10 +928,12 @@ class FoundationPoseWorkflowGui:
         self.camera_height.set(height)
         self.status.set(f"Camera {self.camera_model.get()} default resolution: {width}x{height}")
 
-    def _start_command(self, command: list[str]) -> None:
+    def _start_command(self, command: list[str], *, remote: bool = False) -> None:
         try:
+            self._active_remote_command = bool(remote)
             self.runner.start(command)
         except Exception as exc:
+            self._active_remote_command = False
             self.status.set(str(exc))
 
     def _charuco_command(
@@ -933,6 +1042,12 @@ class FoundationPoseWorkflowGui:
             self._handle_command_event(event)
         while True:
             try:
+                event = self.remote_events.get_nowait()
+            except queue.Empty:
+                break
+            self._handle_remote_event(event)
+        while True:
+            try:
                 event = self.recording_events.get_nowait()
             except queue.Empty:
                 break
@@ -944,7 +1059,13 @@ class FoundationPoseWorkflowGui:
         if event.kind == "start":
             self.status.set("Command running")
         elif event.kind == "done":
-            if self.recording_session is None:
+            remote_failed = False
+            if self._active_remote_command and event.text != "returncode=0":
+                self.remote_state.set("Disconnected")
+                self.status.set("Remote command failed")
+                remote_failed = True
+            self._active_remote_command = False
+            if self.recording_session is None and not remote_failed:
                 self.status.set(event.text)
             if self._pending_axis_preview_path is not None:
                 self._show_axis_preview(self._pending_axis_preview_path)
@@ -954,6 +1075,11 @@ class FoundationPoseWorkflowGui:
             self._update_processing_status()
         elif event.kind == "stop":
             self.status.set(event.text)
+
+    def _handle_remote_event(self, event: RemoteHealthEvent) -> None:
+        self.remote_state.set(event.state)
+        self.status.set(event.text)
+        self._append_log(event.text)
 
     def _handle_recording_event(self, event: RecordingEvent | Exception) -> None:
         if isinstance(event, Exception):
@@ -1127,6 +1253,19 @@ def _default_camera_resolution(camera_model: str) -> tuple[int, int]:
         return default_camera_resolution(camera_model)
     except ValueError:
         return DEFAULT_CAMERA_RESOLUTIONS["d405"]
+
+
+def check_remote_health(*, host: str, port: int, timeout_s: float = 2.0) -> dict:
+    url = f"http://{host}:{int(port)}/foundationpose/v2/health"
+    try:
+        with urllib_request.urlopen(url, timeout=float(timeout_s)) as response:
+            payload = response.read()
+    except urllib_error.URLError as exc:
+        raise RuntimeError(str(exc)) from exc
+    decoded = json.loads(payload.decode("utf-8"))
+    if not isinstance(decoded, dict):
+        raise RuntimeError("health response must be a JSON object")
+    return decoded
 
 
 def _draw_recording_preview_status(image_bgr, *, session_id: str, frame_count: int) -> None:
