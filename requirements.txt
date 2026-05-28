@@ -30,6 +30,8 @@ matplotlib
 pandas
 Pillow
 pyrender
+# pyrender declares PyOpenGL==3.1.0, but Python 3.12 + EGL textured rendering
+# needs a post-install upgrade to PyOpenGL/PyOpenGL_accelerate 3.1.10.
 pyOpenGL>=3.1
 pyOpenGL_accelerate>=3.1
 

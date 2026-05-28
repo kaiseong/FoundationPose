@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import importlib
+import importlib.metadata
 import importlib.util
 import json
 import os
@@ -48,6 +49,8 @@ def run_checks(*, foundationpose_path: str | Path | None = None, camera: str = "
         _import_check("pytorch3d", required=True),
         _module_check("trimesh", required=True),
         _module_check("xatlas", required=True),
+        _pyopengl_version_check(required=True),
+        _pyrender_egl_texture_check(required=True),
         _module_check("kaolin", required=False),
     ]
     if check_realsense:
@@ -103,6 +106,54 @@ def _import_check(name: str, *, required: bool, package_hint: str | None = None)
         return CheckResult(name, False, f"missing or failed import; install {hint}: {exc}", required=required)
     origin = getattr(module, "__file__", None) or "namespace/package"
     return CheckResult(name, True, str(origin), required=required)
+
+
+def _pyopengl_version_check(*, required: bool) -> CheckResult:
+    name = "pyopengl"
+    try:
+        version = importlib.metadata.version("PyOpenGL")
+    except importlib.metadata.PackageNotFoundError:
+        return CheckResult(name, False, "missing; install PyOpenGL>=3.1.10", required=required)
+    parts = tuple(int(part) for part in version.split(".")[:3] if part.isdigit())
+    ok = parts >= (3, 1, 10)
+    detail = f"{version}; Python 3.12/EGL textured rendering needs PyOpenGL>=3.1.10"
+    return CheckResult(name, ok, detail, required=required)
+
+
+def _pyrender_egl_texture_check(*, required: bool) -> CheckResult:
+    previous_platform = os.environ.get("PYOPENGL_PLATFORM")
+    os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+    try:
+        import numpy as np
+        import pyrender
+        import trimesh
+
+        mesh = trimesh.creation.box()
+        mesh.visual = trimesh.visual.TextureVisuals(
+            uv=np.zeros((len(mesh.vertices), 2)),
+            image=np.zeros((4, 4, 3), dtype=np.uint8),
+        )
+        scene = pyrender.Scene()
+        scene.add(pyrender.Mesh.from_trimesh(mesh, smooth=False))
+        scene.add(pyrender.PerspectiveCamera(yfov=1.0), pose=np.eye(4))
+        renderer = pyrender.OffscreenRenderer(8, 8)
+        try:
+            renderer.render(scene)
+        finally:
+            renderer.delete()
+    except Exception as exc:
+        return CheckResult(
+            "pyrender_egl_texture",
+            False,
+            f"failed; set PYOPENGL_PLATFORM=egl and install PyOpenGL>=3.1.10: {exc}",
+            required=required,
+        )
+    finally:
+        if previous_platform is None:
+            os.environ.pop("PYOPENGL_PLATFORM", None)
+        else:
+            os.environ["PYOPENGL_PLATFORM"] = previous_platform
+    return CheckResult("pyrender_egl_texture", True, "textured EGL offscreen render OK", required=required)
 
 
 def _zed_sdk_check(*, required: bool) -> CheckResult:

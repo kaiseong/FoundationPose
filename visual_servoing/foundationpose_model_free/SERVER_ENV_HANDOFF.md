@@ -128,6 +128,10 @@ python -m pip install \
   h5py ruamel.yaml transformations pandas Pillow pyrender \
   pyOpenGL pyOpenGL_accelerate kornia omegaconf psutil tqdm \
   warp-lang scikit-image open3d
+
+# pyrender declares PyOpenGL==3.1.0, but Python 3.12 + EGL textured rendering
+# needs the newer PyOpenGL wrapper. Run this after installing pyrender.
+python -m pip install --upgrade PyOpenGL==3.1.10 PyOpenGL_accelerate==3.1.10
 ```
 
 Install or expose SAM3 in this same env. If `/home/rby1/sam3` is a local checkout:
@@ -188,6 +192,8 @@ import joblib
 import matplotlib.pyplot as plt
 import trimesh
 import xatlas
+import pyrender
+import OpenGL
 import cv2
 import sam3
 print("FoundationPose/BundleSDF/SAM3 import smoke test OK")
@@ -328,6 +334,7 @@ nvdiffrast   -> python -m pip install --no-build-isolation git+https://github.co
 kaolin       -> torch/CUDA-matched Kaolin wheel, currently torch 2.8.0 cu128 + kaolin 0.18.0
 xatlas       -> python -m pip install xatlas
 No display   -> export PYOPENGL_PLATFORM=egl before starting the server/build subprocess
+glGenTextures TypeError -> python -m pip install --upgrade PyOpenGL==3.1.10 PyOpenGL_accelerate==3.1.10
 ```
 
 ## Split Env Fallback
