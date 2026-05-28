@@ -6,6 +6,7 @@ import argparse
 from dataclasses import dataclass, field
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import json
 from pathlib import Path
 import threading
@@ -13,6 +14,7 @@ import time
 import traceback
 from typing import Any, Callable
 import uuid
+import zipfile
 
 import numpy as np
 
@@ -21,12 +23,25 @@ from visual_servoing.foundationpose_model_free.asset_builder import (
     FoundationPoseAssetBuilder,
     find_generated_mesh,
 )
+from visual_servoing.foundationpose_model_free.charuco_reference import (
+    BoardObjectTransform,
+    CHARUCO_DETECTOR_PRESET_CONSERVATIVE,
+    CharucoBoardSpec,
+    CharucoDetectorConfig,
+    CharucoQualityConfig,
+)
 from visual_servoing.foundationpose_model_free.foundationpose_adapter import (
     FoundationPoseAdapter,
     FoundationPoseConfig,
 )
 from visual_servoing.foundationpose_model_free.mask_provider import Sam3MaskProvider
 from visual_servoing.foundationpose_model_free.profile_schema import ObjectProfile
+from visual_servoing.foundationpose_model_free.reference_processing import (
+    ReferenceProcessingConfig,
+    process_recorded_references,
+    reselect_recorded_references,
+)
+from visual_servoing.foundationpose_model_free.reference_recording import RECORDINGS_DIR
 from visual_servoing.foundationpose_model_free.registry import ObjectProfileRegistry
 from visual_servoing.foundationpose_model_free.tracker import (
     FoundationPoseLiveTracker,
@@ -46,9 +61,14 @@ from visual_servoing.visual_servo_protocol_v2 import (
 HEALTH_PATH = "/foundationpose/v2/health"
 BUILD_PATH = "/foundationpose/v2/assets/build"
 BUILD_STATUS_PREFIX = "/foundationpose/v2/assets/build/"
+PROCESS_RECORDINGS_PATH = "/foundationpose/v2/recordings/process"
+PROCESS_RECORDINGS_STATUS_PREFIX = "/foundationpose/v2/recordings/process/"
 TRACK_PATH = "/foundationpose/v2/track"
+RECORDINGS_ZIP_CONTENT_TYPE = "application/x-foundationpose-recordings+zip"
+PROCESSING_REQUEST_JSON = "foundationpose_processing_request.json"
 TAIL_LIMIT = 4000
 MESH_HASH_LIMIT_BYTES = 50 * 1024 * 1024
+SERVER_DEFAULT_MAX_CONTENT_LENGTH = 512 * 1024 * 1024
 
 
 class UnknownProfileError(ValueError):
@@ -124,6 +144,88 @@ class BuildJobManager:
         job.stderr_tail = _tail(result.stderr, self.max_tail_chars)
         job.validation_report = result.validation_report
         job.command = list(result.command)
+
+
+@dataclass
+class ProcessingJob:
+    job_id: str
+    profile: str
+    request_id: str | None = None
+    mode: str = "process_recordings"
+    state: str = "queued"
+    started_at: float | None = None
+    completed_at: float | None = None
+    returncode: int | None = None
+    error: str | None = None
+    stderr_tail: str = ""
+    upload: dict[str, Any] = field(default_factory=dict)
+    result: dict[str, Any] | None = None
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "ok": self.state == "succeeded",
+            "job_id": self.job_id,
+            "request_id": self.request_id,
+            "state": self.state,
+            "profile": self.profile,
+            "mode": self.mode,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "returncode": self.returncode,
+            "error": self.error,
+            "stderr_tail": self.stderr_tail,
+            "upload": dict(self.upload),
+            "result": dict(self.result) if self.result is not None else None,
+        }
+
+
+class ProcessingJobManager:
+    def __init__(self, *, max_tail_chars: int = TAIL_LIMIT) -> None:
+        self.max_tail_chars = int(max_tail_chars)
+        self._jobs: dict[str, ProcessingJob] = {}
+        self._lock = threading.Lock()
+
+    def enqueue(
+        self,
+        *,
+        profile: ObjectProfile,
+        request_id: str | None,
+        mode: str,
+        upload: dict[str, Any],
+        processor: Callable[[], dict[str, Any]],
+    ) -> ProcessingJob:
+        job = ProcessingJob(
+            job_id=uuid.uuid4().hex,
+            profile=profile.name,
+            request_id=request_id,
+            mode=mode,
+            upload=dict(upload),
+        )
+        with self._lock:
+            self._jobs[job.job_id] = job
+        thread = threading.Thread(target=self._run, args=(job, processor), daemon=True)
+        thread.start()
+        return job
+
+    def get(self, job_id: str) -> ProcessingJob | None:
+        with self._lock:
+            return self._jobs.get(job_id)
+
+    def _run(self, job: ProcessingJob, processor: Callable[[], dict[str, Any]]) -> None:
+        job.state = "running"
+        job.started_at = time.time()
+        try:
+            result = processor()
+            job.result = result
+            job.returncode = int(result.get("returncode", 0))
+            job.state = "succeeded"
+        except Exception as exc:
+            job.state = "failed"
+            job.returncode = 1
+            job.error = str(exc)
+            job.stderr_tail = _tail(traceback.format_exc(), self.max_tail_chars)
+        finally:
+            job.completed_at = time.time()
 
 
 @dataclass(frozen=True)
@@ -217,14 +319,18 @@ class FoundationPoseV2Service:
         registry: ObjectProfileRegistry | None = None,
         builder_factory: Callable[[str | Path], FoundationPoseAssetBuilder] | None = None,
         tracker_factory: Callable[[ObjectProfile, Path, FoundationPoseTrackRequest], Any] | None = None,
+        processing_runner: Callable[[ObjectProfile, dict[str, Any]], dict[str, Any]] | None = None,
         job_manager: BuildJobManager | None = None,
+        processing_job_manager: ProcessingJobManager | None = None,
         tracker_sessions: TrackerSessionManager | None = None,
     ) -> None:
         self.registry = registry or ObjectProfileRegistry()
         self.builder_factory = builder_factory or (
             lambda foundationpose_root: FoundationPoseAssetBuilder(foundationpose_root=foundationpose_root)
         )
+        self.processing_runner = processing_runner
         self.job_manager = job_manager or BuildJobManager()
+        self.processing_job_manager = processing_job_manager or ProcessingJobManager()
         self.tracker_sessions = tracker_sessions or TrackerSessionManager(tracker_factory=tracker_factory)
 
     def health(self) -> dict[str, Any]:
@@ -262,6 +368,50 @@ class FoundationPoseV2Service:
         job = self.job_manager.get(job_id)
         if job is None:
             return 404, {"ok": False, "status": "error", "reason": f"unknown build job: {job_id}"}
+        return 200, job.payload()
+
+    def process_recordings_archive(
+        self,
+        *,
+        archive: bytes,
+        request_id: str | None = None,
+        profile_name: str | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            options, upload = _extract_recordings_archive(
+                self.registry,
+                archive,
+                profile_name=profile_name,
+            )
+            profile = self.registry.create(
+                str(options["profile"]),
+                prompt=str(options.get("prompt") or "object"),
+                exist_ok=True,
+            )
+        except Exception as exc:
+            return 400, {"ok": False, "status": "error", "reason": str(exc)}
+        mode = "reselect_recordings" if bool(options.get("reselect")) else "process_recordings"
+        request_id = request_id or str(options.get("request_id") or "")
+        job = self.processing_job_manager.enqueue(
+            profile=profile,
+            request_id=request_id,
+            mode=mode,
+            upload=upload,
+            processor=lambda: self._run_recording_processing(profile.name, options),
+        )
+        return 202, {
+            "ok": True,
+            "status": "queued",
+            "job_id": job.job_id,
+            "profile": profile.name,
+            "mode": mode,
+            "upload": upload,
+        }
+
+    def process_recordings_status(self, job_id: str) -> tuple[int, dict[str, Any]]:
+        job = self.processing_job_manager.get(job_id)
+        if job is None:
+            return 404, {"ok": False, "status": "error", "reason": f"unknown processing job: {job_id}"}
         return 200, job.payload()
 
     def track(self, request: FoundationPoseTrackRequest) -> tuple[int, dict[str, Any]]:
@@ -333,11 +483,59 @@ class FoundationPoseV2Service:
         except FileNotFoundError as exc:
             raise UnknownProfileError(str(exc)) from exc
 
+    def _run_recording_processing(self, profile_name: str, options: dict[str, Any]) -> dict[str, Any]:
+        profile = self.registry.get(profile_name)
+        if self.processing_runner is not None:
+            return self.processing_runner(profile, options)
+        board_spec = _board_spec_from_options(options.get("board_spec"))
+        quality_config = _quality_config_from_options(options.get("quality_config"))
+        board_object = _board_object_from_options(options.get("board_object"))
+        detector_preset = (
+            options.get("charuco_detector_preset")
+            or options.get("detector_preset")
+            or CHARUCO_DETECTOR_PRESET_CONSERVATIVE
+        )
+        detector_config = CharucoDetectorConfig(str(detector_preset))
+        config = _processing_config_from_options(options)
+        if bool(options.get("reselect")):
+            report = reselect_recorded_references(
+                profile,
+                board_spec=board_spec,
+                quality_config=quality_config,
+                board_object=board_object,
+                config=config,
+                detector_config=detector_config,
+            )
+            mode = "reselect_recordings"
+        else:
+            provider = Sam3MaskProvider(
+                prompt=str(options.get("prompt") or profile.prompt),
+                device=str(options.get("sam_device") or options.get("device") or "auto"),
+                confidence_threshold=float(options.get("sam_threshold", options.get("threshold", 0.3))),
+                resolution=int(options.get("sam_resolution", 1008)),
+            )
+            report = process_recorded_references(
+                profile,
+                mask_provider=provider,
+                board_spec=board_spec,
+                quality_config=quality_config,
+                board_object=board_object,
+                config=config,
+                detector_config=detector_config,
+            )
+            mode = "process_recordings"
+        payload = report.to_dict()
+        payload["ok"] = report.ok
+        payload["returncode"] = 0 if int(report.accepted) > 0 else 1
+        payload["mode"] = mode
+        payload["detector_preset"] = detector_config.preset
+        return payload
+
 
 def make_handler(
     service: FoundationPoseV2Service,
     *,
-    max_content_length: int = DEFAULT_MAX_CONTENT_LENGTH,
+    max_content_length: int = SERVER_DEFAULT_MAX_CONTENT_LENGTH,
 ):
     class FoundationPoseV2Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
@@ -352,11 +550,22 @@ def make_handler(
                 status_code, payload = service.build_status(job_id)
                 self._send_json(status_code, payload)
                 return
+            if self.path.startswith(PROCESS_RECORDINGS_STATUS_PREFIX):
+                job_id = self.path[len(PROCESS_RECORDINGS_STATUS_PREFIX) :].strip("/")
+                if not job_id:
+                    self._send_json(404, {"ok": False, "status": "error", "reason": "missing job_id"})
+                    return
+                status_code, payload = service.process_recordings_status(job_id)
+                self._send_json(status_code, payload)
+                return
             self._send_json(404, {"ok": False, "status": "error", "reason": "not found"})
 
         def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
             if self.path == BUILD_PATH:
                 self._handle_build()
+                return
+            if self.path == PROCESS_RECORDINGS_PATH:
+                self._handle_process_recordings()
                 return
             if self.path == TRACK_PATH:
                 self._handle_track()
@@ -380,6 +589,23 @@ def make_handler(
                 self._send_json(400, {"ok": False, "status": "error", "reason": str(exc)})
                 return
             status_code, response = service.build_assets(payload)
+            self._send_json(status_code, response)
+
+        def _handle_process_recordings(self) -> None:
+            content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip()
+            if content_type != RECORDINGS_ZIP_CONTENT_TYPE:
+                self._send_json(415, {"ok": False, "status": "error", "reason": "unsupported content type"})
+                return
+            try:
+                body = self._read_body()
+            except Exception as exc:
+                self._send_json(400, {"ok": False, "status": "error", "reason": str(exc)})
+                return
+            status_code, response = service.process_recordings_archive(
+                archive=body,
+                request_id=self.headers.get("X-FoundationPose-Request-Id"),
+                profile_name=self.headers.get("X-FoundationPose-Profile"),
+            )
             self._send_json(status_code, response)
 
         def _handle_track(self) -> None:
@@ -421,6 +647,125 @@ def make_handler(
     return FoundationPoseV2Handler
 
 
+def _extract_recordings_archive(
+    registry: ObjectProfileRegistry,
+    archive: bytes,
+    *,
+    profile_name: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    try:
+        zip_buffer = io.BytesIO(archive)
+        with zipfile.ZipFile(zip_buffer) as zf:
+            options = _processing_options_from_zip(zf)
+            profile_name = str(profile_name or options.get("profile") or "").strip()
+            if not profile_name:
+                raise ValueError("processing archive must include a profile")
+            options["profile"] = profile_name
+            profile = registry.create(
+                profile_name,
+                prompt=str(options.get("prompt") or "object"),
+                exist_ok=True,
+            )
+            upload = _extract_recording_members(zf, profile)
+    except zipfile.BadZipFile as exc:
+        raise ValueError("recordings upload must be a valid zip archive") from exc
+    if int(upload.get("file_count", 0)) <= 0:
+        raise ValueError("recordings archive did not contain recording files")
+    return options, upload
+
+
+def _processing_options_from_zip(zf: zipfile.ZipFile) -> dict[str, Any]:
+    if PROCESSING_REQUEST_JSON not in zf.namelist():
+        return {}
+    payload = json.loads(zf.read(PROCESSING_REQUEST_JSON).decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"{PROCESSING_REQUEST_JSON} must contain a JSON object")
+    return payload
+
+
+def _extract_recording_members(zf: zipfile.ZipFile, profile: ObjectProfile) -> dict[str, Any]:
+    profile.root.mkdir(parents=True, exist_ok=True)
+    session_ids: set[str] = set()
+    file_count = 0
+    uncompressed_bytes = 0
+    for member in zf.infolist():
+        if member.is_dir() or member.filename == PROCESSING_REQUEST_JSON:
+            continue
+        parts = Path(member.filename).parts
+        if len(parts) < 3 or parts[0] != RECORDINGS_DIR:
+            raise ValueError(f"unsupported archive member: {member.filename}")
+        if any(part in {"", ".", ".."} for part in parts) or Path(member.filename).is_absolute():
+            raise ValueError(f"unsafe archive member: {member.filename}")
+        target = profile.root.joinpath(*parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with zf.open(member) as source, target.open("wb") as output:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+        session_ids.add(parts[1])
+        file_count += 1
+        uncompressed_bytes += int(member.file_size)
+    profile.touch()
+    profile.save()
+    return {
+        "session_count": len(session_ids),
+        "session_ids": sorted(session_ids),
+        "file_count": file_count,
+        "uncompressed_bytes": uncompressed_bytes,
+    }
+
+
+def _board_spec_from_options(value: Any) -> CharucoBoardSpec:
+    data = dict(value) if isinstance(value, dict) else {}
+    return CharucoBoardSpec(
+        squares_x=int(data.get("squares_x", 5)),
+        squares_y=int(data.get("squares_y", 8)),
+        square_length_m=float(data.get("square_length_m", 0.030)),
+        marker_length_m=float(data.get("marker_length_m", 0.022)),
+        dictionary=str(data.get("dictionary", "auto")),
+        legacy_pattern=bool(data.get("legacy_pattern", False)),
+    )
+
+
+def _quality_config_from_options(value: Any) -> CharucoQualityConfig:
+    data = dict(value) if isinstance(value, dict) else {}
+    return CharucoQualityConfig(
+        min_corners=int(data.get("min_corners", 6)),
+        min_markers=int(data.get("min_markers", 2)),
+        max_reprojection_error_px=float(data.get("max_reprojection_error_px", 4.0)),
+        min_image_coverage_fraction=float(data.get("min_image_coverage_fraction", 0.005)),
+    )
+
+
+def _board_object_from_options(value: Any) -> BoardObjectTransform:
+    data = dict(value) if isinstance(value, dict) else {}
+    matrix = data.get("board_T_object", data.get("matrix"))
+    if matrix is None:
+        return BoardObjectTransform.identity()
+    xyz = data.get("xyz_m")
+    rpy = data.get("rpy_deg")
+    return BoardObjectTransform(
+        np.asarray(matrix, dtype=np.float64),
+        source=str(data.get("source") or "remote_processing_options"),
+        xyz_m=tuple(float(v) for v in xyz) if isinstance(xyz, (list, tuple)) else None,
+        rpy_deg=tuple(float(v) for v in rpy) if isinstance(rpy, (list, tuple)) else None,
+    )
+
+
+def _processing_config_from_options(options: dict[str, Any]) -> ReferenceProcessingConfig:
+    return ReferenceProcessingConfig(
+        required_keyframes=int(options.get("required_keyframes", 16)),
+        max_keyframes=int(options.get("max_keyframes", 32)),
+        min_mask_area_fraction=float(options.get("min_mask_area_fraction", 0.0005)),
+        min_valid_depth_ratio=float(options.get("min_valid_depth_ratio", 0.05)),
+        min_depth_m=float(options.get("min_depth_m", 0.05)),
+        max_depth_m=float(options.get("max_depth_m", 3.0)),
+        publish=not bool(options.get("evaluate_only", False)),
+    )
+
+
 def recovery_config_from_options(options: dict[str, Any]) -> TrackingRecoveryConfig:
     return TrackingRecoveryConfig(
         hold_last_pose_frames=int(options.get("hold_last_pose_frames", 0)),
@@ -454,7 +799,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8081)
     parser.add_argument("--data-root")
-    parser.add_argument("--max-content-length", type=int, default=DEFAULT_MAX_CONTENT_LENGTH)
+    parser.add_argument("--max-content-length", type=int, default=SERVER_DEFAULT_MAX_CONTENT_LENGTH)
     return parser.parse_args(argv)
 
 

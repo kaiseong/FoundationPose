@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import io
 import inspect
+import json
 from pathlib import Path
 import sys
+import zipfile
 
 from visual_servoing.foundationpose_model_free.gui_app import (
     BackgroundCommandRunner,
     FoundationPoseWorkflowGui,
     GuiCommandBuilder,
     GuiConfig,
+    create_recordings_archive,
+    remote_build_assets,
+    remote_process_recordings,
     resolve_gui_config,
 )
 
@@ -300,6 +306,10 @@ def test_gui_source_contains_remote_connect_state_flow():
     connect_source = inspect.getsource(FoundationPoseWorkflowGui.connect_remote_server)
     poll_source = inspect.getsource(FoundationPoseWorkflowGui._poll_queues)
     command_source = inspect.getsource(FoundationPoseWorkflowGui.run_tracking)
+    build_command_source = inspect.getsource(FoundationPoseWorkflowGui.run_build_assets)
+    force_build_source = inspect.getsource(FoundationPoseWorkflowGui.run_force_build_assets)
+    processing_source = inspect.getsource(FoundationPoseWorkflowGui.run_recording_processing)
+    reselect_source = inspect.getsource(FoundationPoseWorkflowGui.run_recording_reselect)
     done_source = inspect.getsource(FoundationPoseWorkflowGui._handle_command_event)
 
     assert 'text="Server"' in build_source
@@ -308,7 +318,141 @@ def test_gui_source_contains_remote_connect_state_flow():
     assert "threading.Thread" in connect_source
     assert "remote_events" in poll_source
     assert "track_remote_live" in command_source
+    assert "_start_remote_build" in build_command_source
+    assert "_start_remote_build" in force_build_source
+    assert build_command_source.index("_start_remote_build") < build_command_source.index("latest_processing_report")
+    assert "_start_remote_processing" in processing_source
+    assert "_start_remote_processing" in reselect_source
+    assert processing_source.index("_start_remote_processing") < processing_source.index("_charuco_command")
     assert "Disconnected" in done_source
+
+
+def test_remote_build_assets_posts_to_server_and_polls_job(monkeypatch):
+    calls = []
+    responses = [
+        {"ok": True, "status": "queued", "job_id": "job-1", "profile": "mouse"},
+        {"ok": False, "state": "running", "job_id": "job-1", "profile": "mouse"},
+        {"ok": True, "state": "succeeded", "job_id": "job-1", "profile": "mouse"},
+    ]
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(self.payload).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        calls.append((request, timeout))
+        return FakeResponse(responses.pop(0))
+
+    monkeypatch.setattr(
+        "visual_servoing.foundationpose_model_free.gui_app.urllib_request.urlopen",
+        fake_urlopen,
+    )
+
+    result = remote_build_assets(
+        host="192.168.0.3",
+        port=8081,
+        profile="mouse",
+        foundationpose_root="/home/kgs/FoundationPose",
+        execute=True,
+        poll_interval_s=0.0,
+        max_wait_s=1.0,
+    )
+
+    assert result["state"] == "succeeded"
+    post_request = calls[0][0]
+    assert post_request.full_url == "http://192.168.0.3:8081/foundationpose/v2/assets/build"
+    posted = json.loads(post_request.data.decode("utf-8"))
+    assert posted["profile"] == "mouse"
+    assert posted["foundationpose_root"] == "/home/kgs/FoundationPose"
+    assert posted["execute"] is True
+    assert calls[1][0] == "http://192.168.0.3:8081/foundationpose/v2/assets/build/job-1"
+    assert calls[2][0] == "http://192.168.0.3:8081/foundationpose/v2/assets/build/job-1"
+
+
+def test_create_recordings_archive_includes_request_and_sessions(tmp_path):
+    profile_root = tmp_path / "object_profiles" / "meter"
+    session_dir = profile_root / "recordings" / "session-1"
+    session_dir.mkdir(parents=True)
+    (session_dir / "session.json").write_text("{}", encoding="utf-8")
+    (session_dir / "frames.jsonl").write_text("", encoding="utf-8")
+
+    archive, summary = create_recordings_archive(
+        profile_root,
+        request_payload={"profile": "meter", "prompt": "multimeter"},
+    )
+
+    assert summary["session_count"] == 1
+    with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+        names = set(zf.namelist())
+        payload = json.loads(zf.read("foundationpose_processing_request.json").decode("utf-8"))
+    assert payload["profile"] == "meter"
+    assert "recordings/session-1/session.json" in names
+    assert "recordings/session-1/frames.jsonl" in names
+
+
+def test_remote_process_recordings_posts_zip_and_polls_job(monkeypatch):
+    calls = []
+    responses = [
+        {"ok": True, "status": "queued", "job_id": "job-1", "profile": "meter"},
+        {"ok": False, "state": "running", "job_id": "job-1", "profile": "meter"},
+        {
+            "ok": True,
+            "state": "succeeded",
+            "job_id": "job-1",
+            "profile": "meter",
+            "result": {"readiness": "ready", "accepted": 16},
+        },
+    ]
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(self.payload).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        calls.append((request, timeout))
+        return FakeResponse(responses.pop(0))
+
+    monkeypatch.setattr(
+        "visual_servoing.foundationpose_model_free.gui_app.urllib_request.urlopen",
+        fake_urlopen,
+    )
+
+    result = remote_process_recordings(
+        host="192.168.0.3",
+        port=8081,
+        profile="meter",
+        archive=b"zip-bytes",
+        poll_interval_s=0.0,
+        max_wait_s=1.0,
+    )
+
+    assert result["state"] == "succeeded"
+    post_request = calls[0][0]
+    assert post_request.full_url == "http://192.168.0.3:8081/foundationpose/v2/recordings/process"
+    assert post_request.data == b"zip-bytes"
+    headers = dict(post_request.header_items())
+    assert headers["Content-type"] == "application/x-foundationpose-recordings+zip"
+    assert headers["X-foundationpose-profile"] == "meter"
+    assert calls[1][0] == "http://192.168.0.3:8081/foundationpose/v2/recordings/process/job-1"
+    assert calls[2][0] == "http://192.168.0.3:8081/foundationpose/v2/recordings/process/job-1"
 
 
 def test_gui_resolves_and_passes_default_data_root(tmp_path, monkeypatch):

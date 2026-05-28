@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import argparse
+import io
 import json
 import os
 from pathlib import Path
@@ -11,11 +12,13 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import Callable
 from urllib import error as urllib_error
 from urllib import request as urllib_request
+import zipfile
 
 from visual_servoing.common.paths import data_root
 from visual_servoing.point_pose.live_camera_config import (
@@ -69,6 +72,12 @@ DEFAULT_CAMERA_RESOLUTIONS = {
     "zed": (672, 376),
 }
 RECORDING_PREVIEW_WINDOW = "Reference Recording Preview"
+REMOTE_BUILD_POLL_INTERVAL_S = 2.0
+REMOTE_BUILD_TIMEOUT_S = 60.0 * 60.0
+REMOTE_PROCESS_POLL_INTERVAL_S = 2.0
+REMOTE_PROCESS_TIMEOUT_S = 60.0 * 60.0
+RECORDINGS_ZIP_CONTENT_TYPE = "application/x-foundationpose-recordings+zip"
+PROCESSING_REQUEST_JSON = "foundationpose_processing_request.json"
 
 
 class GuiCommandBuilder:
@@ -792,6 +801,9 @@ class FoundationPoseWorkflowGui:
         profile = self._current_profile()
         if not self._release_live_sessions_for_gpu():
             return
+        if self.remote_state.get() == "Remote":
+            self._start_remote_processing(profile=profile, reselect=False)
+            return
         self._start_command(self._charuco_command(profile, mode="process-recordings"))
 
     def run_recording_reselect(self) -> None:
@@ -801,6 +813,9 @@ class FoundationPoseWorkflowGui:
             return
         profile = self._current_profile()
         if not self._release_live_sessions_for_gpu():
+            return
+        if self.remote_state.get() == "Remote":
+            self._start_remote_processing(profile=profile, reselect=True)
             return
         self._start_command(self._charuco_command(profile, mode="reselect-recordings"))
 
@@ -828,6 +843,9 @@ class FoundationPoseWorkflowGui:
     def run_build_assets(self, execute: bool) -> None:
         profile = self._current_profile()
         if not self._release_live_sessions_for_gpu():
+            return
+        if self.remote_state.get() == "Remote":
+            self._start_remote_build(profile_name=profile.name, execute=execute)
             return
         report = latest_processing_report(profile)
         if not report:
@@ -857,6 +875,9 @@ class FoundationPoseWorkflowGui:
         if not messagebox.askyesno("Force Build", f"Build assets despite quality warning?\n\n{reason}"):
             return
         if not self._release_live_sessions_for_gpu():
+            return
+        if self.remote_state.get() == "Remote":
+            self._start_remote_build(profile_name=profile.name, execute=True)
             return
         self._start_command(
             self.command_builder.build_assets(
@@ -910,6 +931,98 @@ class FoundationPoseWorkflowGui:
                 data_root=self.config.data_root,
             )
         )
+
+    def _start_remote_processing(self, *, profile, reselect: bool) -> None:
+        host = self.server_host.get().strip()
+        port = int(self.server_port.get())
+        options = self._remote_processing_options(profile_name=profile.name, reselect=reselect)
+        self.status.set("Uploading recordings for remote processing")
+        thread = threading.Thread(
+            target=self._remote_processing_worker,
+            args=(host, port, profile.name, str(profile.root), options),
+            daemon=True,
+        )
+        thread.start()
+
+    def _remote_processing_worker(
+        self,
+        host: str,
+        port: int,
+        profile_name: str,
+        profile_root: str,
+        options: dict,
+    ) -> None:
+        try:
+            archive, upload = create_recordings_archive(profile_root, request_payload=options)
+            payload = remote_process_recordings(
+                host=host,
+                port=port,
+                profile=profile_name,
+                archive=archive,
+                timeout_s=10.0,
+                poll_interval_s=REMOTE_PROCESS_POLL_INTERVAL_S,
+                max_wait_s=REMOTE_PROCESS_TIMEOUT_S,
+            )
+        except Exception as exc:
+            self.remote_events.put(RemoteHealthEvent("Disconnected", f"Remote processing failed: {exc}"))
+            return
+        state = str(payload.get("state") or payload.get("status") or "unknown")
+        result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+        if state == "succeeded":
+            readiness = result.get("readiness", "unknown")
+            accepted = result.get("accepted", 0)
+            required = result.get("required_keyframes", options.get("required_keyframes", "?"))
+            sessions = upload.get("session_count", 0)
+            self.remote_events.put(
+                RemoteHealthEvent(
+                    "Remote",
+                    f"Remote processing {readiness}: accepted={accepted}/{required}, uploaded_sessions={sessions}",
+                )
+            )
+        else:
+            reason = payload.get("error") or payload.get("reason") or payload.get("stderr_tail") or state
+            self.remote_events.put(RemoteHealthEvent("Remote", f"Remote processing {state}: {reason}"))
+
+    def _start_remote_build(self, *, profile_name: str, execute: bool) -> None:
+        host = self.server_host.get().strip()
+        port = int(self.server_port.get())
+        foundationpose_root = self.foundationpose_root.get()
+        self.status.set("Requesting remote asset build")
+        thread = threading.Thread(
+            target=self._remote_build_worker,
+            args=(host, port, profile_name, foundationpose_root, bool(execute)),
+            daemon=True,
+        )
+        thread.start()
+
+    def _remote_build_worker(
+        self,
+        host: str,
+        port: int,
+        profile_name: str,
+        foundationpose_root: str,
+        execute: bool,
+    ) -> None:
+        try:
+            payload = remote_build_assets(
+                host=host,
+                port=port,
+                profile=profile_name,
+                foundationpose_root=foundationpose_root,
+                execute=execute,
+                timeout_s=10.0,
+                poll_interval_s=REMOTE_BUILD_POLL_INTERVAL_S,
+                max_wait_s=REMOTE_BUILD_TIMEOUT_S,
+            )
+        except Exception as exc:
+            self.remote_events.put(RemoteHealthEvent("Disconnected", f"Remote build failed: {exc}"))
+            return
+        state = str(payload.get("state") or payload.get("status") or "unknown")
+        if payload.get("ok") is True:
+            self.remote_events.put(RemoteHealthEvent("Remote", f"Remote build {state}: {profile_name}"))
+        else:
+            reason = payload.get("error") or payload.get("reason") or payload.get("stderr_tail") or state
+            self.remote_events.put(RemoteHealthEvent("Remote", f"Remote build {state}: {reason}"))
 
     def reinitialize_tracking_event(self, event=None) -> None:
         if self.runner.running:
@@ -1147,6 +1260,23 @@ class FoundationPoseWorkflowGui:
             ),
         )
 
+    def _remote_processing_options(self, *, profile_name: str, reselect: bool) -> dict:
+        return {
+            "profile": profile_name,
+            "prompt": self.prompt.get(),
+            "reselect": bool(reselect),
+            "board_spec": self._current_board_spec().to_dict(),
+            "board_object": self._current_board_object().to_dict(),
+            "charuco_detector_preset": CHARUCO_DETECTOR_PRESET_CONSERVATIVE,
+            "sam_device": self.sam_device.get(),
+            "sam_resolution": int(self.sam_resolution.get()),
+            "sam_threshold": 0.3,
+            "required_keyframes": int(self.reference_target.get()),
+            "max_keyframes": int(self.max_keyframes.get()),
+            "min_mask_area_fraction": 0.0005,
+            "min_valid_depth_ratio": 0.05,
+        }
+
     def _append_log(self, text: str) -> None:
         self.log_text.configure(state="normal")
         self.log_text.insert(tk.END, text + "\n")
@@ -1265,6 +1395,145 @@ def check_remote_health(*, host: str, port: int, timeout_s: float = 2.0) -> dict
     decoded = json.loads(payload.decode("utf-8"))
     if not isinstance(decoded, dict):
         raise RuntimeError("health response must be a JSON object")
+    return decoded
+
+
+def remote_build_assets(
+    *,
+    host: str,
+    port: int,
+    profile: str,
+    foundationpose_root: str,
+    execute: bool,
+    timeout_s: float = 10.0,
+    poll_interval_s: float = REMOTE_BUILD_POLL_INTERVAL_S,
+    max_wait_s: float = REMOTE_BUILD_TIMEOUT_S,
+) -> dict:
+    base_url = f"http://{host}:{int(port)}/foundationpose/v2"
+    request_id = f"gui-build-{time.monotonic_ns()}"
+    payload = {
+        "request_id": request_id,
+        "profile": profile,
+        "foundationpose_root": foundationpose_root,
+        "execute": bool(execute),
+    }
+    initial = _post_json(f"{base_url}/assets/build", payload, timeout_s=timeout_s)
+    job_id = initial.get("job_id")
+    if not execute or not job_id:
+        return initial
+    deadline = time.monotonic() + float(max_wait_s)
+    while True:
+        status = _get_json(f"{base_url}/assets/build/{job_id}", timeout_s=timeout_s)
+        if status.get("state") in {"succeeded", "failed"}:
+            return status
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"remote build timed out: job_id={job_id}")
+        time.sleep(float(poll_interval_s))
+
+
+def create_recordings_archive(profile_root: str | Path, *, request_payload: dict) -> tuple[bytes, dict]:
+    profile_root = Path(profile_root).expanduser()
+    recordings_root = profile_root / "recordings"
+    session_dirs = []
+    if recordings_root.exists():
+        session_dirs = [
+            path
+            for path in sorted(recordings_root.iterdir())
+            if path.is_dir() and (path / "session.json").exists()
+        ]
+    if not session_dirs:
+        raise RuntimeError("No recording sessions found; run Start Recording first")
+    buffer = io.BytesIO()
+    file_count = 0
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(PROCESSING_REQUEST_JSON, json.dumps(request_payload, sort_keys=True).encode("utf-8"))
+        for session_dir in session_dirs:
+            for path in sorted(session_dir.rglob("*")):
+                if not path.is_file():
+                    continue
+                zf.write(path, path.relative_to(profile_root).as_posix())
+                file_count += 1
+    return buffer.getvalue(), {
+        "session_count": len(session_dirs),
+        "session_ids": [path.name for path in session_dirs],
+        "file_count": file_count,
+    }
+
+
+def remote_process_recordings(
+    *,
+    host: str,
+    port: int,
+    profile: str,
+    archive: bytes,
+    timeout_s: float = 10.0,
+    poll_interval_s: float = REMOTE_PROCESS_POLL_INTERVAL_S,
+    max_wait_s: float = REMOTE_PROCESS_TIMEOUT_S,
+) -> dict:
+    base_url = f"http://{host}:{int(port)}/foundationpose/v2"
+    request_id = f"gui-process-{time.monotonic_ns()}"
+    initial = _post_bytes(
+        f"{base_url}/recordings/process",
+        archive,
+        timeout_s=timeout_s,
+        headers={
+            "Content-Type": RECORDINGS_ZIP_CONTENT_TYPE,
+            "X-FoundationPose-Request-Id": request_id,
+            "X-FoundationPose-Profile": profile,
+        },
+    )
+    job_id = initial.get("job_id")
+    if not job_id:
+        return initial
+    deadline = time.monotonic() + float(max_wait_s)
+    while True:
+        status = _get_json(f"{base_url}/recordings/process/{job_id}", timeout_s=timeout_s)
+        if status.get("state") in {"succeeded", "failed"}:
+            return status
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"remote processing timed out: job_id={job_id}")
+        time.sleep(float(poll_interval_s))
+
+
+def _post_json(url: str, payload: dict, *, timeout_s: float) -> dict:
+    request = urllib_request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=float(timeout_s)) as response:
+            raw = response.read()
+    except urllib_error.URLError as exc:
+        raise RuntimeError(str(exc)) from exc
+    decoded = json.loads(raw.decode("utf-8"))
+    if not isinstance(decoded, dict):
+        raise RuntimeError("remote build response must be a JSON object")
+    return decoded
+
+
+def _post_bytes(url: str, body: bytes, *, timeout_s: float, headers: dict[str, str]) -> dict:
+    request = urllib_request.Request(url, data=body, headers=dict(headers))
+    try:
+        with urllib_request.urlopen(request, timeout=float(timeout_s)) as response:
+            raw = response.read()
+    except urllib_error.URLError as exc:
+        raise RuntimeError(str(exc)) from exc
+    decoded = json.loads(raw.decode("utf-8"))
+    if not isinstance(decoded, dict):
+        raise RuntimeError("remote response must be a JSON object")
+    return decoded
+
+
+def _get_json(url: str, *, timeout_s: float) -> dict:
+    try:
+        with urllib_request.urlopen(url, timeout=float(timeout_s)) as response:
+            raw = response.read()
+    except urllib_error.URLError as exc:
+        raise RuntimeError(str(exc)) from exc
+    decoded = json.loads(raw.decode("utf-8"))
+    if not isinstance(decoded, dict):
+        raise RuntimeError("remote status response must be a JSON object")
     return decoded
 
 

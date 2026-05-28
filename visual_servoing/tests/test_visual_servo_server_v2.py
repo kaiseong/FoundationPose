@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
+import io
 import json
 import threading
 import time
 from urllib import error as urllib_error
 from urllib import request as urllib_request
+import zipfile
 
 import numpy as np
 
@@ -22,6 +24,7 @@ from visual_servoing.visual_servo_protocol_v2 import (
     encode_foundationpose_track_request,
 )
 from visual_servoing.visual_servo_server_v2 import FoundationPoseV2Service, make_handler, mesh_identity
+from visual_servoing.visual_servo_server_v2 import RECORDINGS_ZIP_CONTENT_TYPE
 
 
 class FakeBuilder:
@@ -75,6 +78,21 @@ class FakeTracker:
         )
 
 
+def fake_processing_runner(profile, options):
+    assert options["profile"] == profile.name
+    assert (profile.root / "recordings" / "session-1" / "session.json").exists()
+    return {
+        "ok": True,
+        "returncode": 0,
+        "mode": "process_recordings",
+        "object": profile.name,
+        "readiness": "ready",
+        "accepted": 3,
+        "required_keyframes": int(options["required_keyframes"]),
+        "detector_preset": options["charuco_detector_preset"],
+    }
+
+
 def _serve(service):
     server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(service))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -122,6 +140,26 @@ def _track_body(*, profile="phone", t5_T_camera=None, **metadata):
         recovery_options=metadata.pop("recovery_options", {}),
         metadata=metadata,
     )
+
+
+def _recordings_archive(*, profile="phone"):
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "foundationpose_processing_request.json",
+            json.dumps(
+                {
+                    "profile": profile,
+                    "prompt": "multimeter",
+                    "required_keyframes": 3,
+                    "max_keyframes": 8,
+                    "charuco_detector_preset": "conservative-charuco",
+                }
+            ),
+        )
+        zf.writestr("recordings/session-1/session.json", "{}")
+        zf.writestr("recordings/session-1/frames.jsonl", "")
+    return buffer.getvalue()
 
 
 def test_health_endpoint_returns_protocol_version(tmp_path):
@@ -209,6 +247,43 @@ def test_build_missing_fields_and_unknown_profile(tmp_path):
     )
     assert status == 404
     assert "Object profile not found" in payload["reason"]
+
+
+def test_process_recordings_upload_creates_profile_and_polls_job(tmp_path):
+    registry = ObjectProfileRegistry(tmp_path)
+    service = FoundationPoseV2Service(
+        registry=registry,
+        builder_factory=FakeBuilder,
+        processing_runner=fake_processing_runner,
+    )
+    server, thread, base_url = _serve(service)
+    try:
+        run_status, run_payload = _post(
+            f"{base_url}/foundationpose/v2/recordings/process",
+            _recordings_archive(profile="meter"),
+            RECORDINGS_ZIP_CONTENT_TYPE,
+        )
+        job_id = run_payload["job_id"]
+        status_payload = None
+        for _ in range(20):
+            with urllib_request.urlopen(
+                f"{base_url}/foundationpose/v2/recordings/process/{job_id}", timeout=2.0
+            ) as response:
+                status_payload = decode_foundationpose_response(response.read())
+            if status_payload["state"] in {"succeeded", "failed"}:
+                break
+            time.sleep(0.02)
+    finally:
+        _stop(server, thread)
+
+    assert run_status == 202
+    assert run_payload["profile"] == "meter"
+    assert run_payload["upload"]["session_count"] == 1
+    assert (registry.root / "meter" / "recordings" / "session-1" / "session.json").exists()
+    assert status_payload is not None
+    assert status_payload["state"] == "succeeded"
+    assert status_payload["result"]["readiness"] == "ready"
+    assert status_payload["result"]["accepted"] == 3
 
 
 def test_track_rejects_bad_content_type(tmp_path):
