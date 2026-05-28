@@ -496,6 +496,7 @@ class FoundationPoseWorkflowGui:
         self._capture_preview_images: tuple[tk.PhotoImage, ...] | None = None
         self._pending_axis_preview_path: Path | None = None
         self._active_remote_command = False
+        self._last_tracking_mode = "local"
 
         self.root = tk.Tk()
         self.root.title(self.config.title)
@@ -682,9 +683,10 @@ class FoundationPoseWorkflowGui:
         ttk.Spinbox(build, from_=1, to=10, textvariable=self.refine_iterations, width=5).grid(row=0, column=4)
         ttk.Label(build, text="Track iters").grid(row=0, column=5)
         ttk.Spinbox(build, from_=1, to=10, textvariable=self.track_iterations, width=5).grid(row=0, column=6)
-        ttk.Button(build, text="Track Live", command=self.run_tracking).grid(row=1, column=0)
-        ttk.Button(build, text="Reinit Tracking", command=self.reinitialize_tracking_event).grid(row=1, column=1)
-        ttk.Button(build, text="Stop Command", command=self.stop_command).grid(row=1, column=2)
+        ttk.Button(build, text="Track Local", command=self.run_tracking_local).grid(row=1, column=0)
+        ttk.Button(build, text="Track Remote", command=self.run_tracking_remote).grid(row=1, column=1)
+        ttk.Button(build, text="Reinit Tracking", command=self.reinitialize_tracking_event).grid(row=1, column=2)
+        ttk.Button(build, text="Stop Command", command=self.stop_command).grid(row=1, column=3)
 
         logs = ttk.LabelFrame(stages, text="Status / Logs", padding=6)
         logs.grid(row=4, column=0, sticky="nsew", pady=(8, 0))
@@ -995,31 +997,13 @@ class FoundationPoseWorkflowGui:
         )
 
     def run_tracking(self) -> None:
+        self.run_tracking_local()
+
+    def run_tracking_local(self) -> None:
         profile = self._current_profile()
         if not self._release_live_sessions_for_gpu():
             return
-        if self.remote_state.get() == "Remote":
-            self._start_command(
-                self.command_builder.track_remote_live(
-                    server_host=self.server_host.get().strip(),
-                    server_port=int(self.server_port.get()),
-                    object_name=profile.name,
-                    prompt=self.prompt.get(),
-                    foundationpose_root=self.foundationpose_root.get(),
-                    auto_reinit=bool(self.auto_reinit.get()),
-                    auto_reinit_after_lost_frames=int(self.auto_reinit_after.get()),
-                    camera_model=self.camera_model.get(),
-                    serial=self.camera_serial.get(),
-                    width=int(self.camera_width.get()),
-                    height=int(self.camera_height.get()),
-                    fps=int(self.camera_fps.get()),
-                    refine_iterations=int(self.refine_iterations.get()),
-                    track_iterations=int(self.track_iterations.get()),
-                    data_root=self.config.data_root,
-                ),
-                remote=True,
-            )
-            return
+        self._last_tracking_mode = "local"
         self._start_command(
             self.command_builder.track_live(
                 object_name=profile.name,
@@ -1036,6 +1020,32 @@ class FoundationPoseWorkflowGui:
                 track_iterations=int(self.track_iterations.get()),
                 data_root=self.config.data_root,
             )
+        )
+
+    def run_tracking_remote(self) -> None:
+        profile = self._current_profile()
+        if not self._release_live_sessions_for_gpu():
+            return
+        self._last_tracking_mode = "remote"
+        self._start_command(
+            self.command_builder.track_remote_live(
+                server_host=self.server_host.get().strip(),
+                server_port=int(self.server_port.get()),
+                object_name=profile.name,
+                prompt=self.prompt.get(),
+                foundationpose_root=self.foundationpose_root.get(),
+                auto_reinit=bool(self.auto_reinit.get()),
+                auto_reinit_after_lost_frames=int(self.auto_reinit_after.get()),
+                camera_model=self.camera_model.get(),
+                serial=self.camera_serial.get(),
+                width=int(self.camera_width.get()),
+                height=int(self.camera_height.get()),
+                fps=int(self.camera_fps.get()),
+                refine_iterations=int(self.refine_iterations.get()),
+                track_iterations=int(self.track_iterations.get()),
+                data_root=self.config.data_root,
+            ),
+            remote=True,
         )
 
     def _start_remote_processing(self, *, profile, reselect: bool) -> None:
@@ -1079,10 +1089,12 @@ class FoundationPoseWorkflowGui:
             accepted = result.get("accepted", 0)
             required = result.get("required_keyframes", options.get("required_keyframes", "?"))
             sessions = upload.get("session_count", 0)
+            rejection_summary = summarize_processing_rejections(result) if int(accepted) <= 0 else ""
+            details = f"; {rejection_summary}" if rejection_summary else ""
             self.remote_events.put(
                 RemoteHealthEvent(
                     "Remote",
-                    f"Remote processing {readiness}: accepted={accepted}/{required}, uploaded_sessions={sessions}",
+                    f"Remote processing {readiness}: accepted={accepted}/{required}, uploaded_sessions={sessions}{details}",
                 )
             )
         else:
@@ -1131,12 +1143,13 @@ class FoundationPoseWorkflowGui:
             self.remote_events.put(RemoteHealthEvent("Remote", f"Remote build {state}: {reason}"))
 
     def reinitialize_tracking_event(self, event=None) -> None:
+        restart_tracking = self.run_tracking_remote if self._last_tracking_mode == "remote" else self.run_tracking_local
         if self.runner.running:
             self.runner.stop()
-            self.root.after(700, self.run_tracking)
-            self.status.set("Restarting tracking for reinitialization")
+            self.root.after(700, restart_tracking)
+            self.status.set(f"Restarting {self._last_tracking_mode} tracking for reinitialization")
         else:
-            self.run_tracking()
+            restart_tracking()
 
     def stop_command(self) -> None:
         self.runner.stop()
@@ -1626,6 +1639,29 @@ def create_recordings_archive(profile_root: str | Path, *, request_payload: dict
         "max_upload_frames": max_upload_frames,
         "archive_bytes": len(archive),
     }
+
+
+def summarize_processing_rejections(result: dict, *, limit: int = 3, max_reason_chars: int = 90) -> str:
+    counts: dict[str, int] = {}
+    for record in result.get("records", []):
+        if not isinstance(record, dict) or record.get("accepted"):
+            continue
+        reasons = record.get("reasons") or record.get("reason") or []
+        if isinstance(reasons, str):
+            reasons = [reasons]
+        if not reasons:
+            reasons = ["unknown rejection reason"]
+        for reason in reasons:
+            text = " ".join(str(reason).split())
+            if not text:
+                continue
+            if len(text) > max_reason_chars:
+                text = text[: max_reason_chars - 3] + "..."
+            counts[text] = counts.get(text, 0) + 1
+    if not counts:
+        return ""
+    top = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[: max(int(limit), 1)]
+    return "top rejects: " + "; ".join(f"{count}x {reason}" for reason, count in top)
 
 
 def _remote_processing_upload_frame_limit(request_payload: dict) -> int:

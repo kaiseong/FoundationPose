@@ -20,6 +20,7 @@ from visual_servoing.foundationpose_model_free.gui_app import (
     remote_process_recordings,
     remote_segmentation_sanity,
     resolve_gui_config,
+    summarize_processing_rejections,
     write_segmentation_preview,
 )
 from visual_servoing.visual_servo_protocol_v2 import (
@@ -317,7 +318,9 @@ def test_gui_source_contains_remote_connect_state_flow():
     connect_source = inspect.getsource(FoundationPoseWorkflowGui.connect_remote_server)
     poll_source = inspect.getsource(FoundationPoseWorkflowGui._poll_queues)
     segmentation_source = inspect.getsource(FoundationPoseWorkflowGui.run_segmentation_check)
-    command_source = inspect.getsource(FoundationPoseWorkflowGui.run_tracking)
+    local_tracking_source = inspect.getsource(FoundationPoseWorkflowGui.run_tracking_local)
+    remote_tracking_source = inspect.getsource(FoundationPoseWorkflowGui.run_tracking_remote)
+    reinit_source = inspect.getsource(FoundationPoseWorkflowGui.reinitialize_tracking_event)
     build_command_source = inspect.getsource(FoundationPoseWorkflowGui.run_build_assets)
     force_build_source = inspect.getsource(FoundationPoseWorkflowGui.run_force_build_assets)
     processing_source = inspect.getsource(FoundationPoseWorkflowGui.run_recording_processing)
@@ -327,10 +330,14 @@ def test_gui_source_contains_remote_connect_state_flow():
     assert 'text="Server"' in build_source
     assert 'text="Port"' in build_source
     assert 'text="Connect"' in build_source
+    assert 'text="Track Local"' in build_source
+    assert 'text="Track Remote"' in build_source
     assert "threading.Thread" in connect_source
     assert "remote_events" in poll_source
     assert "_start_remote_segmentation_check" in segmentation_source
-    assert "track_remote_live" in command_source
+    assert "track_live" in local_tracking_source
+    assert "track_remote_live" in remote_tracking_source
+    assert "_last_tracking_mode" in reinit_source
     assert "_start_remote_build" in build_command_source
     assert "_start_remote_build" in force_build_source
     assert build_command_source.index("_start_remote_build") < build_command_source.index("latest_processing_report")
@@ -339,6 +346,23 @@ def test_gui_source_contains_remote_connect_state_flow():
     assert "_start_remote_processing" in reselect_source
     assert processing_source.index("_start_remote_processing") < processing_source.index("_charuco_command")
     assert "Disconnected" in done_source
+
+
+def test_summarize_processing_rejections_counts_top_reasons():
+    summary = summarize_processing_rejections(
+        {
+            "records": [
+                {"accepted": False, "reasons": ["charuco rejected: corner count 0 below minimum 6"]},
+                {"accepted": False, "reasons": ["charuco rejected: corner count 0 below minimum 6"]},
+                {"accepted": False, "reason": ["valid depth ratio 0.000 below minimum 0.200"]},
+                {"accepted": True, "reasons": ["ignored"]},
+            ]
+        }
+    )
+
+    assert "top rejects:" in summary
+    assert "2x charuco rejected" in summary
+    assert "1x valid depth ratio" in summary
 
 
 def test_remote_build_assets_posts_to_server_and_polls_job(monkeypatch):
