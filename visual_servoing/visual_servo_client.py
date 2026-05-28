@@ -55,8 +55,6 @@ CAMERA_POSE_PRESETS = {
 }
 CAMERA_POSE_PRESET_CHOICES = ("auto", *CAMERA_POSE_PRESETS.keys())
 DEFAULT_CAMERA_MOUNT_LINK = "link_head_2"
-DEFAULT_RIGHT_ARM_STIFFNESS = (90.0, 90.0, 90.0, 70.0, 70.0, 70.0, 70.0)
-DEFAULT_RIGHT_ARM_TORQUE_LIMIT = (40.0, 40.0, 40.0, 30.0, 30.0, 30.0, 30.0)
 RIGHT_ARM_CARTESIAN_READY_POSE_DEG = (0.0, -5.0, 0.0, -120.0, 0.0, 40.0, 0.0)
 RIGHT_ARM_CONTROL_ROOT_LINK = servo_core.RIGHT_ARM_CONTROL_ROOT_LINK
 DEFAULT_RIGHT_ARM_EE_LINK = servo_core.DEFAULT_RIGHT_ARM_EE_LINK
@@ -245,6 +243,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ready-hold-time-s", type=float, default=4.0)
     parser.add_argument("--linear-limit", type=float, default=1.0)
     parser.add_argument("--angular-limit", type=float, default=math.pi / 2.0)
+    parser.add_argument("--acceleration-limit-scaling", type=float, default=1.0)
     parser.add_argument("--linear-gain", type=float, default=50.0)
     parser.add_argument("--angular-gain", type=float, default=math.pi * 20.0)
     args = parser.parse_args(argv)
@@ -1064,16 +1063,14 @@ class RobotContext:
             raise RuntimeError("Robot is not connected.")
         rby = self.rby
         builder = (
-            rby.CartesianImpedanceControlCommandBuilder()
+            rby.CartesianCommandBuilder()
             .set_command_header(
                 rby.CommandHeaderBuilder().set_control_hold_time(float(self.args.command_hold_time_s))
             )
             .set_minimum_time(float(self.args.command_min_time_s))
-            .set_joint_stiffness(np.asarray(DEFAULT_RIGHT_ARM_STIFFNESS, dtype=np.float64))
-            .set_joint_torque_limit(np.asarray(DEFAULT_RIGHT_ARM_TORQUE_LIMIT, dtype=np.float64))
             .set_stop_joint_position_tracking_error(0)
+            .set_stop_position_tracking_error(0)
             .set_stop_orientation_tracking_error(0)
-            .set_joint_damping_ratio(0.6)
         )
         builder.add_target(
             self.args.control_root_link,
@@ -1081,8 +1078,7 @@ class RobotContext:
             target_t5_T_ee,
             float(self.args.linear_limit),
             float(self.args.angular_limit),
-            float(self.args.linear_gain),
-            float(self.args.angular_gain),
+            float(self.args.acceleration_limit_scaling),
         )
         command = rby.RobotCommandBuilder().set_command(
             rby.ComponentBasedCommandBuilder().set_body_command(

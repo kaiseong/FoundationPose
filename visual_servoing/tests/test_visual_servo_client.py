@@ -74,8 +74,8 @@ class FakeBuilder:
         return self
 
 
-class FakeCartesianImpedanceControlCommandBuilder(FakeBuilder):
-    instances: list["FakeCartesianImpedanceControlCommandBuilder"] = []
+class FakeCartesianCommandBuilder(FakeBuilder):
+    instances: list["FakeCartesianCommandBuilder"] = []
 
     def __init__(self):
         self.targets = []
@@ -162,7 +162,7 @@ class FakeRby:
             Idle = "idle"
             Running = "running"
 
-    CartesianImpedanceControlCommandBuilder = FakeCartesianImpedanceControlCommandBuilder
+    CartesianCommandBuilder = FakeCartesianCommandBuilder
     JointPositionCommandBuilder = FakeBuilder
     CommandHeaderBuilder = FakeBuilder
     RobotCommandBuilder = FakeBuilder
@@ -695,15 +695,14 @@ def test_send_right_arm_cartesian_uses_command_stream_with_timeout():
     assert len(robot.streams[0].send_args) == 2
     assert robot.streams[0].send_args[1] == 1250
     assert robot.wait_calls == []
-    target_args = FakeCartesianImpedanceControlCommandBuilder.instances[-1].targets[-1]
+    target_args = FakeCartesianCommandBuilder.instances[-1].targets[-1]
     assert target_args[0] == args.control_root_link
     assert target_args[1] == args.ee_link
     np.testing.assert_allclose(target_args[2], target)
     assert target_args[3:] == (
         float(args.linear_limit),
         float(args.angular_limit),
-        float(args.linear_gain),
-        float(args.angular_gain),
+        float(args.acceleration_limit_scaling),
     )
 
 

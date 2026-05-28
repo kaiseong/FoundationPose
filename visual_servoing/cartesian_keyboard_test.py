@@ -102,6 +102,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ready-hold-time-s", type=float, default=4.0)
     parser.add_argument("--linear-limit", type=float, default=0.2)
     parser.add_argument("--angular-limit", type=float, default=math.pi / 4.0)
+    parser.add_argument("--acceleration-limit-scaling", type=float, default=1.0)
     parser.add_argument("--linear-gain", type=float, default=50.0)
     parser.add_argument("--angular-gain", type=float, default=math.pi * 20.0)
     args = parser.parse_args(argv)
