@@ -345,9 +345,10 @@ def test_gui_command_builder_constructs_hybrid_track_command(tmp_path):
     )
 
     assert command[:3] == ["python", "-m", "visual_servoing.scripts.fp_track_live"]
-    assert command[command.index("--remote-init-mask-server") + 1] == "192.168.0.3:8081"
-    assert command[command.index("--remote-init-mask-device") + 1] == "cpu"
-    assert command[command.index("--remote-init-mask-resolution") + 1] == "512"
+    assert command[command.index("--remote-register-server") + 1] == "192.168.0.3:8081"
+    assert command[command.index("--remote-register-device") + 1] == "cpu"
+    assert command[command.index("--remote-register-resolution") + 1] == "512"
+    assert "--remote-init-mask-server" not in command
     assert command[command.index("--object") + 1] == "mouse"
     assert command[command.index("--prompt") + 1] == "wireless mouse"
     assert command[command.index("--camera") + 1] == "zed"

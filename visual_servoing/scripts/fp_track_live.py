@@ -25,6 +25,7 @@ from visual_servoing.foundationpose_model_free.mask_provider import (
     Sam3MaskProvider,
 )
 from visual_servoing.foundationpose_model_free.registry import ObjectProfileRegistry
+from visual_servoing.foundationpose_model_free.remote_register_provider import RemoteFoundationPoseRegisterProvider
 from visual_servoing.foundationpose_model_free.tracker import (
     FoundationPoseLiveTracker,
     TrackingRecoveryConfig,
@@ -63,6 +64,23 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="SAM threshold used by the remote segmentation server. Defaults to --threshold.",
+    )
+    parser.add_argument(
+        "--remote-register-server",
+        help="Use the FoundationPose v2 server for initialization/reinitialization register, then track locally.",
+    )
+    parser.add_argument("--remote-register-timeout-s", type=float, default=10.0)
+    parser.add_argument(
+        "--remote-register-device",
+        default=None,
+        help="SAM device used by the remote register server. Defaults to --device.",
+    )
+    parser.add_argument("--remote-register-resolution", type=int, default=1008)
+    parser.add_argument(
+        "--remote-register-threshold",
+        type=float,
+        default=None,
+        help="SAM threshold used by the remote register server. Defaults to --threshold.",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--threshold", type=float, default=0.3)
@@ -148,14 +166,17 @@ def main(argv: list[str] | None = None) -> int:
             debug=args.debug,
             refinement_iterations=args.refine_iterations,
             tracking_iterations=args.track_iterations,
+            tracking_only=bool(args.remote_register_server and not args.init_mask),
         )
     )
-    mask_provider = build_mask_provider(args, profile)
+    remote_register_provider = build_remote_register_provider(args, profile)
+    mask_provider = None if remote_register_provider is not None and not args.init_mask else build_mask_provider(args, profile)
     recovery_config = build_recovery_config(args)
     tracker = FoundationPoseLiveTracker(
         profile=profile,
         adapter=adapter,
         mask_provider=mask_provider,
+        remote_register_provider=remote_register_provider,
         recovery_config=recovery_config,
     )
     return run_live(args, profile.prompt, tracker)
@@ -178,9 +199,34 @@ def build_mask_provider(args: argparse.Namespace, profile) -> object:
     return Sam3MaskProvider(prompt=profile.prompt, device=args.device, confidence_threshold=args.threshold)
 
 
+def build_remote_register_provider(args: argparse.Namespace, profile) -> RemoteFoundationPoseRegisterProvider | None:
+    if args.init_mask or not args.remote_register_server:
+        return None
+    return RemoteFoundationPoseRegisterProvider(
+        args.remote_register_server,
+        profile=args.object,
+        foundationpose_root=args.foundationpose_root,
+        refine_iterations=args.refine_iterations,
+        track_iterations=args.track_iterations,
+        prompt=profile.prompt,
+        device=args.remote_register_device or args.device,
+        threshold=args.threshold if args.remote_register_threshold is None else args.remote_register_threshold,
+        resolution=args.remote_register_resolution,
+        timeout_s=args.remote_register_timeout_s,
+        recovery_options={
+            "auto_reinit": False,
+            "hold_last_pose_frames": args.hold_last_pose_frames,
+            "verify_pose_depth": bool(args.enable_depth_lost_check and not args.disable_depth_lost_check),
+            "max_pose_jump_m": args.max_pose_jump_m,
+        },
+    )
+
+
 def build_recovery_config(args: argparse.Namespace) -> TrackingRecoveryConfig:
-    hybrid_remote_init = bool(args.remote_init_mask_server and not args.init_mask)
+    hybrid_remote_init = bool((args.remote_init_mask_server or args.remote_register_server) and not args.init_mask)
+    hybrid_remote_register = bool(args.remote_register_server and not args.init_mask)
     setattr(args, "hybrid_remote_init", hybrid_remote_init)
+    setattr(args, "hybrid_remote_register", hybrid_remote_register)
     setattr(args, "hybrid_auto_reinit_disabled", hybrid_remote_init)
     return TrackingRecoveryConfig(
         hold_last_pose_frames=args.hold_last_pose_frames,
@@ -235,9 +281,10 @@ def run_live(args: argparse.Namespace, prompt: str, tracker: FoundationPoseLiveT
                 result_metadata = result.metadata
                 merge_timing_metadata(timing_ms, result_metadata)
                 if getattr(args, "hybrid_auto_reinit_disabled", False):
+                    mode = "remote-register" if getattr(args, "hybrid_remote_register", False) else "remote-init"
                     message = combine_status_messages(
                         message,
-                        "hybrid remote-init: auto reinit disabled; press R to reinitialize",
+                        f"hybrid {mode}: auto reinit disabled; press R to reinitialize",
                     )
                 if pose is not None:
                     start = time.perf_counter()
@@ -341,7 +388,20 @@ def emit_json(
 
 def merge_timing_metadata(timing_ms: dict[str, float], metadata: dict[str, object] | None) -> None:
     if metadata:
-        for key in ("remote_segmentation_ms", "register_ms", "track_one_ms", "mask_provider_ms"):
+        for key in (
+            "remote_segmentation_ms",
+            "remote_connect_ms",
+            "remote_upload_ms",
+            "remote_wait_ms",
+            "remote_download_ms",
+            "remote_http_total_ms",
+            "remote_register_ms",
+            "remote_register_provider_ms",
+            "local_pose_seed_ms",
+            "register_ms",
+            "track_one_ms",
+            "mask_provider_ms",
+        ):
             value = metadata.get(key)
             if isinstance(value, (int, float)):
                 timing_ms[key] = float(value)

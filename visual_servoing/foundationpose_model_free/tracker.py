@@ -15,6 +15,7 @@ from .foundationpose_adapter import PoseEstimate
 from .mask_provider import MaskProvider
 from .metrics import TrackingMetrics
 from .profile_schema import ObjectProfile
+from .remote_register_provider import RemoteFoundationPoseRegisterProvider
 
 
 class TrackingState:
@@ -56,11 +57,13 @@ class FoundationPoseLiveTracker:
         profile: ObjectProfile,
         adapter,
         mask_provider: MaskProvider | None = None,
+        remote_register_provider: RemoteFoundationPoseRegisterProvider | None = None,
         recovery_config: TrackingRecoveryConfig | None = None,
     ) -> None:
         self.profile = profile
         self.adapter = adapter
         self.mask_provider = mask_provider
+        self.remote_register_provider = remote_register_provider
         self.recovery_config = recovery_config or TrackingRecoveryConfig()
         self.metrics = TrackingMetrics()
         self.initialized = False
@@ -97,7 +100,28 @@ class FoundationPoseLiveTracker:
             metadata["should_reinit"] = should_reinit
             if not self.initialized or should_reinit:
                 state = TrackingState.REINIT
-                if mask is None:
+                if self.remote_register_provider is not None and mask is None:
+                    start = time.perf_counter()
+                    remote_result = self.remote_register_provider.register(
+                        rgb=rgb,
+                        depth_m=depth_m,
+                        intrinsics=intrinsics,
+                    )
+                    metadata["remote_register_provider_ms"] = elapsed_ms(start)
+                    metadata["remote_register_provider_metadata"] = remote_result.metadata
+                    remote_register_ms = remote_result.metadata.get("remote_register_ms")
+                    if isinstance(remote_register_ms, (int, float)):
+                        metadata["remote_register_ms"] = float(remote_register_ms)
+                    if isinstance(remote_result.metadata.get("remote_server_timing_ms"), dict):
+                        metadata["remote_server_timing_ms"] = remote_result.metadata["remote_server_timing_ms"]
+                    start = time.perf_counter()
+                    initializer = getattr(self.adapter, "initialize_from_pose", None)
+                    if not callable(initializer):
+                        raise ValueError("remote register requires an adapter with initialize_from_pose()")
+                    initializer(camera_T_object=remote_result.pose.camera_T_object)
+                    metadata["local_pose_seed_ms"] = elapsed_ms(start)
+                    pose = remote_result.pose
+                elif mask is None:
                     if self.mask_provider is None:
                         raise ValueError("initialization requires a mask or mask_provider")
                     start = time.perf_counter()
@@ -120,15 +144,16 @@ class FoundationPoseLiveTracker:
                     release = getattr(self.mask_provider, "release", None)
                     if callable(release):
                         release()
-                init_mask = np.asarray(mask).astype(bool)
-                start = time.perf_counter()
-                pose = self.adapter.register(
-                    rgb=rgb,
-                    depth_m=depth_m,
-                    intrinsics=intrinsics,
-                    mask=mask,
-                )
-                metadata["register_ms"] = elapsed_ms(start)
+                init_mask = np.asarray(mask).astype(bool) if mask is not None else None
+                if pose is None:
+                    start = time.perf_counter()
+                    pose = self.adapter.register(
+                        rgb=rgb,
+                        depth_m=depth_m,
+                        intrinsics=intrinsics,
+                        mask=mask,
+                    )
+                    metadata["register_ms"] = elapsed_ms(start)
                 self.initialized = True
                 self._reinit_requested = False
             else:

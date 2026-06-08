@@ -25,6 +25,7 @@ class FoundationPoseConfig:
     debug: int = 0
     refinement_iterations: int = 5
     tracking_iterations: int = 2
+    tracking_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,26 @@ class FoundationPoseAdapter:
             reset_torch_defaults_for_cpu_ops()
         return PoseEstimate(np.asarray(pose, dtype=np.float64), "foundationpose_track_one", {})
 
+    def initialize_from_pose(self, *, camera_T_object: np.ndarray) -> PoseEstimate:
+        pose = np.asarray(camera_T_object, dtype=np.float64)
+        if pose.shape != (4, 4) or not np.all(np.isfinite(pose)):
+            raise ValueError("camera_T_object must be a finite 4x4 matrix")
+        set_torch_defaults_for_cuda_ops()
+        estimator = self._get_estimator()
+        set_torch_defaults_for_cuda_ops()
+        try:
+            import torch  # type: ignore
+
+            tf_to_center = estimator.get_tf_to_centered_mesh()
+            centered_pose = torch.as_tensor(pose, device=tf_to_center.device, dtype=tf_to_center.dtype) @ torch.linalg.inv(
+                tf_to_center
+            )
+            estimator.pose_last = centered_pose
+        finally:
+            reset_torch_defaults_for_cpu_ops()
+        self._initialized = True
+        return PoseEstimate(pose.copy(), "remote_foundationpose_register_seed", {"initialized_from_pose": True})
+
     def _get_estimator(self):
         if self._estimator is not None:
             return self._estimator
@@ -120,7 +141,7 @@ class FoundationPoseAdapter:
         except Exception as exc:  # pragma: no cover - depends on FoundationPose install
             raise FoundationPoseUnavailableError("trimesh is required to load generated object assets.") from exc
         mesh = trimesh.load(str(mesh_path), force="mesh")
-        scorer = estimater_module.ScorePredictor()
+        scorer = _TrackingOnlyScorer() if self.config.tracking_only else estimater_module.ScorePredictor()
         refiner = estimater_module.PoseRefinePredictor()
         glctx = estimater_module.dr.RasterizeCudaContext()
         debug_dir = str(self.config.debug_dir) if self.config.debug_dir else "debug_foundationpose"
@@ -134,6 +155,11 @@ class FoundationPoseAdapter:
             debug=self.config.debug,
             glctx=glctx,
         )
+
+
+class _TrackingOnlyScorer:
+    def predict(self, *args, **kwargs):  # pragma: no cover - register should not use tracking-only scorer
+        raise RuntimeError("tracking-only FoundationPose adapter cannot run register scoring")
 
 
 class StubFoundationPoseAdapter:
@@ -166,3 +192,11 @@ class StubFoundationPoseAdapter:
         if not self._initialized:
             raise RuntimeError("Stub adapter called before register().")
         return PoseEstimate(self._pose.copy(), "stub_track_one", {})
+
+    def initialize_from_pose(self, *, camera_T_object: np.ndarray) -> PoseEstimate:
+        pose = np.asarray(camera_T_object, dtype=np.float64)
+        if pose.shape != (4, 4) or not np.all(np.isfinite(pose)):
+            raise ValueError("camera_T_object must be a finite 4x4 matrix")
+        self._initialized = True
+        self._pose = pose.copy()
+        return PoseEstimate(self._pose.copy(), "stub_remote_register_seed", {"initialized_from_pose": True})

@@ -71,8 +71,14 @@ def test_timing_summary_includes_hybrid_tracking_fields():
         {
             "camera_read_ms": 1.0,
             "remote_segmentation_ms": 2.0,
+            "remote_register_ms": 2.5,
+            "local_pose_seed_ms": 0.5,
             "register_ms": 3.0,
             "track_one_ms": 4.0,
+            "remote_upload_ms": 0.6,
+            "remote_wait_ms": 1.4,
+            "remote_download_ms": 0.7,
+            "remote_http_total_ms": 2.7,
             "frame_total_ms": 5.0,
             "cuda_allocated_mb": 10.0,
             "cuda_reserved_mb": 20.0,
@@ -80,7 +86,13 @@ def test_timing_summary_includes_hybrid_tracking_fields():
     )
 
     assert "rseg:2.0" in summary
+    assert "rreg:2.5" in summary
+    assert "seed:0.5" in summary
     assert "reg:3.0" in summary
     assert "trk:4.0" in summary
+    assert "up:0.6" in summary
+    assert "wait:1.4" in summary
+    assert "down:0.7" in summary
+    assert "http:2.7" in summary
     assert "total:5.0" in summary
     assert "cuda:10/20MB" in summary

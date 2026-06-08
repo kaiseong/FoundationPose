@@ -9,6 +9,7 @@ from visual_servoing.foundationpose_model_free.foundationpose_adapter import (
     StubFoundationPoseAdapter,
 )
 from visual_servoing.foundationpose_model_free.registry import ObjectProfileRegistry
+from visual_servoing.foundationpose_model_free.remote_register_provider import RemoteRegisterResult
 from visual_servoing.foundationpose_model_free.tracker import (
     FoundationPoseLiveTracker,
     TrackingRecoveryConfig,
@@ -142,6 +143,42 @@ def test_tracker_calls_mask_provider_only_for_init_and_manual_reinit(tmp_path):
     assert first.metadata["mask_provider_source"] == "fake"
     assert "register_ms" in first.metadata
     assert "track_one_ms" in second.metadata
+
+
+def test_tracker_uses_remote_register_provider_for_init_and_manual_reinit(tmp_path):
+    profile = ObjectProfileRegistry(tmp_path).create("phone")
+    adapter = CountingAdapter()
+    remote_register_provider = CountingRemoteRegisterProvider()
+    mask_provider = CountingMaskProvider()
+    tracker = FoundationPoseLiveTracker(
+        profile=profile,
+        adapter=adapter,
+        mask_provider=mask_provider,
+        remote_register_provider=remote_register_provider,
+    )
+    rgb, depth, _mask, intr = _frame_inputs()
+
+    first = tracker.process_frame(rgb=rgb, depth_m=depth, intrinsics=intr)
+    second = tracker.process_frame(rgb=rgb, depth_m=depth, intrinsics=intr)
+    tracker.request_reinit()
+    third = tracker.process_frame(rgb=rgb, depth_m=depth, intrinsics=intr)
+
+    assert first.state == TrackingState.REINIT
+    assert second.state == TrackingState.TRACKING
+    assert third.state == TrackingState.REINIT
+    assert remote_register_provider.register_calls == 2
+    assert adapter.initialize_from_pose_calls == 2
+    assert adapter.register_calls == 0
+    assert adapter.track_calls == 1
+    assert mask_provider.get_mask_calls == 0
+    assert first.mask is None
+    assert first.pose is not None
+    np.testing.assert_allclose(first.pose.camera_T_object, remote_register_provider.pose)
+    assert first.metadata is not None
+    assert first.metadata["remote_register_ms"] == 12.0
+    assert "remote_register_provider_ms" in first.metadata
+    assert "local_pose_seed_ms" in first.metadata
+    assert first.metadata["remote_server_timing_ms"] == {"tracking_ms": 11.0}
 
 
 def test_tracker_warns_when_initial_pose_origin_is_far_from_mask_center(tmp_path):
@@ -294,6 +331,7 @@ class CountingAdapter:
     def __init__(self) -> None:
         self.register_calls = 0
         self.track_calls = 0
+        self.initialize_from_pose_calls = 0
         self.pose = np.eye(4, dtype=np.float64)
         self.pose[2, 3] = 1.0
 
@@ -304,6 +342,11 @@ class CountingAdapter:
     def track_one(self, *, rgb, depth_m, intrinsics) -> PoseEstimate:
         self.track_calls += 1
         return PoseEstimate(self.pose.copy(), "counting_track", {})
+
+    def initialize_from_pose(self, *, camera_T_object) -> PoseEstimate:
+        self.initialize_from_pose_calls += 1
+        self.pose = np.asarray(camera_T_object, dtype=np.float64).copy()
+        return PoseEstimate(self.pose.copy(), "counting_remote_seed", {"initialized_from_pose": True})
 
 
 class FailingTrackAdapter(CountingAdapter):
@@ -334,6 +377,21 @@ class CountingMaskProvider(AlwaysMaskProvider):
     def get_mask(self, image_rgb, *, depth_m=None, object_name=None):
         self.get_mask_calls += 1
         return super().get_mask(image_rgb, depth_m=depth_m, object_name=object_name)
+
+
+class CountingRemoteRegisterProvider:
+    def __init__(self) -> None:
+        self.register_calls = 0
+        self.pose = np.eye(4, dtype=np.float64)
+        self.pose[:3, 3] = [0.1, -0.2, 0.7]
+
+    def register(self, *, rgb, depth_m, intrinsics) -> RemoteRegisterResult:
+        self.register_calls += 1
+        metadata = {
+            "remote_register_ms": 12.0,
+            "remote_server_timing_ms": {"tracking_ms": 11.0},
+        }
+        return RemoteRegisterResult(PoseEstimate(self.pose.copy(), "fake_remote_register", metadata), metadata)
 
 
 class CountingEstimator:
