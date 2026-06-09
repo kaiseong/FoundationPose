@@ -359,6 +359,48 @@ def test_gui_command_builder_constructs_hybrid_track_command(tmp_path):
     assert "--auto-reinit" not in command
     assert "--width" not in command
     assert "--height" not in command
+    assert "--eef-follow" not in command
+    assert "--execute" not in command
+    assert "--address" not in command
+
+
+def test_gui_command_builder_constructs_hybrid_eef_follow_command(tmp_path):
+    builder = GuiCommandBuilder(config=GuiConfig(data_root=str(tmp_path), python_executable="python"))
+
+    dry_run = builder.track_hybrid_live(
+        server_host="192.168.0.3",
+        server_port=8081,
+        object_name="mouse",
+        prompt="wireless mouse",
+        foundationpose_root="/home/kgs/FoundationPose",
+        auto_reinit_after_lost_frames=5,
+        eef_follow=True,
+        execute=False,
+        max_translation_step_m="0.03",
+        data_root=str(tmp_path),
+    )
+    execute = builder.track_hybrid_live(
+        server_host="192.168.0.3",
+        server_port=8081,
+        object_name="mouse",
+        prompt="wireless mouse",
+        foundationpose_root="/home/kgs/FoundationPose",
+        auto_reinit_after_lost_frames=5,
+        eef_follow=True,
+        execute=True,
+        robot_address="192.168.30.1:50051",
+        max_translation_step_m="0.03",
+        data_root=str(tmp_path),
+    )
+
+    assert "--remote-register-server" in dry_run
+    assert "--eef-follow" in dry_run
+    assert dry_run[dry_run.index("--max-translation-step-m") + 1] == "0.03"
+    assert "--execute" not in dry_run
+    assert "--address" not in dry_run
+    assert "--execute" in execute
+    assert execute[execute.index("--address") + 1] == "192.168.30.1:50051"
+    assert execute[execute.index("--max-translation-step-m") + 1] == "0.03"
 
 
 def test_gui_source_contains_remote_connect_state_flow():
@@ -382,6 +424,8 @@ def test_gui_source_contains_remote_connect_state_flow():
     assert 'text="Track Local"' in build_source
     assert 'text="Track Remote"' in build_source
     assert 'text="Track Hybrid"' in build_source
+    assert 'text="EEF Follow"' in build_source
+    assert 'text="Execute Robot"' in build_source
     assert "run_tracking_hybrid" in build_source
     assert "threading.Thread" in connect_source
     assert "remote_events" in poll_source
@@ -390,6 +434,9 @@ def test_gui_source_contains_remote_connect_state_flow():
     assert "_download_remote_model_for_local_tracking" in local_tracking_source
     assert "track_remote_live" in remote_tracking_source
     assert "track_hybrid_live" in hybrid_tracking_source
+    assert "eef_follow" in hybrid_tracking_source
+    assert "eef_execute" in hybrid_tracking_source
+    assert "eef_robot_address" in hybrid_tracking_source
     assert '_last_tracking_mode = "hybrid"' in hybrid_tracking_source
     assert "_download_remote_model_for_local_tracking" in hybrid_tracking_source
     assert "_last_tracking_mode" in reinit_source

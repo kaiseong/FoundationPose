@@ -14,6 +14,14 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import numpy as np
 
 from visual_servoing.foundationpose_model_free.asset_builder import find_generated_mesh
+from visual_servoing.foundationpose_model_free.eef_follow import (
+    EefFollowState,
+    add_eef_follow_arguments,
+    apply_eef_follow,
+    make_robot_context,
+    resolve_and_validate_eef_follow_args,
+    t5_T_camera_for_frame,
+)
 from visual_servoing.foundationpose_model_free.foundationpose_adapter import (
     FoundationPoseAdapter,
     FoundationPoseConfig,
@@ -134,11 +142,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pose-depth-window-radius-px", type=int, default=7)
     parser.add_argument("--max-pose-jump-m", type=float, default=None)
     parser.add_argument("--implausible-lost-threshold", type=int, default=1)
+    add_eef_follow_arguments(parser)
     return parser
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    return build_parser().parse_args(argv)
+    args = build_parser().parse_args(argv)
+    resolve_and_validate_eef_follow_args(args)
+    if bool(args.eef_follow) and (not args.remote_register_server or args.init_mask):
+        raise SystemExit("--eef-follow is supported only with Track Hybrid / --remote-register-server")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -247,116 +260,140 @@ def run_live(args: argparse.Namespace, prompt: str, tracker: FoundationPoseLiveT
     fps_smooth = None
     last_overlay = None
     window_title = f"{args.camera.upper()} FoundationPose"
-    with LiveRgbdCamera(
-        model=args.camera,
-        serial=args.serial,
-        width=args.width,
-        height=args.height,
-        fps=args.fps,
-        zed_depth_mode=args.zed_depth_mode,
-    ) as camera:
-        if not args.no_window:
-            cv2.namedWindow(window_title, cv2.WINDOW_NORMAL)
-        frame_index = 0
-        while True:
-            frame_start = time.perf_counter()
-            timing_ms: dict[str, float] = {}
-            start = time.perf_counter()
-            frame = camera.read(timeout_ms=args.frame_timeout_ms)
-            timing_ms["camera_read_ms"] = elapsed_ms(start)
-
-            status = TrackingState.LOST
-            message = None
-            pose = None
-            result = None
-            result_metadata = None
-            overlay = frame.rgb.copy()
-            try:
-                start = time.perf_counter()
-                result = tracker.process_frame(rgb=frame.rgb, depth_m=frame.depth_m, intrinsics=frame.intrinsics)
-                timing_ms["pose_estimation_ms"] = elapsed_ms(start)
-                pose = result.pose.camera_T_object if result.pose is not None else None
-                status = result.state
-                message = result.message
-                result_metadata = result.metadata
-                merge_timing_metadata(timing_ms, result_metadata)
-                if getattr(args, "hybrid_auto_reinit_disabled", False):
-                    mode = "remote-register" if getattr(args, "hybrid_remote_register", False) else "remote-init"
-                    message = combine_status_messages(
-                        message,
-                        f"hybrid {mode}: auto reinit disabled; press R to reinitialize",
-                    )
-                if pose is not None:
-                    start = time.perf_counter()
-                    if result.mask is not None:
-                        overlay = draw_phone_pose_overlay(
-                            frame.rgb,
-                            result.mask,
-                            pose,
-                            frame.intrinsics,
-                            axis_length_m=args.axis_length_m,
-                        )
-                    else:
-                        overlay = draw_axes_overlay(
-                            frame.rgb,
-                            pose,
-                            frame.intrinsics,
-                            axis_length_m=args.axis_length_m,
-                        )
-                    timing_ms["pose_overlay_ms"] = elapsed_ms(start)
-                    if result.held_pose and not message:
-                        message = "holding last pose; press R to reinitialize"
-                    message = combine_status_messages(
-                        message,
-                        pose_status_message(pose, expected_distance_m=args.expected_distance_m),
-                    )
-            except Exception as exc:
-                timing_ms["pose_estimation_ms"] = timing_ms.get("pose_estimation_ms", elapsed_ms(start))
-                message = str(exc)
-
-            now = time.monotonic()
-            current_fps = 1.0 / max(now - previous_frame_time, 1e-9)
-            fps_smooth = current_fps if fps_smooth is None else 0.85 * fps_smooth + 0.15 * current_fps
-            previous_frame_time = now
-            timing_ms["fps"] = fps_smooth
-            timing_ms["frame_total_ms"] = elapsed_ms(frame_start)
-            start = time.perf_counter()
-            overlay = draw_status_overlay(
-                overlay,
-                status=status,
-                prompt=prompt,
-                frame_index=frame_index,
-                fps=fps_smooth,
-                message=message,
-                timing_ms=timing_ms,
-            )
-            timing_ms["status_overlay_ms"] = elapsed_ms(start)
-            last_overlay = overlay
-
-            key = None
+    robot_context = make_robot_context(args) if bool(args.eef_follow) else None
+    eef_state = EefFollowState()
+    try:
+        with LiveRgbdCamera(
+            model=args.camera,
+            serial=args.serial,
+            width=args.width,
+            height=args.height,
+            fps=args.fps,
+            zed_depth_mode=args.zed_depth_mode,
+        ) as camera:
             if not args.no_window:
+                cv2.namedWindow(window_title, cv2.WINDOW_NORMAL)
+            frame_index = 0
+            while True:
+                frame_start = time.perf_counter()
+                timing_ms: dict[str, float] = {}
                 start = time.perf_counter()
-                cv2.imshow(window_title, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
-                key = cv2.waitKey(1) & 0xFF
-                timing_ms["display_ms"] = elapsed_ms(start)
-            timing_ms["frame_total_ms"] = elapsed_ms(frame_start)
-            emit_json(
-                args,
-                status=status,
-                message=message,
-                pose=pose,
-                timing_ms=timing_ms,
-                metadata=result_metadata,
-            )
-            if key in (ord("q"), 27):
-                break
-            if key in (ord("r"), ord("R")):
-                tracker.request_reinit()
-            frame_index += 1
-            if args.max_frames and frame_index >= args.max_frames:
-                break
-    if last_overlay is not None and not args.no_window:
-        cv2.destroyWindow(window_title)
+                frame = camera.read(timeout_ms=args.frame_timeout_ms)
+                timing_ms["camera_read_ms"] = elapsed_ms(start)
+
+                status = TrackingState.LOST
+                message = None
+                pose = None
+                result = None
+                result_metadata = None
+                eef_follow = None
+                overlay = frame.rgb.copy()
+                try:
+                    start = time.perf_counter()
+                    result = tracker.process_frame(rgb=frame.rgb, depth_m=frame.depth_m, intrinsics=frame.intrinsics)
+                    timing_ms["pose_estimation_ms"] = elapsed_ms(start)
+                    pose = result.pose.camera_T_object if result.pose is not None else None
+                    status = result.state
+                    message = result.message
+                    result_metadata = result.metadata
+                    merge_timing_metadata(timing_ms, result_metadata)
+                    if robot_context is not None:
+                        start = time.perf_counter()
+                        t5_T_camera = t5_T_camera_for_frame(args, robot_context)
+                        eef_follow = apply_eef_follow(
+                            args=args,
+                            robot_context=robot_context,
+                            state=eef_state,
+                            camera_T_object=pose,
+                            t5_T_camera=t5_T_camera,
+                            tracking_state=status,
+                            pose_is_fresh=bool(result.fresh_pose),
+                        )
+                        timing_ms["eef_follow_ms"] = elapsed_ms(start)
+                        if eef_follow is not None:
+                            message = combine_status_messages(message, eef_status_message(eef_follow))
+                    if getattr(args, "hybrid_auto_reinit_disabled", False):
+                        mode = "remote-register" if getattr(args, "hybrid_remote_register", False) else "remote-init"
+                        message = combine_status_messages(
+                            message,
+                            f"hybrid {mode}: auto reinit disabled; press R to reinitialize",
+                        )
+                    if pose is not None:
+                        start = time.perf_counter()
+                        if result.mask is not None:
+                            overlay = draw_phone_pose_overlay(
+                                frame.rgb,
+                                result.mask,
+                                pose,
+                                frame.intrinsics,
+                                axis_length_m=args.axis_length_m,
+                            )
+                        else:
+                            overlay = draw_axes_overlay(
+                                frame.rgb,
+                                pose,
+                                frame.intrinsics,
+                                axis_length_m=args.axis_length_m,
+                            )
+                        timing_ms["pose_overlay_ms"] = elapsed_ms(start)
+                        if result.held_pose and not message:
+                            message = "holding last pose; press R to reinitialize"
+                        message = combine_status_messages(
+                            message,
+                            pose_status_message(pose, expected_distance_m=args.expected_distance_m),
+                        )
+                except Exception as exc:
+                    timing_ms["pose_estimation_ms"] = timing_ms.get("pose_estimation_ms", elapsed_ms(start))
+                    message = str(exc)
+
+                now = time.monotonic()
+                current_fps = 1.0 / max(now - previous_frame_time, 1e-9)
+                fps_smooth = current_fps if fps_smooth is None else 0.85 * fps_smooth + 0.15 * current_fps
+                previous_frame_time = now
+                timing_ms["fps"] = fps_smooth
+                timing_ms["frame_total_ms"] = elapsed_ms(frame_start)
+                start = time.perf_counter()
+                overlay = draw_status_overlay(
+                    overlay,
+                    status=status,
+                    prompt=prompt,
+                    frame_index=frame_index,
+                    fps=fps_smooth,
+                    message=message,
+                    timing_ms=timing_ms,
+                )
+                timing_ms["status_overlay_ms"] = elapsed_ms(start)
+                last_overlay = overlay
+
+                key = None
+                if not args.no_window:
+                    start = time.perf_counter()
+                    cv2.imshow(window_title, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+                    key = cv2.waitKey(1) & 0xFF
+                    timing_ms["display_ms"] = elapsed_ms(start)
+                timing_ms["frame_total_ms"] = elapsed_ms(frame_start)
+                emit_json(
+                    args,
+                    status=status,
+                    message=message,
+                    pose=pose,
+                    timing_ms=timing_ms,
+                    metadata=result_metadata,
+                    eef_follow=eef_follow,
+                )
+                if key in (ord("q"), 27):
+                    break
+                if key in (ord("r"), ord("R")):
+                    tracker.request_reinit()
+                    eef_state.last_t5_T_object = None
+                frame_index += 1
+                if args.max_frames and frame_index >= args.max_frames:
+                    break
+    finally:
+        if robot_context is not None:
+            robot_context.close()
+        if last_overlay is not None and not args.no_window:
+            cv2.destroyWindow(window_title)
     return 0
 
 
@@ -368,6 +405,7 @@ def emit_json(
     pose: np.ndarray | None,
     timing_ms: dict[str, float],
     metadata: dict[str, object] | None = None,
+    eef_follow: dict[str, object] | None = None,
 ) -> None:
     if not args.print_json and not args.print_timing:
         return
@@ -383,6 +421,8 @@ def emit_json(
         payload["timing_ms"] = {key: round(float(value), 3) for key, value in timing_ms.items()}
     if metadata:
         payload["tracking_metadata"] = metadata
+    if eef_follow is not None:
+        payload["eef_follow"] = eef_follow
     print(json.dumps(payload, separators=(",", ":")))
 
 
@@ -468,6 +508,14 @@ def pose_status_message(pose: np.ndarray, *, expected_distance_m: float | None =
 
 def combine_status_messages(*messages: str | None) -> str | None:
     return " | ".join(message for message in messages if message) or None
+
+
+def eef_status_message(eef_follow: dict[str, object]) -> str:
+    reason = str(eef_follow.get("reason", "")).strip()
+    command = "sent" if bool(eef_follow.get("command_sent")) else "skip"
+    if reason:
+        return f"eef:{command} {reason}"
+    return f"eef:{command}"
 
 
 def elapsed_ms(start: float) -> float:

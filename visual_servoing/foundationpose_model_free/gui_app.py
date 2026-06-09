@@ -427,6 +427,10 @@ class GuiCommandBuilder:
         zed_depth_mode: str = DEFAULT_ZED_DEPTH_MODE,
         sam_device: str = "auto",
         sam_resolution: int = 1008,
+        eef_follow: bool = False,
+        execute: bool = False,
+        robot_address: str | None = None,
+        max_translation_step_m: str | float = "0.03",
         data_root: str | None = None,
     ) -> list[str]:
         command = self.module(
@@ -457,6 +461,13 @@ class GuiCommandBuilder:
         )
         self._append_live_dimensions(command, camera_model=camera_model, width=width, height=height)
         self._append_zed_depth_mode(command, camera_model=camera_model, depth_mode=zed_depth_mode)
+        if eef_follow or execute:
+            command.append("--eef-follow")
+            command.extend(["--max-translation-step-m", str(max_translation_step_m)])
+        if execute:
+            command.append("--execute")
+            if robot_address and robot_address.strip():
+                command.extend(["--address", robot_address.strip()])
         self._append_serial(command, serial)
         self._append_data_root(command, data_root)
         return command
@@ -609,6 +620,10 @@ class FoundationPoseWorkflowGui:
         self.auto_reinit_after = tk.IntVar(value=5)
         self.refine_iterations = tk.IntVar(value=5)
         self.track_iterations = tk.IntVar(value=2)
+        self.eef_follow = tk.BooleanVar(value=False)
+        self.eef_execute = tk.BooleanVar(value=False)
+        self.eef_robot_address = tk.StringVar(value="192.168.30.1:50051")
+        self.eef_step_m = tk.StringVar(value="0.03")
         self.reference_target = tk.IntVar(value=16)
         self.max_keyframes = tk.IntVar(value=32)
         self.listbox = tk.Listbox(self.root, width=54, height=12)
@@ -768,6 +783,12 @@ class FoundationPoseWorkflowGui:
         ttk.Button(build, text="Track Hybrid", command=self.run_tracking_hybrid).grid(row=1, column=2)
         ttk.Button(build, text="Reinit Tracking", command=self.reinitialize_tracking_event).grid(row=1, column=3)
         ttk.Button(build, text="Stop Command", command=self.stop_command).grid(row=1, column=4)
+        ttk.Checkbutton(build, text="EEF Follow", variable=self.eef_follow).grid(row=2, column=0, sticky="w")
+        ttk.Checkbutton(build, text="Execute Robot", variable=self.eef_execute).grid(row=2, column=1, sticky="w")
+        ttk.Label(build, text="Robot").grid(row=2, column=2, sticky="e")
+        ttk.Entry(build, textvariable=self.eef_robot_address, width=18).grid(row=2, column=3, sticky="w")
+        ttk.Label(build, text="Step m").grid(row=2, column=4, sticky="e")
+        ttk.Entry(build, textvariable=self.eef_step_m, width=7).grid(row=2, column=5, sticky="w")
 
         logs = ttk.LabelFrame(stages, text="Status / Logs", padding=6)
         logs.grid(row=4, column=0, sticky="nsew", pady=(8, 0))
@@ -1161,6 +1182,9 @@ class FoundationPoseWorkflowGui:
         if find_generated_mesh(profile) is None:
             if not self._download_remote_model_for_local_tracking(profile):
                 return
+        if bool(self.eef_execute.get()) and not self.eef_robot_address.get().strip():
+            self.status.set("Robot address is required when Execute Robot is enabled")
+            return
         self._last_tracking_mode = "hybrid"
         self._start_command(
             self.command_builder.track_hybrid_live(
@@ -1179,6 +1203,10 @@ class FoundationPoseWorkflowGui:
                 track_iterations=int(self.track_iterations.get()),
                 sam_device=self.sam_device.get(),
                 sam_resolution=int(self.sam_resolution.get()),
+                eef_follow=bool(self.eef_follow.get()),
+                execute=bool(self.eef_execute.get()),
+                robot_address=self.eef_robot_address.get(),
+                max_translation_step_m=self.eef_step_m.get(),
                 data_root=self.config.data_root,
             ),
             remote=True,

@@ -3,57 +3,36 @@
   "iteration": 1,
   "max_iterations": 10,
   "current_phase": "complete",
-  "started_at": "2026-05-28T23:40:00Z",
-  "completed_at": "2026-05-28T16:10:58Z",
-  "context_snapshot_path": ".omx/context/remote-init-local-tracking-20260528T135451Z.md",
-  "spec_path": ".omx/specs/deep-interview-charuco-corner-origin-exclusion.md",
-  "prd_path": ".omx/plans/prd-foundationpose-charuco-corner-origin-exclusion.md",
-  "test_spec_path": ".omx/plans/test-spec-foundationpose-charuco-corner-origin-exclusion.md",
+  "started_at": "2026-05-29T00:45:16Z",
+  "completed_at": "2026-06-08T08:14:48Z",
+  "context_snapshot_path": ".omx/context/v2-eef-follow-20260608T070515Z.md",
+  "spec_path": ".omx/specs/deep-interview-v2-eef-follow.md",
+  "prd_path": ".omx/plans/prd-v2-eef-follow.md",
+  "test_spec_path": ".omx/plans/test-spec-v2-eef-follow.md",
   "completion_audit": {
     "passed": true,
     "prompt_to_artifact_checklist": [
-      {
-        "requirement": "Implement `$ralph .omx/plans/final-foundationpose-remote-init-local-tracking.md` without reducing scope.",
-        "status": "passed",
-        "evidence": "Ralph state points to final plan and current implementation adds Track Hybrid across provider, tracker, CLI, GUI, overlay, and tests."
-      },
-      {
-        "requirement": "Hybrid mode must use the v2 server only for initial/manual reinit segmentation masks.",
-        "status": "passed",
-        "evidence": "RemoteSegmentationMaskProvider posts RGBD to /foundationpose/v2/segmentation; FoundationPoseLiveTracker calls mask_provider only in init/reinit path and track_one on normal frames."
-      },
-      {
-        "requirement": "Hybrid must not silently fall back to local SAM3 and must force automatic reinit off.",
-        "status": "passed",
-        "evidence": "build_mask_provider selects Precomputed, then RemoteSegmentation, then Sam3 only when no remote server is configured; build_recovery_config sets auto_reinit false for hybrid and status text reports manual-R reinit."
-      },
-      {
-        "requirement": "GUI must expose Track Hybrid and preserve existing Track Local/Track Remote behavior.",
-        "status": "passed",
-        "evidence": "GuiCommandBuilder.track_hybrid_live builds local fp_track_live with remote-init flags; GUI button invokes run_tracking_hybrid and reinit dispatch preserves hybrid mode."
-      },
-      {
-        "requirement": "Timing/diagnostics must expose remote_segmentation_ms, register_ms, track_one_ms, frame_total_ms, and safe CUDA memory fields.",
-        "status": "passed",
-        "evidence": "Tracker metadata records provider/register/track timings; fp_track_live promotes timing to JSON/overlay before draw; cuda_memory_snapshot only inspects already-loaded torch and returns empty safely otherwise."
-      },
-      {
-        "requirement": "Ralph architect verification and deslop pass required before completion.",
-        "status": "passed",
-        "evidence": "Architect re-verification APPROVED after frame_total overlay blocker fix; scoped deslop scan found no masking fallback edits needed after tests locked behavior."
-      }
+      "Ralph executed approved plan .omx/plans/final-v2-eef-follow.md after prd/test-spec artifacts .omx/plans/prd-v2-eef-follow.md and .omx/plans/test-spec-v2-eef-follow.md.",
+      "Track Hybrid is the only tracking path wired for EEF follow: visual_servoing/scripts/fp_track_live.py accepts --eef-follow only with --remote-register-server and rejects init-mask/non-Hybrid usage.",
+      "v1 behavior is preserved: no v1 files were modified for this feature; v1 client tests still pass.",
+      "Target pose rule is implemented in visual_servoing/foundationpose_model_free/eef_follow.py as target_t5_T_ee = t5_T_object @ object_T_ee with default object offset [-0.2,0,0] and Rx(180deg).",
+      "Real robot execution is explicit only: --execute requires --eef-follow and robot execute safety validation; dry-run computes/logs targets without sending commands.",
+      "Per-command translation step default is 0.03m and rotation step default is 5deg; LOST/REINIT/non-fresh/jump cases skip and execute mode cancels the command stream.",
+      "GUI Track Hybrid controls in visual_servoing/foundationpose_model_free/gui_app.py add EEF Follow, Execute Robot, Robot address, and Step m, and only append those flags to Track Hybrid commands.",
+      "Tests in visual_servoing/tests/foundationpose_model_free/test_eef_follow.py and test_gui_app.py cover transform defaults, object-frame offset, step clamp, skip gate, Hybrid-only parse guard, and GUI command propagation."
     ],
     "verification_evidence": [
-      "python -m py_compile visual_servoing/scripts/fp_track_live.py visual_servoing/foundationpose_model_free/mask_provider.py visual_servoing/foundationpose_model_free/tracker.py visual_servoing/foundationpose_model_free/gui_app.py visual_servoing/point_pose/overlay.py: passed",
-      "PYTHONPATH=/home/kgs/FoundationPose PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest visual_servoing/tests/foundationpose_model_free/test_mask_provider.py visual_servoing/tests/foundationpose_model_free/test_tracker.py visual_servoing/tests/foundationpose_model_free/test_gui_app.py visual_servoing/tests/foundationpose_model_free/test_track_live_output.py visual_servoing/tests/test_phone_pose_overlay.py visual_servoing/tests/test_visual_servo_server_v2.py -q: 93 passed in 6.28s",
-      "git diff --check: passed with no whitespace errors",
-      "GUI command smoke: track_hybrid_live emits python -m visual_servoing.scripts.fp_track_live with --remote-init-mask-server 192.168.0.3:8081 and --zed-depth-mode NEURAL, without --auto-reinit",
-      "Architect final verification: APPROVED, no blockers; confirmed frame_total_ms is assigned before overlay and regression test covers source order"
+      "python -m py_compile visual_servoing/foundationpose_model_free/eef_follow.py visual_servoing/scripts/fp_track_live.py visual_servoing/foundationpose_model_free/gui_app.py visual_servoing/visual_servo_client_v2.py -> passed with no output.",
+      "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest visual_servoing/tests/foundationpose_model_free/test_eef_follow.py visual_servoing/tests/foundationpose_model_free/test_gui_app.py -q -> 32 passed in 0.14s.",
+      "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest visual_servoing/tests/foundationpose_model_free/test_track_live_output.py -q -> 12 passed in 0.09s.",
+      "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest visual_servoing/tests/test_visual_servo_client.py visual_servoing/tests/test_visual_servo_client_v2.py -q -> 70 passed in 0.50s.",
+      "python -m visual_servoing.scripts.fp_track_live --object multimeter_zed_1 --remote-register-server 192.168.0.3:8081 --eef-follow --mock -> mock tracking ready for multimeter_zed_1: refs=0, assets=missing.",
+      "python snippet parse_args(['--object','multimeter_zed_1','--remote-register-server','192.168.0.3:8081','--eef-follow','--max-translation-step-m','0.03']) -> eef_follow True, execute False, offset (-0.2,0,0), rpy (180,0,0).",
+      "git diff --check on tracked changed files plus explicit whitespace scan on new EEF files -> no whitespace errors.",
+      "Architect/self-review evidence: transform state is string-based TrackingState, so TRACKING/LOST comparisons in eef_follow.py match tracker.py; Track Local/Remote command builders remain without EEF flags by default."
     ]
   },
-  "plan_path": ".omx/plans/final-foundationpose-remote-init-local-tracking.md",
-  "targeted_tests": "not rerun in final pass; full suite 325 passed covers targeted tests",
-  "agent_tiers_doc": "not_found_under_/home/kgs/.codex",
+  "plan_path": ".omx/plans/final-v2-eef-follow.md",
   "run_outcome": "finish",
   "lifecycle_outcome": "finished"
 }
